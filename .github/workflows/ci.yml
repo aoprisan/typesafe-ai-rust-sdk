@@ -22,6 +22,19 @@ jobs:
       - run: cargo clippy --all-features --all-targets -- -D warnings
       - run: cargo test --all-features
       - run: cargo test --no-default-features
+  repl:
+    # The learning REPL is a workspace member, not part of the published crate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -p jev-repl --check
+      - run: cargo clippy -p jev-repl --all-targets -- -D warnings
+      - run: cargo test -p jev-repl
+
   live:
     # Optional smoke test against the real API; runs only when the secret is configured.
     if: ${{ github.event_name == 'push' }}

@@ -127,6 +127,33 @@ let res = client.system_one("text", questions).send()?;
 
 The blocking client owns a private current-thread runtime; don't call it from inside async code.
 
+## Learn it interactively
+
+`jev` is a terminal REPL for shaping questions before you write any code:
+
+```sh
+just repl            # or: cargo run -p jev-repl
+```
+
+```text
+:preset triage                                   # a ready-made session to poke at
+:state The payout failed again, third time.      # bare text works too
+:noul is_urgent The message conveys urgency | yes: A deadline | no: Routine
+:choice department Which team | billing=Payments | technical=Bugs
+:score frustration How frustrated | Calm | Annoyed | Furious
+<Enter>                                          # send; answers come back with their distributions
+```
+
+- `:lesson` walks a ten-step track from "what is a noul" to confidence gating.
+- `:build` opens a form for composing a question, with the JSON it will send rendered as you type.
+- `:json` shows the exact request body, `:last` the raw response, and `:rust` the same session as a
+  program written against this SDK.
+- Without `TYPESAFE_API_KEY` it starts in mock mode: answers are simulated locally (deterministic,
+  not predictive) so the shapes can be learned offline. `:key <api-key>` switches to live calls.
+
+The REPL lives in [`jev-repl/`](jev-repl) as a separate workspace member, so its TUI dependencies
+stay out of the published library.
+
 ## Configuration
 
 | Builder method  | Environment variable      | Default                   |
@@ -210,8 +237,9 @@ headers and bodies. Secret headers are redacted; bodies (including your `state`)
 ## Development
 
 ```sh
-just          # fmt-check + clippy + tests
+just          # fmt-check + clippy + tests, for the library and the REPL
 just live     # smoke test against the real API (needs TYPESAFE_API_KEY)
+just repl     # the learning REPL
 ```
 
 ## Releasing
