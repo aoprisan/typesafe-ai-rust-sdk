@@ -19,7 +19,8 @@ defaults, retry semantics, error classification and forward-compatible response 
 ```toml
 [dependencies]
 typesafe-sdk = "0.1"                                     # async (bring your own Tokio runtime)
-# typesafe-sdk = { version = "0.1", features = ["blocking"] }
+# typesafe-sdk = { version = "0.1", features = ["blocking"] }         # sync client
+# typesafe-sdk = { version = "0.1", features = ["reqwest-client"] }   # bring your own reqwest::Client
 ```
 
 The library is imported as `typesafe`. MSRV: Rust 1.88. TLS is rustls; `HTTPS_PROXY`-style
@@ -135,9 +136,10 @@ The blocking client owns a private current-thread runtime; don't call it from in
 | `model`         | `TYPESAFE_DEFAULT_MODEL`  | `jev-latest`              |
 | `timeout`       |                           | 10 s per attempt          |
 | `retry`         |                           | `RetryPolicy::default()`  |
-| `http_client`   |                           | a fresh `reqwest::Client` |
+| `http_client`   |                           | a fresh `reqwest::Client` (feature `reqwest-client`) |
 
-Explicit values win; blank environment values are ignored.
+Explicit values win; blank environment values are ignored. Header types come from the `http` crate,
+re-exported as `typesafe::http`.
 
 ## Retries
 
@@ -178,7 +180,7 @@ match client.system_one(state, questions).await {
 | `Config`             | missing API key, invalid base URL, zero timeout, invalid retry policy   |
 | `InvalidRequest`     | no questions, empty choice/score criteria, malformed raw question, unencodable state |
 | `Api`                | non-2xx after retries; `kind`, `message`, `body`, `request_id()`, `retry_after()` |
-| `Connection`         | no response (DNS, connect, reset, body read)                            |
+| `Connection`         | no response (DNS, connect, reset, body read); HTTP client error in `source()` |
 | `Timeout`            | an attempt exceeded its timeout                                         |
 | `ResponseValidation` | 2xx body missing required data; `field_path` like `answers.tone.confidence` |
 

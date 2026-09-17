@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use http::header::HeaderMap;
 use indexmap::IndexMap;
-use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;

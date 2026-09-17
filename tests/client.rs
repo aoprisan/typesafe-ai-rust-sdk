@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::json;
-use typesafe::reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
+use typesafe::http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use typesafe::{ApiErrorKind, Choice, Client, Error, Noul, Questions, RetryPolicy, Score};
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -455,6 +455,38 @@ fn config_validation() {
     }
     let c = Client::builder().api_key("k").build().unwrap();
     assert_eq!(c.default_model(), "jev-latest");
+}
+
+#[cfg(feature = "reqwest-client")]
+#[tokio::test]
+async fn custom_reqwest_client() {
+    let server = MockServer::start().await;
+    Mock::given(path("/v1/models"))
+        .and(header("x-from-reqwest", "1"))
+        .and(header(
+            "x-typesafe-sdk",
+            format!("typesafe-sdk-rust/{}", typesafe::constants::VERSION).as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut defaults = typesafe::http::HeaderMap::new();
+    defaults.insert("x-from-reqwest", HeaderValue::from_static("1"));
+    // A default header set on the reqwest client must not be able to spoof SDK identification.
+    defaults.insert("x-typesafe-sdk", HeaderValue::from_static("spoof"));
+    let http = reqwest::Client::builder()
+        .default_headers(defaults)
+        .build()
+        .unwrap();
+    let c = Client::builder()
+        .api_key("k")
+        .base_url(server.uri())
+        .http_client(http)
+        .build()
+        .unwrap();
+    assert!(c.models().list().await.unwrap().models.is_empty());
 }
 
 #[cfg(feature = "blocking")]

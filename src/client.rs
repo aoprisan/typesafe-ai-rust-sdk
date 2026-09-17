@@ -5,10 +5,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{
+use http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
-use reqwest::{Method, StatusCode};
+use http::{Method, StatusCode};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -74,7 +74,9 @@ impl ClientBuilder {
         self
     }
 
-    /// Use your own `reqwest::Client` (proxies, TLS, connection pools, middleware-free tracing…).
+    /// Use your own `reqwest::Client` (proxies, TLS, connection pools…). Requires the
+    /// `reqwest-client` feature.
+    #[cfg(feature = "reqwest-client")]
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http = Some(client);
         self
@@ -332,7 +334,7 @@ impl Client {
             if e.is_timeout() {
                 Error::Timeout(timeout)
             } else {
-                Error::Connection(e)
+                Error::Connection(Box::new(e))
             }
         };
         let resp = req.send().await.map_err(map_err)?;

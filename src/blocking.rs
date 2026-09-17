@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use reqwest::header::{HeaderName, HeaderValue};
+use http::header::{HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
 

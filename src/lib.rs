@@ -6,7 +6,8 @@
 //! Behaviour follows the official Python SDK (`typesafe-sdk`): the same environment variables,
 //! defaults, retry semantics, error classification and forward-compatible decoding.
 //!
-//! Enable the `blocking` feature for a synchronous client in [`blocking`].
+//! Enable the `blocking` feature for a synchronous client in [`blocking`], and `reqwest-client`
+//! to supply your own `reqwest::Client`.
 #![warn(missing_docs)]
 
 mod client;
@@ -28,8 +29,8 @@ pub use response::{
 };
 pub use retry::RetryPolicy;
 
-/// Re-exported so callers can pass a custom HTTP client or headers.
-pub use reqwest;
+/// Re-exported so callers can build headers without adding a dependency.
+pub use http;
 /// Re-exported so callers can build structured instructions/state without adding a dependency.
 pub use serde_json::{self, json};
 

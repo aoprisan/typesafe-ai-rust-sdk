@@ -8,7 +8,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
-use reqwest::header::HeaderMap;
+use http::header::HeaderMap;
 use serde_json::Value;
 
 use crate::constants::{
@@ -36,9 +36,10 @@ pub enum Error {
     #[error(transparent)]
     Api(Box<ApiError>),
 
-    /// The request could not reach the server or the response could not be read.
+    /// The request could not reach the server or the response could not be read (DNS, connect,
+    /// TLS, reset, body read). The underlying HTTP client's error is available via `source()`.
     #[error("Connection error: {0}")]
-    Connection(#[source] reqwest::Error),
+    Connection(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
     /// The request exceeded its configured timeout.
     #[error("Request timed out (timeout={}s).", .0.as_secs_f64())]
@@ -342,7 +343,7 @@ pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::HeaderValue;
+    use http::header::HeaderValue;
     use serde_json::json;
 
     #[test]
