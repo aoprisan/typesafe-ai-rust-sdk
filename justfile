@@ -24,4 +24,7 @@ doc:
     cargo doc --all-features --no-deps --open
 
 publish-dry:
-    cargo publish --dry-run
+    cargo publish --dry-run --locked
+
+publish:
+    cargo publish --locked

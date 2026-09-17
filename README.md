@@ -1,4 +1,4 @@
-# typesafe-sdk (Rust)
+# typesafe-ai-sdk
 
 Rust client for the [TypeSafe AI](https://typesafe.ai) **System One** API: send a `state` plus named,
 typed questions and get typed answers back.
@@ -18,9 +18,9 @@ defaults, retry semantics, error classification and forward-compatible response 
 
 ```toml
 [dependencies]
-typesafe-sdk = "0.1"                                     # async (bring your own Tokio runtime)
-# typesafe-sdk = { version = "0.1", features = ["blocking"] }         # sync client
-# typesafe-sdk = { version = "0.1", features = ["reqwest-client"] }   # bring your own reqwest::Client
+typesafe-ai-sdk = "0.1"                                                 # async (bring your own Tokio runtime)
+# typesafe-ai-sdk = { version = "0.1", features = ["blocking"] }        # sync client
+# typesafe-ai-sdk = { version = "0.1", features = ["reqwest-client"] }  # bring your own reqwest::Client
 ```
 
 The library is imported as `typesafe`. MSRV: Rust 1.88. TLS is rustls; `HTTPS_PROXY`-style
@@ -213,6 +213,19 @@ headers and bodies. Secret headers are redacted; bodies (including your `state`)
 just          # fmt-check + clippy + tests
 just live     # smoke test against the real API (needs TYPESAFE_API_KEY)
 ```
+
+## Releasing
+
+```sh
+just publish-dry    # package and verify locally, no upload
+just publish        # upload; needs a crates.io token (`cargo login`)
+```
+
+Or let CI do it: push a tag matching the `version` in `Cargo.toml`
+(`git tag v0.1.0 && git push origin v0.1.0`). That runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which re-runs fmt, clippy and
+both test configurations, checks the tag against the manifest version, and publishes with the
+`CARGO_REGISTRY_TOKEN` repository secret.
 
 ## License
 

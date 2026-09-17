@@ -1,12 +1,12 @@
 [package]
-name = "typesafe-sdk"
+name = "typesafe-ai-sdk"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Rust client for the TypeSafe AI System One API (Noul, Choice and Score questions)"
 license = "MIT"
 repository = "https://github.com/aoprisan/typesafe-ai-rust-sdk"
-documentation = "https://docs.rs/typesafe-sdk"
+documentation = "https://docs.rs/typesafe-ai-sdk"
 keywords = ["typesafe", "ai", "classification", "sdk", "api"]
 categories = ["api-bindings", "web-programming::http-client"]
 readme = "README.md"
