@@ -173,6 +173,36 @@ async fn structured_state_overrides_and_protected_headers() {
 }
 
 #[tokio::test]
+async fn wire_body_keeps_question_order_and_extra_body_replaces_fields() {
+    let server = MockServer::start().await;
+    Mock::given(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .system_one("x", questions())
+        .extra_body("model", json!("override"))
+        .extra_body("future", json!(1))
+        .await
+        .unwrap();
+
+    let req = &server.received_requests().await.unwrap()[0];
+    let text = String::from_utf8(req.body.clone()).unwrap();
+    let pos = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing"))
+    };
+    assert!(pos("\"state\"") < pos("\"questions\""));
+    assert!(pos("\"department\"") < pos("\"frustration\""));
+    assert!(pos("\"frustration\"") < pos("\"is_urgent\""));
+    assert_eq!(text.matches("\"model\":").count(), 1);
+    let body: serde_json::Value = req.body_json().unwrap();
+    assert_eq!(body["model"], "override");
+    assert_eq!(body["future"], 1);
+}
+
+#[tokio::test]
 async fn retries_429_honoring_retry_after_ms_then_succeeds() {
     struct Flaky(std::sync::atomic::AtomicU32);
     impl Respond for Flaky {
@@ -373,6 +403,11 @@ async fn local_validation_happens_before_sending() {
         c.system_one("x", Questions::new()).await,
         Err(Error::InvalidRequest(_))
     ));
+    assert!(matches!(
+        c.system_one("x", Questions::new().with("c", Choice::new("no options")))
+            .await,
+        Err(Error::InvalidRequest(_))
+    ));
     let q = Questions::new().with("raw", json!({"type": "score", "criteria": []}));
     assert!(matches!(
         c.system_one("x", q).await,
@@ -409,6 +444,15 @@ fn config_validation() {
             .build(),
         Err(Error::Config(_))
     ));
+    for bad in ["", "not a url", "ftp://x", "http://"] {
+        assert!(
+            matches!(
+                Client::builder().api_key("k").base_url(bad).build(),
+                Err(Error::Config(_))
+            ),
+            "{bad:?}"
+        );
+    }
     let c = Client::builder().api_key("k").build().unwrap();
     assert_eq!(c.default_model(), "jev-latest");
 }

@@ -13,7 +13,11 @@ use crate::error::{Error, Result};
 pub type RetryPredicate = Arc<dyn Fn(&Error) -> bool + Send + Sync>;
 
 /// How failed requests are retried.
+///
+/// Start from [`RetryPolicy::default`] or [`RetryPolicy::none`] and adjust with the builder methods
+/// (or set the public fields directly).
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct RetryPolicy {
     /// Retries after the first attempt; `0` disables retries. Default `2`.
     pub max_retries: u32,
@@ -110,6 +114,24 @@ impl RetryPolicy {
     /// Set the total time budget.
     pub fn budget(mut self, budget: Option<Duration>) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Whether to honor `retry-after-ms` / `Retry-After`.
+    pub fn respect_retry_after(mut self, yes: bool) -> Self {
+        self.respect_retry_after = yes;
+        self
+    }
+
+    /// Whether to retry [`Error::Connection`].
+    pub fn retry_connection_errors(mut self, yes: bool) -> Self {
+        self.retry_connection_errors = yes;
+        self
+    }
+
+    /// Whether to retry [`Error::Timeout`].
+    pub fn retry_timeouts(mut self, yes: bool) -> Self {
+        self.retry_timeouts = yes;
         self
     }
 

@@ -22,12 +22,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// The client could not be configured (missing API key, invalid timeout, invalid retry policy).
+    /// The client could not be configured (missing API key, invalid base URL, invalid timeout,
+    /// invalid retry policy).
     #[error("{0}")]
     Config(String),
 
-    /// The request was rejected locally before being sent (no questions, empty score criteria,
-    /// malformed raw question, or a body that cannot be encoded as JSON).
+    /// The request was rejected locally before being sent (no questions, empty choice or score
+    /// criteria, malformed raw question, or a body that cannot be encoded as JSON).
     #[error("{0}")]
     InvalidRequest(String),
 
@@ -116,6 +117,7 @@ impl ApiErrorKind {
 
 /// An unsuccessful HTTP response.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ApiError {
     /// HTTP status code.
     pub status: u16,
@@ -184,6 +186,7 @@ impl std::error::Error for ApiError {}
 
 /// A successful response whose body is missing or has structurally invalid required data.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ResponseValidationError {
     /// HTTP status code (2xx).
     pub status: u16,
@@ -327,7 +330,7 @@ pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         Ok(secs) if secs.is_finite() && secs >= 0.0 => Duration::try_from_secs_f64(secs).ok(),
         Ok(_) => None,
         Err(_) => {
-            let at = httpdate::parse_http_date(raw).ok()?;
+            let at = httpdate::parse_http_date(trimmed).ok()?;
             Some(
                 at.duration_since(SystemTime::now())
                     .unwrap_or(Duration::ZERO),
@@ -421,7 +424,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(
             RETRY_AFTER_HEADER,
-            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+            HeaderValue::from_static("  Wed, 21 Oct 2015 07:28:00 GMT "),
         );
         assert_eq!(parse_retry_after(&h), Some(Duration::ZERO));
     }

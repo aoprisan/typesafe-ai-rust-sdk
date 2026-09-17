@@ -16,8 +16,8 @@ use crate::constants::*;
 use crate::error::{ApiError, Error, ResponseValidationError, Result, lenient_body};
 use crate::question::Questions;
 use crate::response::{
-    DecodeFailure, ListModelsResponse, ResponseMeta, SystemOneResponse, decode_models,
-    decode_system_one,
+    DecodeFailure, DecodedSystemOne, ListModelsResponse, ResponseMeta, SystemOneResponse,
+    decode_models, decode_system_one,
 };
 use crate::retry::RetryPolicy;
 
@@ -91,6 +91,7 @@ impl ClientBuilder {
             .unwrap_or_default()
             .trim_end_matches('/')
             .to_owned();
+        check_base_url(&base_url)?;
         let model = resolve(self.model, DEFAULT_MODEL_ENV, Some(DEFAULT_MODEL)).unwrap_or_default();
         let timeout = check_timeout(self.timeout.unwrap_or(DEFAULT_TIMEOUT))?;
         let retry = self.retry.unwrap_or_default();
@@ -140,6 +141,18 @@ fn resolve(explicit: Option<String>, env: &str, default: Option<&str>) -> Option
                 .filter(|v| !v.is_empty())
         })
         .or_else(|| default.map(str::to_owned))
+}
+
+fn check_base_url(url: &str) -> Result<()> {
+    match reqwest::Url::parse(url) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") && u.has_host() => Ok(()),
+        Ok(_) => Err(Error::Config(format!(
+            "base_url must be an http(s) URL with a host, got {url:?}."
+        ))),
+        Err(e) => Err(Error::Config(format!(
+            "base_url {url:?} is not a valid URL: {e}."
+        ))),
+    }
 }
 
 fn check_timeout(t: Duration) -> Result<Duration> {
@@ -234,7 +247,7 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
         opts: CallOptions,
-    ) -> Result<(Value, ResponseMeta, String)> {
+    ) -> Result<(Vec<u8>, ResponseMeta, String)> {
         let inner = &self.inner;
         let retry = opts.retry.as_ref().unwrap_or(&inner.retry);
         retry.validate()?;
@@ -266,13 +279,13 @@ impl Client {
                 .attempt(&method, &url, &endpoint, h, body.clone(), timeout)
                 .await;
             match result {
-                Ok((value, status, resp_headers)) => {
+                Ok((bytes, status, resp_headers)) => {
                     let meta = ResponseMeta {
                         status,
                         headers: resp_headers,
                         attempts,
                     };
-                    return Ok((value, meta, endpoint));
+                    return Ok((bytes, meta, endpoint));
                 }
                 Err(err) => {
                     if !retry.is_retryable(&err) {
@@ -298,10 +311,11 @@ impl Client {
         headers: HeaderMap,
         body: Option<Vec<u8>>,
         timeout: Duration,
-    ) -> Result<(Value, u16, HeaderMap)> {
+    ) -> Result<(Vec<u8>, u16, HeaderMap)> {
         let t0 = Instant::now();
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(%endpoint, headers = ?redacted(&headers),
+        tracing::debug!(%endpoint, "->");
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(%endpoint, headers = ?redacted(&headers),
                 body = %body.as_deref().map(String::from_utf8_lossy).unwrap_or_default(), "->");
         }
         let mut req = self
@@ -314,7 +328,7 @@ impl Client {
             req = req.body(b);
         }
         let map_err = |e: reqwest::Error| {
-            tracing::info!(%endpoint, error = %e, "<- transport error");
+            tracing::debug!(%endpoint, error = %e, "<- transport error");
             if e.is_timeout() {
                 Error::Timeout(timeout)
             } else {
@@ -326,15 +340,15 @@ impl Client {
         let resp_headers = resp.headers().clone();
         let bytes = resp.bytes().await.map_err(map_err)?;
 
-        tracing::info!(
+        tracing::debug!(
             %endpoint,
             status = status.as_u16(),
             elapsed_ms = t0.elapsed().as_millis() as u64,
             request_id = resp_headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("-"),
             "<-"
         );
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(%endpoint, headers = ?redacted(&resp_headers),
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(%endpoint, headers = ?redacted(&resp_headers),
                 body = %String::from_utf8_lossy(&bytes), "<-");
         }
 
@@ -346,19 +360,7 @@ impl Client {
                 Some(endpoint.to_owned()),
             ))));
         }
-        match serde_json::from_slice::<Value>(&bytes) {
-            Ok(v) => Ok((v, status.as_u16(), resp_headers)),
-            Err(e) => Err(validation_error(
-                status,
-                lenient_body(&bytes),
-                resp_headers,
-                endpoint,
-                DecodeFailure {
-                    path: String::new(),
-                    detail: e.to_string(),
-                },
-            )),
-        }
+        Ok((bytes.to_vec(), status.as_u16(), resp_headers))
     }
 }
 
@@ -456,8 +458,8 @@ impl SystemOneRequest {
         self
     }
 
-    /// Add a top-level body field, shallow-merged last (so it can override `state`, `model` or
-    /// `questions`). Useful for API fields this SDK version does not model yet.
+    /// Add a top-level body field. A key named `state`, `model` or `questions` replaces the
+    /// standard field. Useful for API fields this SDK version does not model yet.
     pub fn extra_body(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.extra_body.insert(key.into(), value.into());
         self
@@ -467,36 +469,35 @@ impl SystemOneRequest {
     pub async fn send(self) -> Result<SystemOneResponse> {
         let state = self.state.map_err(Error::InvalidRequest)?;
         self.questions.validate()?;
-        let mut body = Map::new();
-        body.insert("state".into(), state);
-        body.insert(
-            "model".into(),
-            Value::String(
-                self.model
-                    .unwrap_or_else(|| self.client.inner.model.clone()),
-            ),
-        );
-        body.insert(
-            "questions".into(),
-            serde_json::to_value(&self.questions).map_err(|e| {
-                Error::InvalidRequest(format!(
-                    "The request body could not be encoded as JSON: {e}"
-                ))
-            })?,
-        );
-        body.extend(self.extra_body);
+        let model = self
+            .model
+            .unwrap_or_else(|| self.client.inner.model.clone());
+        // Serialized as a struct (not via `serde_json::Value`) so question order reaches the wire
+        // unchanged. `extra_body` keys replace the standard field of the same name.
+        let extra = &self.extra_body;
+        let body = SystemOneBody {
+            state: (!extra.contains_key("state")).then_some(&state),
+            model: (!extra.contains_key("model")).then_some(&model),
+            questions: (!extra.contains_key("questions")).then_some(&self.questions),
+            extra,
+        };
         let bytes = serde_json::to_vec(&body).map_err(|e| {
             Error::InvalidRequest(format!(
                 "The request body could not be encoded as JSON: {e}"
             ))
         })?;
 
-        let (raw, meta, endpoint) = self
+        let (bytes, meta, endpoint) = self
             .client
             .execute(Method::POST, SYSTEM_ONE_PATH, Some(bytes), self.opts)
             .await?;
-        match decode_system_one(raw.clone()) {
-            Ok((model, usage, answers)) => Ok(SystemOneResponse {
+        match decode_system_one(&bytes) {
+            Ok(DecodedSystemOne {
+                model,
+                usage,
+                answers,
+                raw,
+            }) => Ok(SystemOneResponse {
                 model,
                 usage,
                 answers,
@@ -505,13 +506,25 @@ impl SystemOneRequest {
             }),
             Err(f) => Err(validation_error(
                 StatusCode::from_u16(meta.status).unwrap_or(StatusCode::OK),
-                Some(raw),
+                lenient_body(&bytes),
                 meta.headers,
                 &endpoint,
                 f,
             )),
         }
     }
+}
+
+#[derive(Serialize)]
+struct SystemOneBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    questions: Option<&'a Questions>,
+    #[serde(flatten)]
+    extra: &'a Map<String, Value>,
 }
 
 impl IntoFuture for SystemOneRequest {
@@ -552,15 +565,15 @@ impl ListModelsRequest {
 
     /// Send the request.
     pub async fn send(self) -> Result<ListModelsResponse> {
-        let (raw, meta, endpoint) = self
+        let (bytes, meta, endpoint) = self
             .client
             .execute(Method::GET, MODELS_PATH, None, self.opts)
             .await?;
-        match decode_models(raw.clone()) {
-            Ok(models) => Ok(ListModelsResponse { models, meta }),
+        match decode_models(&bytes) {
+            Ok((models, raw)) => Ok(ListModelsResponse { models, raw, meta }),
             Err(f) => Err(validation_error(
                 StatusCode::from_u16(meta.status).unwrap_or(StatusCode::OK),
-                Some(raw),
+                lenient_body(&bytes),
                 meta.headers,
                 &endpoint,
                 f,

@@ -32,3 +32,8 @@ pub use retry::RetryPolicy;
 pub use reqwest;
 /// Re-exported so callers can build structured instructions/state without adding a dependency.
 pub use serde_json::{self, json};
+
+/// Compiles the README's code samples as doctests (they are not part of the rendered docs).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

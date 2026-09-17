@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 
 /// A yes/no question; the answer is the probability of "yes".
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[non_exhaustive]
 #[serde(tag = "type", rename = "noul")]
 pub struct Noul {
     /// The question to evaluate.
@@ -23,6 +24,7 @@ pub struct Noul {
 
 /// Descriptions of the yes (`true`) and no (`false`) outcomes of a [`Noul`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct NoulCriteria {
     /// What a yes (value near 1) means.
     #[serde(rename = "true", skip_serializing_if = "Option::is_none")]
@@ -56,6 +58,7 @@ impl Noul {
 
 /// Pick one option from a set you define.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[non_exhaustive]
 #[serde(tag = "type", rename = "choice")]
 pub struct Choice {
     /// What the model should decide.
@@ -101,6 +104,7 @@ impl Choice {
 
 /// Rate the state along ordered levels; the answer is a probability-weighted level index.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[non_exhaustive]
 #[serde(tag = "type", rename = "score")]
 pub struct Score {
     /// What the model should rate.
@@ -225,6 +229,7 @@ impl Questions {
         for (name, q) in &self.0 {
             match q {
                 Question::Score(s) if s.criteria.is_empty() => return Err(empty_score(name)),
+                Question::Choice(c) if c.criteria.is_empty() => return Err(empty_choice(name)),
                 Question::Raw(v) => validate_raw(name, v)?,
                 _ => {}
             }
@@ -236,6 +241,12 @@ impl Questions {
 fn empty_score(name: &str) -> Error {
     Error::InvalidRequest(format!(
         "Score question \"{name}\" has no criteria; at least one score is required."
+    ))
+}
+
+fn empty_choice(name: &str) -> Error {
+    Error::InvalidRequest(format!(
+        "Choice question \"{name}\" has no criteria; at least one option is required."
     ))
 }
 
@@ -262,8 +273,12 @@ fn validate_raw(name: &str, v: &Value) -> Result<()> {
             Value::Object(o) => o.is_empty(),
             Value::Number(n) => n.as_f64() == Some(0.0),
         };
-        if ty == "score" && empty {
-            return Err(empty_score(name));
+        if empty {
+            return Err(if ty == "score" {
+                empty_score(name)
+            } else {
+                empty_choice(name)
+            });
         }
     }
     Ok(())
@@ -355,7 +370,17 @@ mod tests {
                 .is_err()
         );
         assert!(
+            Questions::from([("c", Choice::new("x"))])
+                .validate()
+                .is_err()
+        );
+        assert!(
             Questions::from([("r", json!({"type": "choice"}))])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Questions::from([("r", json!({"type": "choice", "criteria": {}}))])
                 .validate()
                 .is_err()
         );

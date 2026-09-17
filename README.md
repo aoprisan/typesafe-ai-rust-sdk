@@ -22,11 +22,12 @@ typesafe-sdk = "0.1"                                     # async (bring your own
 # typesafe-sdk = { version = "0.1", features = ["blocking"] }
 ```
 
-The library is imported as `typesafe`. MSRV: Rust 1.88. TLS is rustls.
+The library is imported as `typesafe`. MSRV: Rust 1.88. TLS is rustls; `HTTPS_PROXY`-style
+environment variables are honoured.
 
 ## Quick start
 
-```rust
+```rust,no_run
 use typesafe::{Choice, Client, Noul, Questions, Score};
 
 #[tokio::main]
@@ -63,7 +64,7 @@ async fn main() -> typesafe::Result<()> {
 
 `state` is anything `Serialize`: a string, `json!({...})`, or your own struct.
 
-```rust
+```rust,ignore
 #[derive(serde::Serialize)]
 struct Ticket<'a> { subject: &'a str, messages: Vec<&'a str> }
 
@@ -75,7 +76,7 @@ client.system_one(Ticket { subject: "Payouts", messages: vec!["…"] }, question
 Instructions, option descriptions and score levels accept any JSON value:
 
 ```rust
-use typesafe::json;
+use typesafe::{Choice, Noul, Score, json};
 Score::new(json!({"task": "rate tone", "ignore": ["signatures"]}),
            [json!({"level": "neutral"}), json!("hostile")]);
 Noul::new("Is this a refund request?").when_true("Explicit ask for money back");
@@ -84,7 +85,7 @@ Choice::from_labels("Sentiment", ["positive", "neutral", "negative"]);
 
 ### Typed choices
 
-```rust
+```rust,ignore
 #[derive(Debug)]
 enum Dept { Billing, Technical }
 impl std::str::FromStr for Dept { /* … */ }
@@ -96,7 +97,7 @@ let dept: Dept = res.choice("department").unwrap().parse()?;
 
 Requests implement `IntoFuture`, so you can `.await` them directly or configure them first:
 
-```rust
+```rust,ignore
 client.system_one(state, questions)
     .model("jev-latest")
     .timeout(Duration::from_secs(3))
@@ -110,7 +111,7 @@ Authentication and SDK-identification headers cannot be overridden.
 
 ### Models
 
-```rust
+```rust,ignore
 for m in client.models().list().await?.models {
     println!("{} ({})", m.name, m.release_date);
 }
@@ -118,7 +119,7 @@ for m in client.models().list().await?.models {
 
 ### Blocking
 
-```rust
+```rust,ignore
 let client = typesafe::blocking::Client::from_env()?;
 let res = client.system_one("text", questions).send()?;
 ```
@@ -150,6 +151,8 @@ Explicit values win; blank environment values are ignored.
 - retries send `X-TypeSafe-Retry-Count`.
 
 ```rust
+use std::time::Duration;
+use typesafe::RetryPolicy;
 RetryPolicy::default()
     .max_retries(5)
     .backoff(Duration::from_millis(200), Duration::from_secs(2))
@@ -159,7 +162,7 @@ RetryPolicy::default()
 
 ## Errors
 
-```rust
+```rust,ignore
 match client.system_one(state, questions).await {
     Err(typesafe::Error::Api(e)) if e.kind == ApiErrorKind::RateLimit => {
         eprintln!("rate limited, retry after {:?} (request {:?})", e.retry_after(), e.request_id());
@@ -172,8 +175,8 @@ match client.system_one(state, questions).await {
 
 | Variant              | When                                                                   |
 | -------------------- | ---------------------------------------------------------------------- |
-| `Config`             | missing API key, zero timeout, invalid retry policy                     |
-| `InvalidRequest`     | no questions, empty score criteria, malformed raw question, unencodable state |
+| `Config`             | missing API key, invalid base URL, zero timeout, invalid retry policy   |
+| `InvalidRequest`     | no questions, empty choice/score criteria, malformed raw question, unencodable state |
 | `Api`                | non-2xx after retries; `kind`, `message`, `body`, `request_id()`, `retry_after()` |
 | `Connection`         | no response (DNS, connect, reset, body read)                            |
 | `Timeout`            | an attempt exceeded its timeout                                         |
@@ -191,13 +194,14 @@ Error messages from FastAPI-style validation bodies are flattened, e.g.
 
 ## Logging
 
-Uses `tracing`: INFO for each request/response line, DEBUG for headers and bodies. Secret headers are
-redacted; bodies are not.
+Uses `tracing`: INFO when a request is retried, DEBUG for each request/response line, TRACE for
+headers and bodies. Secret headers are redacted; bodies (including your `state`) are not.
 
 ## Differences from the Python SDK
 
 - Answers are looked up with `res.noul(name)` / `res.choice(name)` / `res.score(name)` or iterated with
   `nouls()` / `choices()` / `scores()`; Score maps are keyed by `u32`.
+- Typed answer maps keep server order; `response.raw` uses `serde_json::Map` ordering.
 - `ResponseMeta` exposes status, headers and the number of attempts.
 - No `TYPESAFE_LOG_LEVEL`; configure your `tracing` subscriber instead.
 
