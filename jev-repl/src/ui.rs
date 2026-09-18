@@ -11,7 +11,7 @@ use crate::builder::{Builder, Field};
 use crate::editor::Preview;
 use crate::format::*;
 use crate::sketch::Tag;
-use crate::{codegen, highlight, lessons, mock, wrap};
+use crate::{codegen, cost, highlight, lessons, mock, wrap};
 
 /// Width of the label column in builder mode.
 const LABEL: usize = 14;
@@ -144,6 +144,29 @@ fn panel(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(name.clone()),
             dim(format!("  {kind}")),
         ]));
+    }
+
+    if !app.session.questions.is_empty() {
+        let estimate = cost::estimate(&app.session, &app.model_name());
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled("cost", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            dim("  estimated"),
+        ]));
+        lines.push(Line::from(dim(format!(
+            "≈ {} in / {} out tok",
+            estimate.input_tokens, estimate.output_tokens
+        ))));
+        lines.push(Line::from(match app.rates {
+            Some(rates) => Span::styled(
+                format!(
+                    "{} per call",
+                    cost::usd(cost::price_estimate(&estimate, rates).total)
+                ),
+                Style::new().fg(SCORE),
+            ),
+            None => dim(":cost 0.20/1.00 to price it"),
+        }));
     }
 
     lines.push(Line::default());
@@ -437,6 +460,7 @@ const GUTTER: usize = 8;
 fn sketch(frame: &mut Frame, area: Rect, app: &mut App) {
     let threshold = app.threshold;
     let default_model = app.model_name();
+    let rates = app.rates;
     let Some(ed) = app.sketch.as_mut() else {
         return;
     };
@@ -605,6 +629,19 @@ fn sketch(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         Preview::Rust => {
             preview.extend(highlight::rust(&codegen::rust(&session, &model, threshold)))
+        }
+        Preview::Cost => {
+            if session.questions.is_empty() {
+                preview.push(Line::from(dim(
+                    "  add a question below the --- line to see what a call would cost",
+                )));
+            } else {
+                preview.extend(cost_lines(
+                    &cost::estimate(&session, &model),
+                    rates,
+                    ":cost 0.20/1.00 prices it, dollars per million tokens",
+                ));
+            }
         }
     }
     let wrapped = wrap::wrap_all(&preview, preview_area.width as usize);

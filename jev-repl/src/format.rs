@@ -5,6 +5,8 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 use typesafe::{Answer, Error, Question};
 
+use crate::cost::{Estimate, Rates, format_rates, price_estimate, usd};
+
 pub const NOUL: Color = Color::Cyan;
 pub const CHOICE: Color = Color::Magenta;
 pub const SCORE: Color = Color::Green;
@@ -161,6 +163,113 @@ fn confidence_span(c: f64) -> Span<'static> {
         BAD
     };
     Span::styled(format!("{c:.2}"), Style::new().fg(color))
+}
+
+/// The cost estimate as a small table: which question spends what, and — when rates are set — the
+/// money at the bottom. Tokens are estimated, so the numbers are a shape, not a bill. `hint` is how
+/// this host sets rates, since the terminal has `:cost` and other hosts have their own.
+pub fn cost_lines(estimate: &Estimate, rates: Option<Rates>, hint: &str) -> Vec<Line<'static>> {
+    let pad = estimate
+        .questions
+        .iter()
+        .map(|q| q.name.chars().count())
+        .chain([5, 8, 5])
+        .max()
+        .unwrap_or(8);
+    let row = |name: &str, kind: &str, input: String, output: String, color: Option<Color>| {
+        Line::from(vec![
+            Span::raw("  "),
+            match color {
+                Some(color) => Span::styled(pad_end(name, pad), Style::new().fg(color)),
+                None => Span::raw(pad_end(name, pad)),
+            },
+            Span::raw("  "),
+            dim(pad_end(kind, 7)),
+            Span::raw(format!("{input:>6}")),
+            Span::raw(format!("{output:>6}")),
+        ])
+    };
+
+    let mut out = vec![Line::from(vec![
+        Span::raw("  "),
+        dim(pad_end("", pad)),
+        Span::raw("  "),
+        dim(pad_end("", 7)),
+        dim(format!("{:>6}", "in")),
+        dim(format!("{:>6}", "out")),
+    ])];
+    for q in &estimate.questions {
+        out.push(row(
+            &q.name,
+            &q.kind,
+            q.input_tokens.to_string(),
+            if q.assumed {
+                format!("~{}", q.output_tokens)
+            } else {
+                q.output_tokens.to_string()
+            },
+            Some(color_for(&q.kind)),
+        ));
+    }
+    out.push(row(
+        "state",
+        "",
+        estimate.state_tokens.to_string(),
+        "·".to_owned(),
+        None,
+    ));
+    out.push(row(
+        "envelope",
+        "",
+        estimate.envelope_tokens.to_string(),
+        estimate.answer_envelope_tokens.to_string(),
+        None,
+    ));
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        bold(pad_end("total", pad)),
+        Span::raw("  "),
+        dim(pad_end("", 7)),
+        bold(format!("{:>6}", estimate.input_tokens)),
+        bold(format!("{:>6}", estimate.output_tokens)),
+        dim(format!(
+            "   {} tokens per call",
+            estimate.input_tokens + estimate.output_tokens
+        )),
+    ]));
+
+    let Some(rates) = rates else {
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            dim(format!("no rates set — {hint}")),
+        ]));
+        return out;
+    };
+    let cost = price_estimate(estimate, rates);
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            usd(cost.total),
+            Style::new().fg(SCORE).add_modifier(Modifier::BOLD),
+        ),
+        dim(" per call   ·   "),
+        Span::styled(usd(cost.total * 1000.0), Style::new().fg(SCORE)),
+        dim(" per 1,000 calls"),
+    ]));
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        dim(format!("at {}", format_rates(rates))),
+    ]));
+    out
+}
+
+fn pad_end(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        text.to_owned()
+    } else {
+        format!("{text}{}", " ".repeat(width - len))
+    }
 }
 
 /// One line per question, the way it will go on the wire.

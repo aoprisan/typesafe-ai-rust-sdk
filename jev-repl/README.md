@@ -25,10 +25,10 @@ jev            # with TYPESAFE_API_KEY for live answers; without it, answers are
 <Enter>                                          # send; answers come back with their distributions
 ```
 
-- `:lesson` walks a ten-step track from "what is a noul" to confidence gating.
+- `:lesson` walks an eleven-step track from "what is a noul" to what a call costs.
 - `:sketch` (Ctrl-K) opens the whole request as one page of text, with the question types read
   off the punctuation, a gutter that says what each line became, and a live preview of the JSON,
-  simulated answers, or the same request as Rust:
+  simulated answers, the same request as Rust, or what a call would cost:
 
   ```text
   The payout failed again, third time this month.
@@ -45,6 +45,27 @@ jev            # with TYPESAFE_API_KEY for live answers; without it, answers are
 - `:build` opens a form for one question; `:json` shows the exact request body, `:last` the raw
   response, `:rust` the session as a program against
   [`typesafe-ai-sdk`](https://crates.io/crates/typesafe-ai-sdk).
+- `:cost` says what a call is about to cost, per question and on both sides of the wire — a choice
+  over eight labels comes back with eight probabilities, a score echoes its whole legend:
+
+  ```text
+                          in   out
+  department   choice     74    58
+  frustration  score      60    93
+  is_urgent    noul       32    19
+  state                   40     ·
+  envelope                22    16
+  total                  228   186   414 tokens per call
+    $0.000232 per call   ·   $0.2316 per 1,000 calls
+    at $0.20/$1.00 per Mtok
+  ```
+
+  Rates are yours to supply, because nothing here knows what a model charges: `:cost 0.20/1.00` is
+  dollars per million tokens, input then output, and `JEV_PRICE=0.20/1.00` sets the same at
+  startup. Without them the table counts tokens and stops there. Tokens are estimated from the
+  body — roughly four characters a token — so they are a shape, not an invoice; a live answer
+  carries the counted `usage`, and the REPL prices that instead.
+
 - `:save triage.jev` / `:open triage.jev` keep sessions as sketch pages; other paths use the
   request JSON.
 

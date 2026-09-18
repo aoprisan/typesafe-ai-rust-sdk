@@ -3,6 +3,7 @@
 pub mod app;
 pub mod builder;
 pub mod codegen;
+pub mod cost;
 pub mod editor;
 pub mod format;
 pub mod highlight;

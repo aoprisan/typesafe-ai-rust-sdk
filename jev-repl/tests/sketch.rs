@@ -331,6 +331,8 @@ fn esc_asks_before_discarding_edits_and_preview_cycles() {
     ctrl(&mut ed, 'p');
     assert_eq!(ed.preview, Preview::Rust);
     ctrl(&mut ed, 'p');
+    assert_eq!(ed.preview, Preview::Cost);
+    ctrl(&mut ed, 'p');
     assert_eq!(ed.preview, Preview::Json);
 }
 
@@ -473,11 +475,13 @@ fn the_page_renders_with_its_gutter_and_preview() {
     let ed = app.sketch.as_mut().unwrap();
     ed.lines.push("stray".into());
     ed.row = ed.lines.len() - 1;
-    for p in [Preview::Answers, Preview::Rust] {
+    let mut screens = Vec::new();
+    for p in [Preview::Answers, Preview::Rust, Preview::Cost] {
         app.sketch.as_mut().unwrap().preview = p;
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        screens.push(terminal.backend().to_string());
     }
-    let screen = terminal.backend().to_string();
+    let screen = screens.concat();
     assert!(screen.contains("?     !│stray"), "{screen}");
     assert!(screen.contains("1 problem(s)"), "{screen}");
     // The stray line landed under a noul, so that is what it is told.
@@ -489,6 +493,10 @@ fn the_page_renders_with_its_gutter_and_preview() {
     assert!(
         screen.contains("use typesafe::"),
         "the rust preview: {screen}"
+    );
+    assert!(
+        screen.contains("tokens per call"),
+        "the cost preview: {screen}"
     );
 
     // Small terminals still draw without panicking.

@@ -145,11 +145,16 @@ just repl                         # from this checkout (or: cargo run -p jev-rep
 <Enter>                                          # send; answers come back with their distributions
 ```
 
-- `:lesson` walks a ten-step track from "what is a noul" to confidence gating.
+- `:lesson` walks an eleven-step track from "what is a noul" to what a call costs.
 - `:sketch` opens the whole request as one page of text (below).
 - `:build` opens a form for composing a question, with the JSON it will send rendered as you type.
 - `:json` shows the exact request body, `:last` the raw response, and `:rust` the same session as a
   program written against this SDK.
+- `:cost` estimates what a call spends before it is sent — tokens per question for the request and
+  for the answer it asks for — and prices them at rates you give it: `:cost 0.20/1.00` is dollars
+  per million tokens, input then output, and `JEV_PRICE=0.20/1.00` sets the same at startup.
+  Without rates it counts tokens and stops there; a live answer is priced from the `usage` the API
+  reports.
 - Without `TYPESAFE_API_KEY` it starts in mock mode: answers are simulated locally (deterministic,
   not predictive) so the shapes can be learned offline. `:key <api-key>` switches to live calls.
 
@@ -185,7 +190,8 @@ frustration: How frustrated the customer appears
 While you type, a gutter says what each line became (`noul`, `option`, `level`, …) and marks the
 ones it could not place, the status line explains whatever the cursor is on, and the pane beside
 the page cycles (Ctrl-P) between the JSON that would be sent, simulated answers so the shape of
-the response is visible before anything is sent, and the same request as Rust. Ctrl-S applies the
+the response is visible before anything is sent, the same request as Rust, and what the call would
+cost. Ctrl-S applies the
 page to the session, Ctrl-G applies and sends it, Alt-↑/↓ moves lines so questions and levels can
 be reordered. A page with problems is never applied; the cursor jumps to the first one instead.
 

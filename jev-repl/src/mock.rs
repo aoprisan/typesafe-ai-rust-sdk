@@ -65,6 +65,32 @@ pub fn answer(state: &Value, name: &str, question: &Value) -> Option<Answer> {
     }
 }
 
+/// One answer as it arrives on the wire — what `:last` shows offline, and what the cost estimate
+/// measures to say what an answer of this shape costs.
+pub fn answer_json(answer: &Answer) -> Value {
+    match answer {
+        Answer::Noul(a) => json!({"type": "noul", "noul": a.noul}),
+        Answer::Choice(a) => json!({
+            "type": "choice", "choice": a.choice,
+            "probabilities": a.probabilities.iter()
+                .map(|(k, v)| (k.clone(), json!(v)))
+                .collect::<serde_json::Map<String, Value>>(),
+            "confidence": a.confidence,
+        }),
+        Answer::Score(a) => json!({
+            "type": "score", "score": a.score, "confidence": a.confidence,
+            "legend": a.legend.iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect::<serde_json::Map<String, Value>>(),
+            "probabilities": a.probabilities.iter()
+                .map(|(k, v)| (k.to_string(), json!(v)))
+                .collect::<serde_json::Map<String, Value>>(),
+        }),
+        // An answer variant a later SDK adds: this one has no shape to measure or print.
+        _ => Value::Null,
+    }
+}
+
 /// What `:models` shows offline.
 pub fn models() -> Vec<ModelMetadata> {
     [

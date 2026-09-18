@@ -15,16 +15,24 @@ pub enum Preview {
     Answers,
     /// The same request as a program against the SDK.
     Rust,
+    /// What a call would cost: tokens per question, priced when rates are set.
+    Cost,
 }
 
 impl Preview {
-    pub const ALL: [Preview; 3] = [Preview::Json, Preview::Answers, Preview::Rust];
+    pub const ALL: [Preview; 4] = [
+        Preview::Json,
+        Preview::Answers,
+        Preview::Rust,
+        Preview::Cost,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Preview::Json => "json",
             Preview::Answers => "answers",
             Preview::Rust => "rust",
+            Preview::Cost => "cost",
         }
     }
 
@@ -32,7 +40,8 @@ impl Preview {
         match self {
             Preview::Json => Preview::Answers,
             Preview::Answers => Preview::Rust,
-            Preview::Rust => Preview::Json,
+            Preview::Rust => Preview::Cost,
+            Preview::Cost => Preview::Json,
         }
     }
 }
