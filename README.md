@@ -132,7 +132,8 @@ The blocking client owns a private current-thread runtime; don't call it from in
 `jev` is a terminal REPL for shaping questions before you write any code:
 
 ```sh
-just repl            # or: cargo run -p jev-repl
+cargo install jev-repl && jev     # from crates.io
+just repl                         # from this checkout (or: cargo run -p jev-repl)
 ```
 
 ```text
@@ -191,8 +192,9 @@ be reordered. A page with problems is never applied; the cursor jumps to the fir
 The page is a file format too: `:save triage.jev` writes it, `:open triage.jev` reads it back, and
 `:sketch show` prints the current session in the notation.
 
-The REPL lives in [`jev-repl/`](jev-repl) as a separate workspace member, so its TUI dependencies
-stay out of the published library.
+The REPL lives in [`jev-repl/`](jev-repl) as a separate workspace member and is published as its
+own crate, [`jev-repl`](https://crates.io/crates/jev-repl), so its TUI dependencies stay out of
+the library.
 
 ## Configuration
 
@@ -289,10 +291,13 @@ just publish-dry    # package and verify locally, no upload
 just publish        # upload; needs a crates.io token (`cargo login`)
 ```
 
-Or let CI do it: push a tag matching the `version` in `Cargo.toml`
-(`git tag v0.1.0 && git push origin v0.1.0`). That runs
+The REPL is released the same way with `just publish-repl-dry` / `just publish-repl`; it depends
+on a published library version, so publish the library first when both change.
+
+Or let CI do it: push a tag matching the crate's `version` — `v0.1.0` for the library,
+`jev-v0.1.0` for the REPL (`git tag v0.1.0 && git push origin v0.1.0`). That runs
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which re-runs fmt, clippy and
-both test configurations, checks the tag against the manifest version, and publishes with the
+the tests, checks the tag against that crate's manifest version, and publishes it with the
 `CARGO_REGISTRY_TOKEN` repository secret.
 
 ## License

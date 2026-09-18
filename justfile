@@ -34,7 +34,14 @@ doc:
     cargo doc --all-features --no-deps --open
 
 publish-dry:
-    cargo publish --dry-run --locked
+    cargo publish -p typesafe-ai-sdk --dry-run --locked
 
 publish:
-    cargo publish --locked
+    cargo publish -p typesafe-ai-sdk --locked
+
+# the REPL is its own crate (`cargo install jev-repl`); publish the library version it needs first
+publish-repl-dry:
+    cargo publish -p jev-repl --dry-run --locked
+
+publish-repl:
+    cargo publish -p jev-repl --locked

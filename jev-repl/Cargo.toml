@@ -3,10 +3,12 @@ name = "jev-repl"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Interactive TUI playground for learning the jev model (TypeSafe AI System One)"
+description = "Terminal REPL for shaping TypeSafe AI System One requests: noul, choice and score questions, with a live sketch editor"
 license = "MIT"
 repository = "https://github.com/aoprisan/typesafe-ai-rust-sdk"
-publish = false
+readme = "README.md"
+keywords = ["typesafe", "ai", "repl", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "jev_repl"
