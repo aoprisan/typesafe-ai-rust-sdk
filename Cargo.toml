@@ -1,3 +1,6 @@
+[workspace]
+members = ["jev-repl"]
+
 [package]
 name = "typesafe-ai-sdk"
 version = "0.1.0"
