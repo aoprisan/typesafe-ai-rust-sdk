@@ -10,9 +10,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use typesafe::{Answer, Client, ListModelsResponse, Question, SystemOneResponse};
 
 use crate::builder::{Builder, Outcome};
+use crate::editor::{self, Editor};
 use crate::format::*;
 use crate::session::{self, Session};
-use crate::{codegen, highlight, lessons, mock, presets};
+use crate::{codegen, highlight, lessons, mock, presets, sketch};
 
 /// Everything that can move the app forward.
 pub enum Msg {
@@ -48,6 +49,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         ":build",
         "builder mode: a form with a live JSON preview (Ctrl-B)",
     ),
+    (
+        ":sketch",
+        "sketch mode: the whole request as one page of text (Ctrl-K) — :sketch show prints it",
+    ),
     (":questions", "list what will be sent"),
     (":rm", ":rm <name> — drop one question"),
     (":reset", "empty the session"),
@@ -64,7 +69,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (":timeout", ":timeout <seconds> — per-attempt timeout"),
     (":mock", ":mock on|off — offline simulated answers"),
     (":key", ":key [<api-key>] — API key status, or set one"),
-    (":save", ":save <path> / :open <path> — session JSON"),
+    (
+        ":save",
+        ":save <path> / :open <path> — session JSON, or a sketch if the path ends in .jev",
+    ),
     (":clear", "clear the transcript (Ctrl-L)"),
     (":quit", "leave (Ctrl-C)"),
 ];
@@ -91,6 +99,8 @@ pub struct App {
     pub last_raw: Option<String>,
     /// Some while builder mode is open.
     pub builder: Option<Builder>,
+    /// Some while sketch mode is open.
+    pub sketch: Option<Editor>,
     pub quit: bool,
     tx: UnboundedSender<Msg>,
 }
@@ -119,6 +129,7 @@ impl App {
             timeout: None,
             last_raw: None,
             builder: None,
+            sketch: None,
             quit: false,
             tx,
         };
@@ -196,7 +207,7 @@ impl App {
             self.note(format!("Live against {}.", self.model_name()));
         }
         self.blank();
-        self.note("Press Enter on an empty line to send. :help for commands, :lesson for the guided track, :build for the form.");
+        self.note("Press Enter on an empty line to send. :help for commands, :lesson for the guided track, :sketch to write the whole request as a page.");
         self.lesson_open = true;
         self.suggested = Some(lessons::LESSONS[0].try_this.to_owned());
     }
@@ -250,9 +261,14 @@ impl App {
             self.builder_key(key);
             return;
         }
+        if self.sketch.is_some() {
+            self.sketch_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Char('c' | 'd') if ctrl => self.quit = true,
             KeyCode::Char('b') if ctrl => self.open_builder(""),
+            KeyCode::Char('k') if ctrl => self.open_sketch(),
             KeyCode::Char('l') if ctrl => {
                 self.transcript.clear();
                 self.scroll = 0;
@@ -445,6 +461,10 @@ impl App {
             ":score" => self.add(session::parse_score(args)),
             ":raw" => self.add(session::parse_raw(args)),
             ":build" | ":b" => self.open_builder(args),
+            ":sketch" | ":page" => match args {
+                "show" | "print" => self.show_sketch(),
+                _ => self.open_sketch(),
+            },
             ":questions" | ":qs" => self.list_questions(),
             ":rm" | ":drop" => {
                 if self.session.remove(args) {
@@ -530,7 +550,7 @@ impl App {
         }
         self.blank();
         self.note("Bare text with no leading colon sets the state. Enter on an empty line sends.");
-        self.note("Keys: Ctrl-T try the lesson's command · Ctrl-N next lesson · PgUp/PgDn scroll · Ctrl-L clear · Ctrl-C quit");
+        self.note("Keys: Ctrl-T try the lesson's command · Ctrl-N next lesson · Ctrl-K sketch · PgUp/PgDn scroll · Ctrl-L clear · Ctrl-C quit");
         self.note(":help concepts explains noul, choice, score and confidence.");
     }
 
@@ -737,6 +757,83 @@ impl App {
         }
     }
 
+    /// Sketch mode: the whole session on one page, parsed as it is typed.
+    fn open_sketch(&mut self) {
+        let mut editor = Editor::new(&sketch::render(&self.session));
+        if self.session.state_is_empty() && self.session.questions.is_empty() {
+            editor.preview = editor::Preview::Answers;
+        }
+        self.sketch = Some(editor);
+        self.note("sketch mode — write the state, a --- line, then questions. ^S applies, ^G applies and sends, Esc closes.");
+    }
+
+    fn sketch_key(&mut self, key: KeyEvent) {
+        let Some(editor) = self.sketch.as_mut() else {
+            return;
+        };
+        let outcome = editor.key(key);
+        let send = match outcome {
+            editor::Outcome::Open => return,
+            editor::Outcome::Cancel => {
+                self.sketch = None;
+                self.note("sketch closed, session unchanged");
+                return;
+            }
+            editor::Outcome::Apply => false,
+            editor::Outcome::ApplyAndAsk => true,
+        };
+        let parsed = editor.parsed();
+        if !parsed.ok() {
+            let n = parsed.problems.len();
+            let first = &parsed.problems[0];
+            editor.row = first.line.min(editor.lines.len() - 1);
+            editor.col = 0;
+            editor.message = Some(format!(
+                "{n} problem{} to fix first — line {}: {}",
+                if n == 1 { "" } else { "s" },
+                first.line + 1,
+                first.message
+            ));
+            return;
+        }
+        let text = editor.text();
+        self.sketch = None;
+        self.apply_sketch(&parsed, &text);
+        if send {
+            self.ask();
+        }
+    }
+
+    /// Replace the session with a parsed page and say what changed.
+    fn apply_sketch(&mut self, parsed: &sketch::Parsed, text: &str) {
+        let before = self.session.request_json(&self.model_name());
+        // The page is the whole request: no `@model` line means the client default.
+        self.session = parsed.to_session();
+        let after = self.session.request_json(&self.model_name());
+        self.blank();
+        self.push(Line::from(vec![
+            Span::styled("› ", Style::new().fg(ACCENT)),
+            dim("sketch applied"),
+        ]));
+        if before == after {
+            self.note("nothing changed.");
+            return;
+        }
+        self.extend(sketch::highlight(text.trim_end()));
+        let n = self.session.questions.len();
+        self.note(format!(
+            "session ← {n} question{} from the page. Enter sends it; :json shows the body.",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn show_sketch(&mut self) {
+        self.heading("this session, as a sketch");
+        let text = sketch::render(&self.session);
+        self.extend(sketch::highlight(text.trim_end()));
+        self.note("`name?` asks yes/no · `label = why` lines make a choice · `low < high` makes a score · :sketch opens it for editing.");
+    }
+
     fn show_request(&mut self) {
         let model = self.model_name();
         let body = self.session.request_json(&model);
@@ -890,7 +987,11 @@ impl App {
             self.bad(":save <path>");
             return;
         }
-        let body = self.session.request_json(&self.model_name());
+        let body = if path.ends_with(".jev") {
+            sketch::render(&self.session)
+        } else {
+            self.session.request_json(&self.model_name())
+        };
         match std::fs::write(path, &body) {
             Ok(()) => self.note(format!("wrote {path}")),
             Err(e) => self.bad(format!("could not write {path}: {e}")),
@@ -909,6 +1010,17 @@ impl App {
                 return;
             }
         };
+        if path.ends_with(".jev") {
+            let parsed = sketch::parse(&text);
+            if let Some(p) = parsed.problems.first() {
+                self.bad(format!("{path}:{}: {}", p.line + 1, p.message));
+                return;
+            }
+            self.session = parsed.to_session();
+            self.note(format!("loaded {path}"));
+            self.list_questions();
+            return;
+        }
         match session::from_body(&text) {
             Ok(session) => {
                 self.session = session;

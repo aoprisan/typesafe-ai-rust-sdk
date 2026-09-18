@@ -17,7 +17,8 @@ async fn main() -> std::io::Result<()> {
         println!(
             "jev — a REPL for TypeSafe AI System One questions\n\n\
              Set TYPESAFE_API_KEY for live answers; without one, answers are simulated locally.\n\
-             Inside: :help for commands, :lesson for the guided track, :quit to leave."
+             Inside: :help for commands, :lesson for the guided track, :sketch to write a request\n\
+             as one page of text, :quit to leave."
         );
         return Ok(());
     }
