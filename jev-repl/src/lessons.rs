@@ -1,4 +1,4 @@
-//! The guided track: ten short lessons, each with one command to try.
+//! The guided track: eleven short lessons, each with one command to try.
 
 pub struct Lesson {
     pub title: &'static str,
@@ -77,6 +77,15 @@ pub const LESSONS: &[Lesson] = &[
             "`:last` prints the last response body verbatim, next to the typed answers the SDK decoded from it.",
         ],
         try_this: ":json",
+    },
+    Lesson {
+        title: "What a call costs",
+        body: &[
+            "Every question is paid for twice: once in the request that carries it, once in the answer it asks for. A choice over eight labels comes back with eight probabilities; a score echoes its whole legend.",
+            "`:cost` estimates both sides, per question, so an expensive question is visible before it is sent. The tokens are estimated from the body — the `usage` on a live answer is the counted truth.",
+            "Rates are yours to supply, in dollars per million tokens: `:cost 0.20/1.00`, or `JEV_PRICE=0.20/1.00` in the environment. Nothing here guesses what a model charges.",
+        ],
+        try_this: ":cost",
     },
     Lesson {
         title: "Models and per-call options",

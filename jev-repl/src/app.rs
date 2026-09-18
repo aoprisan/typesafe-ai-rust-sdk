@@ -13,7 +13,7 @@ use crate::builder::{Builder, Outcome};
 use crate::editor::{self, Editor};
 use crate::format::*;
 use crate::session::{self, Session};
-use crate::{codegen, highlight, lessons, mock, presets, sketch};
+use crate::{codegen, cost, highlight, lessons, mock, presets, sketch};
 
 /// Everything that can move the app forward.
 pub enum Msg {
@@ -59,6 +59,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (":ask", "send it (or press Enter on an empty line)"),
     (":json", "the exact request body this session POSTs"),
     (":last", "the last raw response body"),
+    (
+        ":cost",
+        "what a call costs — :cost <in>/<out> sets dollars per million tokens",
+    ),
     (":rust", "this session as a program against the SDK"),
     (
         ":threshold",
@@ -96,6 +100,8 @@ pub struct App {
     pub suggested: Option<String>,
     pub threshold: f64,
     pub timeout: Option<Duration>,
+    /// Dollars per million tokens, from `JEV_PRICE` or `:cost`; `None` counts tokens only.
+    pub rates: Option<cost::Rates>,
     pub last_raw: Option<String>,
     /// Some while builder mode is open.
     pub builder: Option<Builder>,
@@ -127,6 +133,7 @@ impl App {
             suggested: None,
             threshold: 0.5,
             timeout: None,
+            rates: cost::rates_from_env(),
             last_raw: None,
             builder: None,
             sketch: None,
@@ -480,6 +487,7 @@ impl App {
             ":ask" | ":send" => self.ask(),
             ":json" => self.show_request(),
             ":last" => self.show_last(),
+            ":cost" | ":price" => self.cost_cmd(args),
             ":rust" => self.show_rust(),
             ":threshold" => self.threshold_cmd(args),
             ":model" => self.model_cmd(args),
@@ -852,6 +860,56 @@ impl App {
         }
     }
 
+    /// `:cost` estimates the next call; `:cost <in>/<out>` puts a price on it, `:cost off` drops it.
+    fn cost_cmd(&mut self, args: &str) {
+        match args {
+            "off" | "clear" | "none" => {
+                self.rates = None;
+                self.note("rates cleared — :cost now counts tokens only.");
+                return;
+            }
+            "" => {}
+            _ => match cost::parse_rates(args) {
+                Ok(rates) => {
+                    self.rates = Some(rates);
+                    self.note(format!("rates ← {}", cost::format_rates(rates)));
+                }
+                Err(message) => {
+                    self.bad(message);
+                    return;
+                }
+            },
+        }
+        if self.session.questions.is_empty() {
+            self.warn(
+                "nothing to price yet — :noul, :choice or :score first (`:preset triage` loads a set).",
+            );
+            return;
+        }
+        let model = self.model_name();
+        let estimate = cost::estimate(&self.session, &model);
+        let rates = self.rates;
+        self.heading(format!("cost estimate  ·  {model}"));
+        self.extend(cost_lines(
+            &estimate,
+            rates,
+            ":cost 0.20/1.00 prices it: dollars per million tokens, input then output",
+        ));
+        self.note(
+            "Tokens are estimated from the body, not counted by the API's tokenizer; `usage` on a live answer is the real thing.",
+        );
+        self.note(
+            "Answer sizes come from the shapes you asked for: a score echoes its legend, a choice one probability per label.",
+        );
+        if let Some(rates) = rates {
+            self.note(format!(
+                "{}={} sets the same rates at startup.",
+                cost::PRICE_ENV,
+                cost::rates_value(rates)
+            ));
+        }
+    }
+
     fn show_rust(&mut self) {
         let model = self.model_name();
         let code = codegen::rust(&self.session, &model, self.threshold);
@@ -1106,12 +1164,31 @@ impl App {
             }
         }
         self.last_raw = Some(mock_body(&answers, &self.model_name()));
+        let estimate = cost::estimate(&self.session, &self.model_name());
+        let money = match self.rates {
+            Some(rates) => format!(
+                " · {}",
+                cost::usd(cost::price_estimate(&estimate, rates).total)
+            ),
+            None => String::new(),
+        };
+        self.note(format!(
+            "≈ {} in / {} out tokens{money} — estimated, since nothing was sent (:cost breaks it down).",
+            estimate.input_tokens, estimate.output_tokens
+        ));
         self.note(
             "Mock numbers are deterministic noise, not judgement. :key <api-key> for real answers.",
         );
     }
 
     fn show_response(&mut self, res: &SystemOneResponse, elapsed: Duration) {
+        let money = match self
+            .rates
+            .and_then(|rates| cost::price_usage(&res.usage, rates))
+        {
+            Some(cost) => format!(" · {}", cost::usd(cost.total)),
+            None => String::new(),
+        };
         self.blank();
         self.push(Line::from(vec![
             Span::styled(
@@ -1124,7 +1201,7 @@ impl App {
                 elapsed.as_secs_f64() * 1000.0,
                 res.meta.attempts,
                 match (res.usage.input_tokens, res.usage.output_tokens) {
-                    (Some(i), Some(o)) => format!(" · {i} in / {o} out tokens"),
+                    (Some(i), Some(o)) => format!(" · {i} in / {o} out tokens{money}"),
                     _ => String::new(),
                 }
             )),
@@ -1162,24 +1239,8 @@ fn mock_body(answers: &[(String, Option<Answer>)], model: &str) -> String {
     let mut map = serde_json::Map::new();
     for (name, answer) in answers {
         let value = match answer {
-            Some(Answer::Noul(a)) => serde_json::json!({"type": "noul", "noul": a.noul}),
-            Some(Answer::Choice(a)) => serde_json::json!({
-                "type": "choice", "choice": a.choice,
-                "probabilities": a.probabilities.iter()
-                    .map(|(k, v)| (k.clone(), serde_json::json!(v)))
-                    .collect::<serde_json::Map<String, Value>>(),
-                "confidence": a.confidence,
-            }),
-            Some(Answer::Score(a)) => serde_json::json!({
-                "type": "score", "score": a.score, "confidence": a.confidence,
-                "legend": a.legend.iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
-                    .collect::<serde_json::Map<String, Value>>(),
-                "probabilities": a.probabilities.iter()
-                    .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
-                    .collect::<serde_json::Map<String, Value>>(),
-            }),
-            _ => Value::Null,
+            Some(answer) => mock::answer_json(answer),
+            None => Value::Null,
         };
         map.insert(name.clone(), value);
     }
