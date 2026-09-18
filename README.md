@@ -132,7 +132,8 @@ The blocking client owns a private current-thread runtime; don't call it from in
 `jev` is a terminal REPL for shaping questions before you write any code:
 
 ```sh
-just repl            # or: cargo run -p jev-repl
+cargo install jev-repl && jev     # from crates.io
+just repl                         # from this checkout (or: cargo run -p jev-repl)
 ```
 
 ```text
@@ -145,14 +146,55 @@ just repl            # or: cargo run -p jev-repl
 ```
 
 - `:lesson` walks a ten-step track from "what is a noul" to confidence gating.
+- `:sketch` opens the whole request as one page of text (below).
 - `:build` opens a form for composing a question, with the JSON it will send rendered as you type.
 - `:json` shows the exact request body, `:last` the raw response, and `:rust` the same session as a
   program written against this SDK.
 - Without `TYPESAFE_API_KEY` it starts in mock mode: answers are simulated locally (deterministic,
   not predictive) so the shapes can be learned offline. `:key <api-key>` switches to live calls.
 
-The REPL lives in [`jev-repl/`](jev-repl) as a separate workspace member, so its TUI dependencies
-stay out of the published library.
+### Sketch mode: the request as a page
+
+Requests are rubrics, and rubrics are easier to write on paper than in a form. `:sketch` (or
+Ctrl-K) opens the session as one page of plain text; the type of each question is read off its
+punctuation, so there is nothing to select:
+
+```text
+The payout failed again, third time this month. I'm done waiting.
+---
+is_urgent? The message conveys urgency or time-sensitivity
+  yes: A deadline, a threat to leave, or "ASAP"
+  no: Routine, no time pressure
+
+department: Which team should handle this
+  billing = Payment or subscription issues
+  technical = Bugs or integration problems
+  sales
+
+frustration: How frustrated the customer appears
+  Calm < Frustrated but civil < Very angry
+```
+
+- Everything above the first `---` line is the state (JSON if it parses as JSON).
+- `name?` asks yes/no (a noul); `yes:` / `no:` lines describe the outcomes.
+- `name:` followed by `label = description` lines (or bare labels) is a choice.
+- `name:` followed by levels joined with `<` is a score, lowest first.
+- `name! {json}` sends a hand-built question object; `@model jev-2` pins the model; `#` comments.
+- Parts can share the first line: `tone: Rate the reply | Warm < Neutral < Hostile`.
+
+While you type, a gutter says what each line became (`noul`, `option`, `level`, …) and marks the
+ones it could not place, the status line explains whatever the cursor is on, and the pane beside
+the page cycles (Ctrl-P) between the JSON that would be sent, simulated answers so the shape of
+the response is visible before anything is sent, and the same request as Rust. Ctrl-S applies the
+page to the session, Ctrl-G applies and sends it, Alt-↑/↓ moves lines so questions and levels can
+be reordered. A page with problems is never applied; the cursor jumps to the first one instead.
+
+The page is a file format too: `:save triage.jev` writes it, `:open triage.jev` reads it back, and
+`:sketch show` prints the current session in the notation.
+
+The REPL lives in [`jev-repl/`](jev-repl) as a separate workspace member and is published as its
+own crate, [`jev-repl`](https://crates.io/crates/jev-repl), so its TUI dependencies stay out of
+the library.
 
 ## Configuration
 
@@ -249,10 +291,13 @@ just publish-dry    # package and verify locally, no upload
 just publish        # upload; needs a crates.io token (`cargo login`)
 ```
 
-Or let CI do it: push a tag matching the `version` in `Cargo.toml`
-(`git tag v0.1.0 && git push origin v0.1.0`). That runs
+The REPL is released the same way with `just publish-repl-dry` / `just publish-repl`; it depends
+on a published library version, so publish the library first when both change.
+
+Or let CI do it: push a tag matching the crate's `version` — `v0.1.0` for the library,
+`jev-v0.1.0` for the REPL (`git tag v0.1.0 && git push origin v0.1.0`). That runs
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which re-runs fmt, clippy and
-both test configurations, checks the tag against the manifest version, and publishes with the
+the tests, checks the tag against that crate's manifest version, and publishes it with the
 `CARGO_REGISTRY_TOKEN` repository secret.
 
 ## License
