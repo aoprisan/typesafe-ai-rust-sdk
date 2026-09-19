@@ -178,10 +178,10 @@ fn fnv(parts: &[&str]) -> u64 {
     for part in parts {
         for b in part.as_bytes() {
             h ^= *b as u64;
-            h = h.wrapping_mul(0x1000_0000_01b3);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
         h ^= 0xff;
-        h = h.wrapping_mul(0x1000_0000_01b3);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
 }

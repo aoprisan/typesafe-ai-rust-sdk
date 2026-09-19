@@ -127,6 +127,27 @@ fn mock_answers_are_deterministic() {
     let second = mock::answer(&state, "urgent", &q);
     assert_eq!(format!("{first:?}"), format!("{second:?}"));
     assert!(mock::answer(&state, "x", &json!({"type": "mystery"})).is_none());
+
+    // Pinned, because the TypeScript port simulates from the same FNV-1a seed and the two are
+    // meant to answer a page identically. The same vectors are asserted there.
+    let noul = mock::answer(&state, "urgent", &q).map(|a| mock::answer_json(&a));
+    assert_eq!(noul, Some(json!({"type": "noul", "noul": 0.742})));
+    let choice = mock::answer(
+        &state,
+        "team",
+        &json!({"type": "choice", "instructions": "which team",
+                "criteria": {"billing": "money", "technical": "bugs"}}),
+    )
+    .map(|a| mock::answer_json(&a));
+    assert_eq!(
+        choice,
+        Some(json!({
+            "type": "choice",
+            "choice": "billing",
+            "probabilities": {"billing": 0.599, "technical": 0.401},
+            "confidence": 0.198
+        }))
+    );
 }
 
 #[test]
