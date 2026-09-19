@@ -189,3 +189,21 @@ fn fnv(parts: &[&str]) -> u64 {
 fn round(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
 }
+
+/// The body the mock answers would have arrived in — so `:last` teaches the same shape offline.
+pub fn body(answers: &[(String, Option<Answer>)], model: &str) -> String {
+    let mut map = serde_json::Map::new();
+    for (name, answer) in answers {
+        let value = match answer {
+            Some(answer) => answer_json(answer),
+            None => Value::Null,
+        };
+        map.insert(name.clone(), value);
+    }
+    serde_json::to_string_pretty(&serde_json::json!({
+        "model": model,
+        "answers": map,
+        "usage": {"input_tokens": null, "output_tokens": null},
+    }))
+    .unwrap_or_default()
+}
