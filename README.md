@@ -157,6 +157,11 @@ just repl                         # from this checkout (or: cargo run -p jev-rep
   reports.
 - Without `TYPESAFE_API_KEY` it starts in mock mode: answers are simulated locally (deterministic,
   not predictive) so the shapes can be learned offline. `:key <api-key>` switches to live calls.
+- A session saved with `:save` runs from a script: with a subcommand `jev` opens no terminal at
+  all, so `jev run triage.jev` sends the page and prints the answers, `jev run --json` hands the
+  raw body to `jq`, and `jev json`, `jev cost`, `jev rust` and `jev check` print the body, the
+  token table, the code and the parse. Exit status is 0 when it worked, 1 when the call or the
+  file did not, 2 when the command line did not parse.
 
 ### Sketch mode: the request as a page
 

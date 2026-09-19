@@ -6,6 +6,7 @@ pub mod codegen;
 pub mod cost;
 pub mod editor;
 pub mod format;
+pub mod headless;
 pub mod highlight;
 pub mod lessons;
 pub mod mock;

@@ -1163,7 +1163,7 @@ impl App {
                 )),
             }
         }
-        self.last_raw = Some(mock_body(&answers, &self.model_name()));
+        self.last_raw = Some(mock::body(&answers, &self.model_name()));
         let estimate = cost::estimate(&self.session, &self.model_name());
         let money = match self.rates {
             Some(rates) => format!(
@@ -1232,22 +1232,4 @@ fn masked(key: &str) -> String {
         .rev()
         .collect();
     format!("…{tail}")
-}
-
-/// The body the mock answers would have arrived in — so `:last` teaches the same shape offline.
-fn mock_body(answers: &[(String, Option<Answer>)], model: &str) -> String {
-    let mut map = serde_json::Map::new();
-    for (name, answer) in answers {
-        let value = match answer {
-            Some(answer) => mock::answer_json(answer),
-            None => Value::Null,
-        };
-        map.insert(name.clone(), value);
-    }
-    serde_json::to_string_pretty(&serde_json::json!({
-        "model": model,
-        "answers": map,
-        "usage": {"input_tokens": null, "output_tokens": null},
-    }))
-    .unwrap_or_default()
 }
