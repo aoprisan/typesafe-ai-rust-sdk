@@ -46,5 +46,13 @@ wiremock = "0.6.5"
 [[example]]
 name = "triage"
 
+[[example]]
+name = "blocking"
+required-features = ["blocking"]
+
+[[example]]
+name = "custom_client"
+required-features = ["reqwest-client"]
+
 [package.metadata.docs.rs]
 all-features = true
