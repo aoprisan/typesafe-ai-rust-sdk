@@ -61,6 +61,19 @@ async fn main() -> typesafe::Result<()> {
 
 `cargo run --example triage` runs the same flow against the live API.
 
+## Examples
+
+[`examples/`](examples) holds a program per topic — routing, moderation, batching, retries,
+error handling, the blocking client, and a fully configured one. Start with
+[`examples/errors.rs`](examples/errors.rs), which needs neither a key nor a network:
+
+```sh
+cargo run --example errors
+cargo run --example triage           # needs TYPESAFE_API_KEY
+```
+
+See [`examples/README.md`](examples/README.md) for the whole list.
+
 ### State
 
 `state` is anything `Serialize`: a string, `json!({...})`, or your own struct.
