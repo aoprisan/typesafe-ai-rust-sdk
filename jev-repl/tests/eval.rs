@@ -1,5 +1,9 @@
 //! Scoring a rubric: the cases file, the metrics, the runner and the two reports.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use jev_repl::cost::Rates;
 use jev_repl::evaluate::{
     self, CaseError, Expectation, GateRow, Outcome, QuestionReport, Report, ReportOptions,
@@ -567,4 +571,124 @@ fn rounds_a_tie_away_from_zero_the_way_to_fixed_does() {
     assert_eq!(evaluate::two(0.125), "0.13");
     assert_eq!(evaluate::two(0.005), "0.01");
     assert_eq!(evaluate::two(0.0), "0.00");
+}
+
+fn five_cases() -> Vec<String> {
+    (0..5)
+        .map(|i| format!(r#"{{"state": "case {i}", "expect": {{"is_urgent": true}}}}"#))
+        .collect()
+}
+
+#[tokio::test]
+async fn keeps_at_most_concurrency_calls_in_the_air_and_asks_every_case_once() {
+    let s = session();
+    let lines = five_cases();
+    let parsed = cases(&lines.join("\n"), &s);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let flying = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let outcomes = {
+        let (asked, flying, most) = (asked.clone(), flying.clone(), most.clone());
+        evaluate::run(
+            &s,
+            &parsed,
+            move |one| {
+                let (asked, flying, most) = (asked.clone(), flying.clone(), most.clone());
+                async move {
+                    let now = flying.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    asked.lock().expect("the log").push(one.state_preview());
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    flying.fetch_sub(1, Ordering::SeqCst);
+                    answered(&[("is_urgent", noul(0.9))], None)
+                }
+            },
+            2,
+        )
+        .await
+    };
+    assert_eq!(most.load(Ordering::SeqCst), 2);
+    let mut seen = asked.lock().expect("the log").clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        (0..5).map(|i| format!("case {i}")).collect::<Vec<_>>()
+    );
+    assert_eq!(outcomes.len(), 5);
+}
+
+#[tokio::test]
+async fn reports_in_case_order_however_the_calls_finished() {
+    let s = session();
+    let lines = five_cases();
+    let parsed = cases(&lines.join("\n"), &s);
+    let total = parsed.len() as u64;
+    let outcomes = evaluate::run(
+        &s,
+        &parsed,
+        move |one| async move {
+            let at: u64 = one.state_preview()[5..].parse().expect("the case number");
+            // The last case answers first, the first case last.
+            tokio::time::sleep(Duration::from_millis((total - at) * 4)).await;
+            answered(&[("is_urgent", noul(at as f64 / 10.0))], None)
+        },
+        5,
+    )
+    .await;
+    let probabilities: Vec<f64> = outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            Outcome::Ok { answers, .. } => match &answers[0].1 {
+                Some(typesafe::Answer::Noul(a)) => a.noul,
+                _ => -1.0,
+            },
+            Outcome::Failed { .. } => -1.0,
+        })
+        .collect();
+    assert_eq!(probabilities, vec![0.0, 0.1, 0.2, 0.3, 0.4]);
+}
+
+#[tokio::test]
+async fn turns_a_refused_call_into_an_outcome_and_carries_on() {
+    let s = session();
+    let lines = five_cases();
+    let parsed = cases(&lines.join("\n"), &s);
+    let outcomes = evaluate::run(
+        &s,
+        &parsed,
+        |one| async move {
+            if one.state_preview() == "case 2" {
+                failed("the socket went away")
+            } else {
+                answered(&[("is_urgent", noul(0.9))], None)
+            }
+        },
+        2,
+    )
+    .await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, Outcome::Ok { .. }))
+            .count(),
+        4
+    );
+    let Outcome::Failed { error } = &outcomes[2] else {
+        panic!("case 2 failed")
+    };
+    assert!(error.contains("the socket went away"), "{error}");
+}
+
+#[tokio::test]
+async fn does_not_mind_more_workers_than_there_are_cases() {
+    let s = session();
+    let parsed = cases(&five_cases()[0], &s);
+    let outcomes = evaluate::run(
+        &s,
+        &parsed,
+        |_| async { answered(&[("is_urgent", noul(0.9))], None) },
+        16,
+    )
+    .await;
+    assert_eq!(outcomes.len(), 1);
 }

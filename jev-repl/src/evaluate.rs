@@ -10,7 +10,12 @@
 //! the report goes out as lines and JSON. Reading files, hashing request bodies and talking to the
 //! API belong to the caller.
 
+use std::future::Future;
+use std::sync::Arc;
+
 use serde_json::Value;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use typesafe::{Answer, Choice, Question, Usage};
 
 use crate::cost::{self, Cost, Rates};
@@ -185,6 +190,50 @@ pub enum Outcome {
     Failed {
         error: String,
     },
+}
+
+/// Send every case through `ask`, at most `concurrency` at a time; results are in case order.
+///
+/// Every case is spawned at once and a semaphore decides how many are in the air, so a slow case
+/// holds up nothing but itself, and each result is written to its own slot: a file of a thousand
+/// labels keeps its order however the calls come back.
+pub async fn run<F, Fut>(
+    session: &Session,
+    cases: &[Case],
+    ask: F,
+    concurrency: usize,
+) -> Vec<Outcome>
+where
+    F: Fn(Session) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Outcome> + Send + 'static,
+{
+    let permits = Arc::new(Semaphore::new(concurrency.max(1)));
+    let mut workers = JoinSet::new();
+    for (at, one) in cases.iter().enumerate() {
+        let session = with_state(session, one.state.clone());
+        let ask = ask.clone();
+        let permits = Arc::clone(&permits);
+        workers.spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            (at, ask(session).await)
+        });
+    }
+
+    let mut outcomes: Vec<Option<Outcome>> = vec![None; cases.len()];
+    while let Some(joined) = workers.join_next().await {
+        // A worker that panicked leaves its slot empty; the run is not lost to one case.
+        if let Ok((at, outcome)) = joined {
+            outcomes[at] = Some(outcome);
+        }
+    }
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome.unwrap_or_else(|| Outcome::Failed {
+                error: "nothing was sent for this case.".to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// One row of a noul's threshold sweep: the confusion counts, and what they come to.
