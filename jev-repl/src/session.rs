@@ -28,13 +28,7 @@ impl Session {
     }
 
     pub fn state_is_empty(&self) -> bool {
-        match &self.state {
-            Value::Null => true,
-            Value::String(s) => s.trim().is_empty(),
-            Value::Array(a) => a.is_empty(),
-            Value::Object(o) => o.is_empty(),
-            _ => false,
-        }
+        is_empty_value(&self.state)
     }
 
     /// One-line preview of the state for the side panel.
@@ -84,6 +78,20 @@ impl Session {
             questions: &questions,
         })
         .unwrap_or_else(|e| format!("<unencodable: {e}>"))
+    }
+}
+
+/// Whether a value is empty enough that there is nothing to judge.
+///
+/// A case's state is arbitrary JSON and is held to the same bar as a session's, so the rule lives
+/// here rather than inside [`Session::state_is_empty`].
+pub fn is_empty_value(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
     }
 }
 
