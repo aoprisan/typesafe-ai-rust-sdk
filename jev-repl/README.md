@@ -79,6 +79,7 @@ the command line did not parse.
 ```sh
 jev run triage.jev                       # send it; the answers, with their distributions
 jev run triage.jev --json | jq .answers  # the raw response body instead
+jev eval triage.jev --cases cases.jsonl  # score the rubric over states you have labelled
 jev json triage.jev                      # the exact request body it would POST
 jev cost triage.jev --price 0.20/1.00    # the token table, priced
 jev rust triage.jev                      # the session as a program against the SDK
@@ -97,6 +98,62 @@ jev run triage.jev --state "$(cat ticket.txt)" --json | jq '.answers.is_urgent.n
 says what counts as a yes for a noul, `--price <in>/<out>` prices the table, `--timeout <seconds>`
 bounds a live attempt, and `--mock` stays offline even with a key set. Without a key `jev run`
 simulates the answers and says so on stderr, so the stdout of a mock run is still the answer page.
+
+### Scoring a rubric
+
+One call tells you what the model said about one ticket. It does not tell you where to put the
+threshold, or how sure a choice has to be before a script may act on it — and this README leaves
+both calls to you. `jev eval` is how you make them with data: it runs a saved page over states you
+have already labelled and reports what the rubric got right.
+
+```sh
+jev eval triage.jev --cases cases.jsonl --price 0.20/1.00
+jev eval triage.jev --cases cases.jsonl --json | jq .questions.is_urgent.best
+```
+
+The cases are JSON Lines, one labelled state per line. `state` is what to judge — a string or any
+JSON — and `expect` names the questions on the page it is labelled for; questions it leaves out are
+still asked and simply not scored. An `id` is optional and shows up in the report.
+
+```jsonl
+{"id": "t-001", "state": "Stripe has been failing for 3 days, I'm losing sales", "expect": {"is_urgent": true, "department": "technical", "frustration": 2}}
+{"state": {"subject": "Invoice question", "body": "Can I get a copy of last month's invoice?"}, "expect": {"department": "billing", "is_urgent": false}}
+```
+
+An expectation is written the way its question is answered: a noul takes `true` or `false`, a
+choice takes one of its option labels, and a score takes a level index or the text of one of its
+levels. A bad line stops the run before anything is sent, named by its line in the file.
+
+```text
+  is_urgent    noul    40 cases · Brier 0.11
+    threshold   acc   prec   rec    f1
+    0.40        0.82  0.74   0.94   0.83
+    0.50 *      0.85  0.80   0.89   0.84
+    0.60        0.88  0.86   0.89   0.87
+    best f1 at 0.60
+
+  department   choice  40 cases · accuracy 0.78
+    confidence ≥   coverage  accuracy
+    0.00           1.00      0.78
+    0.60           0.55      0.95
+    confusion, rows expected, columns predicted
+                billing  technical  sales
+    billing     12       2          0
+
+  40 cases · 40 answered · 0 errors
+  4812 in / 3120 out tokens · $0.0041
+```
+
+That is the whole point of the table: the sweep says what a threshold buys, and the gate says what
+a confidence bar buys — 0.95 accuracy over 55% of the tickets, with the rest going to a person.
+
+`--cases <file>` is the only new flag that is required; `-` reads them from stdin, which the page
+cannot also do. `--concurrency <n>` sends that many at a time (default 4), `--cache <dir>` keeps
+each response so a second run sends nothing, `--max-cost <dollars>` refuses a run whose estimate is
+above it (rates required), and `--min-accuracy <0-1>` exits 1 when a question scores below it. A
+live run prints its estimate on stderr before sending anything. `--state` does not apply: the cases
+carry the states. Exit status is 0 when every case answered and every bar was met, 1 when a case
+errored or a bar was missed, 2 when the command line did not parse.
 
 Without `TYPESAFE_API_KEY` it starts in mock mode: answers are simulated locally (deterministic,
 not predictive) so the shapes can be learned offline. `:key <api-key>` switches to live calls.
