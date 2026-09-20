@@ -1037,7 +1037,7 @@ pub fn report_json(report: &Report) -> Value {
     usage.insert("outputTokens".to_owned(), json!(report.usage.output_tokens));
     usage.insert("estimated".to_owned(), json!(report.usage.estimated));
     if let Some(cost) = report.usage.cost {
-        usage.insert("cost".to_owned(), json!(cost.total));
+        usage.insert("cost".to_owned(), number(cost.total));
     }
     let errors: Vec<Value> = report
         .errors
@@ -1054,7 +1054,7 @@ pub fn report_json(report: &Report) -> Value {
         .collect();
     json!({
         "model": report.model,
-        "threshold": report.threshold,
+        "threshold": number(report.threshold),
         "cases": report.cases,
         "answered": report.answered,
         "errors": errors,
@@ -1075,19 +1075,19 @@ fn question_json(question: &QuestionReport) -> Value {
         } => json!({
             "kind": question.kind(),
             "cases": cases,
-            "brier": brier,
-            "accuracy": accuracy,
-            "best": {"threshold": best.threshold, "f1": best.f1},
+            "brier": number(*brier),
+            "accuracy": number(*accuracy),
+            "best": {"threshold": number(best.threshold), "f1": number(best.f1)},
             "sweep": sweep.iter().map(|row| json!({
-                "threshold": row.threshold,
+                "threshold": number(row.threshold),
                 "tp": row.tp,
                 "fp": row.fp,
                 "fn": row.r#fn,
                 "tn": row.tn,
-                "accuracy": row.accuracy,
-                "precision": row.precision,
-                "recall": row.recall,
-                "f1": row.f1,
+                "accuracy": number(row.accuracy),
+                "precision": maybe(row.precision),
+                "recall": maybe(row.recall),
+                "f1": number(row.f1),
             })).collect::<Vec<_>>(),
         }),
         QuestionReport::Choice {
@@ -1100,7 +1100,7 @@ fn question_json(question: &QuestionReport) -> Value {
         } => json!({
             "kind": question.kind(),
             "cases": cases,
-            "accuracy": accuracy,
+            "accuracy": number(*accuracy),
             "labels": labels,
             "confusion": confusion,
             "gate": gate.iter().map(gate_json).collect::<Vec<_>>(),
@@ -1115,16 +1115,34 @@ fn question_json(question: &QuestionReport) -> Value {
         } => json!({
             "kind": question.kind(),
             "cases": cases,
-            "exact": exact,
-            "withinOne": within_one,
-            "mae": mae,
+            "exact": number(*exact),
+            "withinOne": number(*within_one),
+            "mae": number(*mae),
             "gate": gate.iter().map(gate_json).collect::<Vec<_>>(),
         }),
     }
 }
 
 fn gate_json(row: &GateRow) -> Value {
-    json!({"confidence": row.confidence, "coverage": row.coverage, "accuracy": row.accuracy})
+    json!({
+        "confidence": number(row.confidence),
+        "coverage": number(row.coverage),
+        "accuracy": maybe(row.accuracy),
+    })
+}
+
+/// A number written the way `JSON.stringify` writes it: a whole float loses its `.0`, so the two
+/// ports' JSON reports can be compared byte for byte the way their tables can.
+fn number(x: f64) -> Value {
+    if x.fract() == 0.0 && x.abs() < 9e15 {
+        return json!(x as i64);
+    }
+    json!(x)
+}
+
+/// The same, for a rate that was never defined: `null`, so the key is always there.
+fn maybe(x: Option<f64>) -> Value {
+    x.map_or(Value::Null, number)
 }
 
 /// A rate that was never defined is a dot, not a zero: nothing was measured.

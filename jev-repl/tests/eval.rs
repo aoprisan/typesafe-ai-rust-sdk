@@ -829,7 +829,7 @@ fn has_the_shape_a_script_can_read() {
     assert_eq!(urgent["kind"], "noul");
     assert_eq!(urgent["cases"], 2);
     assert_eq!(urgent["accuracy"], 1.0);
-    assert_eq!(urgent["best"], json!({"threshold": 0.5, "f1": 1.0}));
+    assert_eq!(urgent["best"], json!({"threshold": 0.5, "f1": 1}));
     assert_eq!(
         json["questions"]["department"]["labels"],
         json!(["billing", "technical", "sales", "other"])
@@ -837,6 +837,11 @@ fn has_the_shape_a_script_can_read() {
     assert_eq!(
         json["usage"],
         json!({"inputTokens": 200, "outputTokens": 40, "estimated": false, "cost": 0.00008})
+    );
+    // A whole number loses its `.0`, the way `JSON.stringify` writes it.
+    assert_eq!(
+        serde_json::to_string(&urgent["best"]).expect("json"),
+        r#"{"threshold":0.5,"f1":1}"#
     );
     let first = &urgent["sweep"][0];
     assert_eq!(first["threshold"], 0.1);
