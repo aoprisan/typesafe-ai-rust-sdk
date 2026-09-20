@@ -692,3 +692,187 @@ async fn does_not_mind_more_workers_than_there_are_cases() {
     .await;
     assert_eq!(outcomes.len(), 1);
 }
+
+const EVERY: [&str; 3] = [
+    r#"{"id": "t-001", "state": "one", "expect": {"is_urgent": true, "department": "billing", "frustration": 2}}"#,
+    r#"{"state": "two", "expect": {"is_urgent": false, "department": "technical", "frustration": 0}}"#,
+    r#"{"state": "three", "expect": {"is_urgent": true, "department": "sales"}}"#,
+];
+
+fn every(p: f64, label: &str, level: f64) -> Vec<(&'static str, typesafe::Answer)> {
+    vec![
+        ("is_urgent", noul(p)),
+        ("department", choice(label, 0.7)),
+        ("frustration", score(level, 0.4)),
+    ]
+}
+
+fn text_report() -> String {
+    let report = scored(
+        &EVERY,
+        vec![
+            answered(&every(0.9, "billing", 2.0), Some(usage(100, 20))),
+            answered(&every(0.2, "sales", 1.0), Some(usage(100, 20))),
+            failed("Timeout  the request did not complete\n    kind: timeout"),
+        ],
+        0.5,
+        None,
+    );
+    evaluate::report_text(&report)
+}
+
+/// The one line of the report that mentions `needle`, for the landmarks that are a whole row.
+fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
+    text.lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no line mentions {needle} in\n{text}"))
+}
+
+#[test]
+fn gives_every_question_a_block_that_says_what_it_is_and_what_it_scored() {
+    let text = text_report();
+    let urgent = line_with(&text, "is_urgent");
+    assert!(urgent.contains("noul"), "{urgent}");
+    assert!(urgent.contains("2 cases · Brier"), "{urgent}");
+    let department = line_with(&text, "department");
+    assert!(department.contains("choice"), "{department}");
+    assert!(department.contains("2 cases · accuracy"), "{department}");
+    let frustration = line_with(&text, "frustration");
+    assert!(frustration.contains("score"), "{frustration}");
+    assert!(
+        frustration.contains("2 cases · exact 0.50 · within one 1.00 · mae 0.50"),
+        "{frustration}"
+    );
+}
+
+#[test]
+fn marks_the_threshold_this_run_used_and_names_the_best_one() {
+    let text = text_report();
+    assert!(text.contains("0.50 *"), "{text}");
+    assert!(text.contains("best f1 at 0."), "{text}");
+}
+
+#[test]
+fn draws_the_gate_and_the_matrix() {
+    let text = text_report();
+    assert!(text.contains("confidence ≥"), "{text}");
+    assert!(
+        text.contains("confusion, rows expected, columns predicted"),
+        "{text}"
+    );
+    assert!(text.contains("technical"), "{text}");
+}
+
+#[test]
+fn names_the_cases_that_did_not_answer_and_totals_the_run() {
+    let text = text_report();
+    assert!(text.contains("case 3: Timeout"), "{text}");
+    assert!(text.contains("3 cases · 2 answered · 1 error"), "{text}");
+    assert!(text.contains("200 in / 40 out tokens"), "{text}");
+    // A dot stands where a rate was never defined.
+    assert!(text.contains('·'), "{text}");
+}
+
+#[test]
+fn marks_an_estimate_as_one() {
+    let report = scored(
+        &EVERY[..1],
+        vec![answered(&every(0.9, "billing", 2.0), None)],
+        0.5,
+        None,
+    );
+    let text = evaluate::report_text(&report);
+    assert!(text.contains('≈'), "{text}");
+    assert!(text.contains("estimated, nothing was counted"), "{text}");
+}
+
+fn json_report() -> serde_json::Value {
+    let report = scored(
+        &[
+            r#"{"id": "t-001", "state": "one", "expect": {"is_urgent": true, "department": "billing"}}"#,
+            r#"{"state": "two", "expect": {"is_urgent": false, "department": "technical"}}"#,
+        ],
+        vec![
+            answered(
+                &[
+                    ("is_urgent", noul(0.85)),
+                    ("department", choice("billing", 0.9)),
+                ],
+                Some(usage(100, 20)),
+            ),
+            answered(
+                &[
+                    ("is_urgent", noul(0.45)),
+                    ("department", choice("legal", 0.1)),
+                ],
+                Some(usage(100, 20)),
+            ),
+        ],
+        0.5,
+        Some(Rates {
+            input: 0.2,
+            output: 1.0,
+        }),
+    );
+    evaluate::report_json(&report)
+}
+
+#[test]
+fn has_the_shape_a_script_can_read() {
+    let json = json_report();
+    assert_eq!(json["model"], "jev-latest");
+    assert_eq!(json["threshold"], 0.5);
+    assert_eq!(json["cases"], 2);
+    assert_eq!(json["answered"], 2);
+    assert_eq!(json["errors"], json!([]));
+    let urgent = &json["questions"]["is_urgent"];
+    assert_eq!(urgent["kind"], "noul");
+    assert_eq!(urgent["cases"], 2);
+    assert_eq!(urgent["accuracy"], 1.0);
+    assert_eq!(urgent["best"], json!({"threshold": 0.5, "f1": 1.0}));
+    assert_eq!(
+        json["questions"]["department"]["labels"],
+        json!(["billing", "technical", "sales", "other"])
+    );
+    assert_eq!(
+        json["usage"],
+        json!({"inputTokens": 200, "outputTokens": 40, "estimated": false, "cost": 0.00008})
+    );
+    let first = &urgent["sweep"][0];
+    assert_eq!(first["threshold"], 0.1);
+    assert_eq!((&first["tp"], &first["fp"]), (&json!(1), &json!(1)));
+    assert_eq!((&first["fn"], &first["tn"]), (&json!(0), &json!(0)));
+}
+
+#[test]
+fn keeps_what_is_undefined_as_null_so_the_keys_are_always_there() {
+    let json = json_report();
+    let sweep = json["questions"]["is_urgent"]["sweep"]
+        .as_array()
+        .expect("a sweep")
+        .clone();
+    let last = sweep.last().expect("a last row");
+    assert_eq!(last["threshold"], 0.9);
+    assert_eq!(last["precision"], json!(null));
+    assert_eq!(last["recall"], 0.0);
+}
+
+#[test]
+fn adds_up_what_every_case_would_cost_before_anything_is_sent() {
+    let s = session();
+    let parsed = cases(&URGENT.join("\n"), &s);
+    let one = evaluate::preflight(&s, &parsed[..1], "jev-latest", None);
+    let all = evaluate::preflight(
+        &s,
+        &parsed,
+        "jev-latest",
+        Some(Rates {
+            input: 0.2,
+            output: 1.0,
+        }),
+    );
+    assert_eq!(all.cases, 4);
+    assert!(all.input_tokens > one.input_tokens);
+    assert!(all.cost.expect("a price").total > 0.0);
+    assert_eq!(one.cost, None);
+}
