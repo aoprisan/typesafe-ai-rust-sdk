@@ -273,3 +273,374 @@ async fn mock_stays_offline_even_with_a_key_set() {
     assert_eq!(out.status, 0, "{}", out.stderr);
     assert!(out.stderr.contains("Simulated answers"), "{}", out.stderr);
 }
+
+const EVAL_PAGE: &str = "placeholder
+---
+is_urgent? The message conveys urgency
+department: Which team should handle this
+  billing = Payment or subscription issues
+  technical = Bugs or integration problems
+  sales = Pricing and plans
+frustration: How frustrated the customer appears
+  Calm < Frustrated but civil < Very angry
+";
+
+const EVAL_CASES: &str = concat!(
+    r#"{"id": "t-001", "state": "Stripe has been failing for 3 days", "expect": {"is_urgent": true, "department": "technical", "frustration": 2}}"#,
+    "\n",
+    r#"{"state": "Can I get a copy of last month's invoice?", "expect": {"department": "billing", "is_urgent": false}}"#,
+    "\n",
+    r#"{"state": "What does the enterprise plan include?", "expect": {"department": "sales", "frustration": 0}}"#,
+);
+
+/// A directory of this test's own, so the pages and cases files do not collide.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("jev-eval-{}-{name}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    dir
+}
+
+/// A page and a cases file on disk, for the duration of one test.
+fn with_files(name: &str, cases: &str, run: impl FnOnce(&str, &str)) {
+    let dir = scratch(name);
+    let page = dir.join("triage.jev");
+    let path = dir.join("cases.jsonl");
+    std::fs::write(&page, EVAL_PAGE).expect("the page is written");
+    std::fs::write(&path, cases).expect("the cases are written");
+    run(
+        page.to_str().expect("a path"),
+        path.to_str().expect("a path"),
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reports_every_question_it_was_given_labels_for() {
+    with_files("reports", EVAL_CASES, |page, cases| {
+        let out = jev(&["eval", page, "--cases", cases, "--mock"], "", &[]);
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        for (name, kind) in [
+            ("is_urgent", "noul"),
+            ("department", "choice"),
+            ("frustration", "score"),
+        ] {
+            let line = out
+                .stdout
+                .lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("no line for {name} in\n{}", out.stdout));
+            assert!(line.contains(kind), "{line}");
+        }
+        assert!(out.stdout.contains("best f1 at"), "{}", out.stdout);
+        assert!(
+            out.stdout.contains("3 cases · 3 answered · 0 errors"),
+            "{}",
+            out.stdout
+        );
+        assert!(out.stderr.contains("Simulated answers"), "{}", out.stderr);
+    });
+}
+
+#[test]
+fn prints_the_whole_report_as_json_for_a_script_to_read() {
+    with_files("json", EVAL_CASES, |page, cases| {
+        let out = jev(
+            &["eval", page, "--cases", cases, "--mock", "--json"],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        let report: Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+        assert_eq!(report["cases"], 3);
+        let questions: Vec<&String> = report["questions"]
+            .as_object()
+            .expect("the questions")
+            .keys()
+            .collect();
+        assert_eq!(questions, ["is_urgent", "department", "frustration"]);
+    });
+}
+
+#[test]
+fn refuses_a_cases_file_with_a_bad_line_and_says_which_line() {
+    let broken = format!("{EVAL_CASES}\n{{\"state\": \"no expectations\"}}");
+    with_files("broken", &broken, |page, cases| {
+        let out = jev(&["eval", page, "--cases", cases, "--mock"], "", &[]);
+        assert_eq!(out.status, 1);
+        assert!(out.stderr.contains("cases line 4:"), "{}", out.stderr);
+    });
+}
+
+#[test]
+fn exits_2_on_a_command_line_eval_cannot_use() {
+    with_files("usage", EVAL_CASES, |page, cases| {
+        let state = jev(
+            &["eval", page, "--cases", cases, "--mock", "--state", "hello"],
+            "",
+            &[],
+        );
+        assert_eq!(state.status, 2);
+        assert!(
+            state
+                .stderr
+                .contains("--state does not apply to eval: the cases carry the states."),
+            "{}",
+            state.stderr
+        );
+
+        let rateless = jev(
+            &["eval", page, "--cases", cases, "--mock", "--max-cost", "1"],
+            "",
+            &[],
+        );
+        assert_eq!(rateless.status, 2);
+        assert!(
+            rateless
+                .stderr
+                .contains("--max-cost needs rates: pass --price <in>/<out> or set JEV_PRICE."),
+            "{}",
+            rateless.stderr
+        );
+
+        assert_eq!(
+            jev(
+                &["eval", page, "--cases", cases, "--concurrency", "0"],
+                "",
+                &[]
+            )
+            .status,
+            2
+        );
+        let both = jev(&["eval", "--cases", "-", "--mock"], EVAL_PAGE, &[]);
+        assert!(
+            both.stderr
+                .contains("the page and the cases cannot both come from stdin."),
+            "{}",
+            both.stderr
+        );
+        assert_eq!(jev(&["eval", page, "--mock"], "", &[]).status, 2);
+    });
+}
+
+#[test]
+fn exits_1_and_names_the_question_when_a_bar_is_not_met() {
+    // The simulator is deterministic, so a case can be labelled with what it is bound to get wrong.
+    let state = json!("A payout failed again.");
+    let answer = jev_repl::mock::answer(
+        &state,
+        "is_urgent",
+        &json!({"type": "noul", "instructions": "The message conveys urgency"}),
+    );
+    let yes = matches!(answer, Some(typesafe::Answer::Noul(a)) if a.is_yes(0.5));
+    let cases = format!(
+        r#"{{"state": {state}, "expect": {{"is_urgent": {}}}}}"#,
+        !yes
+    );
+    with_files("bar", &cases, |page, path| {
+        let out = jev(
+            &[
+                "eval",
+                page,
+                "--cases",
+                path,
+                "--mock",
+                "--min-accuracy",
+                "1",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 1);
+        assert!(
+            out.stderr
+                .contains("jev eval: is_urgent accuracy 0.00 is below 1.00."),
+            "{}",
+            out.stderr
+        );
+    });
+}
+
+#[test]
+fn lists_eval_and_its_flags_in_help() {
+    let help = jev(&["--help"], "", &[]).stdout;
+    assert!(help.contains("eval"), "{help}");
+    for flag in [
+        "--cases",
+        "--concurrency",
+        "--cache",
+        "--max-cost",
+        "--min-accuracy",
+    ] {
+        assert!(help.contains(flag), "{help}");
+    }
+}
+
+const PAGE_ONE: &str = "placeholder\n---\nis_urgent? The message conveys urgency\n";
+
+const EVAL_LIVE_CASES: &str = concat!(
+    r#"{"id": "u-1", "state": "urgent: the payout failed", "expect": {"is_urgent": true}}"#,
+    "\n",
+    r#"{"id": "u-2", "state": "urgent: checkout is down", "expect": {"is_urgent": true}}"#,
+    "\n",
+    r#"{"id": "c-1", "state": "a question about the plan", "expect": {"is_urgent": false}}"#,
+    "\n",
+    r#"{"id": "c-2", "state": "a note of thanks", "expect": {"is_urgent": false}}"#,
+);
+
+/// The fake API the live eval talks to: the answer is read off the state in the request body.
+struct FromTheState;
+
+impl wiremock::Respond for FromTheState {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let state = body["state"].as_str().unwrap_or_default().to_owned();
+        if state.contains("refuse") {
+            return ResponseTemplate::new(400)
+                .set_body_json(json!({"error": {"message": "this state is not allowed"}}));
+        }
+        ResponseTemplate::new(200).set_body_json(json!({
+            "model": "jev-1",
+            "answers": {"is_urgent": {
+                "type": "noul",
+                "noul": if state.contains("urgent") { 0.9 } else { 0.1 },
+            }},
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }))
+    }
+}
+
+async fn answering_from_the_state() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(FromTheState)
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn asked(server: &MockServer) -> usize {
+    server.received_requests().await.map_or(0, |all| all.len())
+}
+
+/// A run against the fake API, with the page on stdin and the cases in a file.
+async fn live_eval(server: &MockServer, cases: &str, args: &[&str]) -> Attempt {
+    let mut child = tokio::process::Command::new(JEV)
+        .args(["eval", "--cases", cases])
+        .args(args)
+        .env("TYPESAFE_API_KEY", "sk-test")
+        .env("TYPESAFE_BASE_URL", server.uri())
+        .env("JEV_PRICE", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("jev starts");
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take().expect("stdin is a pipe");
+        stdin
+            .write_all(PAGE_ONE.as_bytes())
+            .await
+            .expect("the page");
+        stdin.shutdown().await.ok();
+    }
+    let out = child.wait_with_output().await.expect("jev finishes");
+    Attempt {
+        status: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// The cases file for one live test, in a directory of its own.
+fn live_cases(name: &str, cases: &str) -> std::path::PathBuf {
+    let path = scratch(name).join("cases.jsonl");
+    std::fs::write(&path, cases).expect("the cases are written");
+    path
+}
+
+#[tokio::test]
+async fn asks_once_per_case_and_counts_what_the_api_counted() {
+    let server = answering_from_the_state().await;
+    let cases = live_cases("live", EVAL_LIVE_CASES);
+    let out = live_eval(&server, cases.to_str().expect("a path"), &[]).await;
+    assert_eq!(out.status, 0, "{}", out.stderr);
+    assert_eq!(asked(&server).await, 4);
+    let chosen = out
+        .stdout
+        .lines()
+        .find(|line| line.contains("0.50 *"))
+        .unwrap_or_else(|| panic!("no chosen row in\n{}", out.stdout));
+    assert!(chosen.contains("1.00  1.00"), "{chosen}");
+    assert!(
+        out.stdout.contains("40 in / 20 out tokens"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.contains("jev eval: 4 cases, ≈"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[tokio::test]
+async fn answers_a_second_run_from_the_cache_without_sending_anything() {
+    let server = answering_from_the_state().await;
+    let dir = scratch("cache");
+    let cases = live_cases("cache-cases", EVAL_LIVE_CASES);
+    let cache = dir.to_str().expect("a path");
+    let first = live_eval(
+        &server,
+        cases.to_str().expect("a path"),
+        &["--cache", cache],
+    )
+    .await;
+    assert_eq!(first.status, 0, "{}", first.stderr);
+    assert_eq!(asked(&server).await, 4);
+    let again = live_eval(
+        &server,
+        cases.to_str().expect("a path"),
+        &["--cache", cache],
+    )
+    .await;
+    assert_eq!(asked(&server).await, 4);
+    assert_eq!(again.stdout, first.stdout);
+}
+
+#[tokio::test]
+async fn refuses_to_send_when_the_estimate_is_above_max_cost() {
+    let server = answering_from_the_state().await;
+    let cases = live_cases("max-cost", EVAL_LIVE_CASES);
+    let out = live_eval(
+        &server,
+        cases.to_str().expect("a path"),
+        &["--max-cost", "0.000001", "--price", "0.20/1.00"],
+    )
+    .await;
+    assert_eq!(out.status, 1);
+    assert_eq!(asked(&server).await, 0);
+    assert!(out.stderr.contains("refusing to send"), "{}", out.stderr);
+}
+
+#[tokio::test]
+async fn carries_on_when_one_case_is_refused_and_says_which() {
+    let server = answering_from_the_state().await;
+    let cases = live_cases(
+        "refused",
+        &format!(
+            "{EVAL_LIVE_CASES}\n{}",
+            r#"{"id": "bad", "state": "refuse this one", "expect": {"is_urgent": true}}"#
+        ),
+    );
+    let out = live_eval(&server, cases.to_str().expect("a path"), &[]).await;
+    assert_eq!(out.status, 1);
+    assert!(out.stdout.contains("case 5 (bad):"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("5 cases · 4 answered · 1 error"),
+        "{}",
+        out.stdout
+    );
+}

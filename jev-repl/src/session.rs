@@ -28,13 +28,7 @@ impl Session {
     }
 
     pub fn state_is_empty(&self) -> bool {
-        match &self.state {
-            Value::Null => true,
-            Value::String(s) => s.trim().is_empty(),
-            Value::Array(a) => a.is_empty(),
-            Value::Object(o) => o.is_empty(),
-            _ => false,
-        }
+        is_empty_value(&self.state)
     }
 
     /// One-line preview of the state for the side panel.
@@ -71,6 +65,16 @@ impl Session {
     /// Serialized through a struct (not a `Value`) so field and question order survive, which is
     /// the whole point of showing it.
     pub fn request_json(&self, model: &str) -> String {
+        self.body_json(model, true)
+    }
+
+    /// The same body [`Session::request_json`] shows, with the whitespace taken out: what a cache
+    /// key hashes.
+    pub fn request_json_compact(&self, model: &str) -> String {
+        self.body_json(model, false)
+    }
+
+    fn body_json(&self, model: &str, pretty: bool) -> String {
         #[derive(Serialize)]
         struct Body<'a> {
             state: &'a Value,
@@ -78,12 +82,31 @@ impl Session {
             questions: &'a Questions,
         }
         let questions = self.to_questions();
-        serde_json::to_string_pretty(&Body {
+        let body = Body {
             state: &self.state,
             model,
             questions: &questions,
-        })
+        };
+        if pretty {
+            serde_json::to_string_pretty(&body)
+        } else {
+            serde_json::to_string(&body)
+        }
         .unwrap_or_else(|e| format!("<unencodable: {e}>"))
+    }
+}
+
+/// Whether a value is empty enough that there is nothing to judge.
+///
+/// A case's state is arbitrary JSON and is held to the same bar as a session's, so the rule lives
+/// here rather than inside [`Session::state_is_empty`].
+pub fn is_empty_value(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
     }
 }
 

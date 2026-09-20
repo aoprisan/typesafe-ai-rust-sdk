@@ -5,6 +5,7 @@ pub mod builder;
 pub mod codegen;
 pub mod cost;
 pub mod editor;
+pub mod evaluate;
 pub mod format;
 pub mod headless;
 pub mod highlight;
