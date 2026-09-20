@@ -22,6 +22,10 @@ use crate::{codegen, cost, mock, session, sketch};
 /// The subcommands that run without a terminal, and what each one prints.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("run", "send the request and print the answers"),
+    (
+        "eval",
+        "run a page over a file of labelled cases and score the answers",
+    ),
     ("json", "the exact request body this session POSTs"),
     (
         "cost",
@@ -151,6 +155,42 @@ pub fn live_answers(session: &Session, response: &SystemOneResponse) -> Vec<Answ
         .iter()
         .map(|(name, _)| (name.clone(), response.answers.get(name).cloned()))
         .collect()
+}
+
+/// The answers a cached body carries, lined up with the questions that were asked.
+///
+/// The wire body is all the cache keeps, and `SystemOneResponse` cannot be rebuilt outside the SDK
+/// crate, so this is [`live_answers`] for a response that arrived from disk instead of the
+/// network. `None` means the file is not a System One body, which is a cache miss and not an error.
+pub fn cached_answers(session: &Session, body: &Value) -> Option<(Vec<Answered>, Option<Usage>)> {
+    let object = body.as_object()?;
+    object.get("model")?.as_str()?;
+    let mut decoded: Vec<(String, Answer)> = Vec::new();
+    for (name, value) in object.get("answers")?.as_object()? {
+        let answer = match value.get("type")?.as_str()? {
+            "noul" => Answer::Noul(serde_json::from_value(value.clone()).ok()?),
+            "choice" => Answer::Choice(serde_json::from_value(value.clone()).ok()?),
+            "score" => Answer::Score(serde_json::from_value(value.clone()).ok()?),
+            // An answer this build does not model is skipped, the way the SDK's decoder skips it.
+            _ => continue,
+        };
+        decoded.push((name.clone(), answer));
+    }
+    let answers = session
+        .questions
+        .iter()
+        .map(|(name, _)| {
+            let answer = decoded
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, a)| a.clone());
+            (name.clone(), answer)
+        })
+        .collect();
+    let usage = object
+        .get("usage")
+        .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok());
+    Some((answers, usage))
 }
 
 /// The answer page: the same bars and labels the REPL draws, minus the colour.

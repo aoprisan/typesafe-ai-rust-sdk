@@ -65,6 +65,16 @@ impl Session {
     /// Serialized through a struct (not a `Value`) so field and question order survive, which is
     /// the whole point of showing it.
     pub fn request_json(&self, model: &str) -> String {
+        self.body_json(model, true)
+    }
+
+    /// The same body [`Session::request_json`] shows, with the whitespace taken out: what a cache
+    /// key hashes.
+    pub fn request_json_compact(&self, model: &str) -> String {
+        self.body_json(model, false)
+    }
+
+    fn body_json(&self, model: &str, pretty: bool) -> String {
         #[derive(Serialize)]
         struct Body<'a> {
             state: &'a Value,
@@ -72,11 +82,16 @@ impl Session {
             questions: &'a Questions,
         }
         let questions = self.to_questions();
-        serde_json::to_string_pretty(&Body {
+        let body = Body {
             state: &self.state,
             model,
             questions: &questions,
-        })
+        };
+        if pretty {
+            serde_json::to_string_pretty(&body)
+        } else {
+            serde_json::to_string(&body)
+        }
         .unwrap_or_else(|e| format!("<unencodable: {e}>"))
     }
 }

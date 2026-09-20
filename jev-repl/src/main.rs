@@ -8,17 +8,22 @@
 //! saved with `:save` and then run from a script, a Makefile or CI.
 
 use std::io::{IsTerminal, Read, Write};
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use ratatui::crossterm::event;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use jev_repl::app::{App, Msg};
 use jev_repl::cost::Rates;
+use jev_repl::evaluate::{self, Outcome};
+use jev_repl::headless::Answered;
 use jev_repl::session::Session;
 use jev_repl::{cost, headless, ui};
-use typesafe::Client;
+use typesafe::{Client, Usage};
 
 /// 0 when it worked, 1 when the call or the file did not, 2 when the command line did not parse.
 const OK: u8 = 0;
@@ -85,6 +90,12 @@ fn help() -> String {
          \x20 --json                 print the raw response body instead of the answer page\n\
          \x20 --help, -h             this message\n\
          \x20 --version, -v          the version of this package\n\n\
+         Options for eval\n\
+         \x20 --cases <file>         the JSON Lines file of labelled states to score, or `-`\n\
+         \x20 --concurrency <n>      how many cases are in the air at once (default 4)\n\
+         \x20 --cache <dir>          keep the responses here, so running it again sends nothing\n\
+         \x20 --max-cost <dollars>   refuse to send when the estimate is above this\n\
+         \x20 --min-accuracy <0-1>   exit 1 when a scored question falls below this\n\n\
          Exit status is 0 when it worked, 1 when the call or the file did not, 2 when the\n\
          command line did not parse.\n"
     )
@@ -101,6 +112,12 @@ struct Options {
     timeout: Option<Duration>,
     mock: bool,
     json: bool,
+    /// `jev eval`: the file of labelled cases, and what to do with them.
+    cases: Option<String>,
+    concurrency: usize,
+    cache: Option<String>,
+    max_cost: Option<f64>,
+    min_accuracy: Option<f64>,
 }
 
 /// Read the flags after a subcommand. `--flag value` and `--flag=value` both work, and the first
@@ -110,6 +127,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         file: "-".to_owned(),
         threshold: 0.5,
         rates: cost::rates_from_env(),
+        concurrency: 4,
         ..Options::default()
     };
     let mut file: Option<String> = None;
@@ -153,6 +171,36 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 }
                 options.timeout = Some(Duration::from_secs_f64(seconds));
             }
+            "--cases" => options.cases = Some(value()?),
+            "--concurrency" => {
+                let text = value()?;
+                let workers: i64 = text
+                    .parse()
+                    .map_err(|_| "--concurrency takes a whole number of 1 or more.".to_owned())?;
+                if workers < 1 {
+                    return Err("--concurrency takes a whole number of 1 or more.".to_owned());
+                }
+                options.concurrency = workers as usize;
+            }
+            "--cache" => options.cache = Some(value()?),
+            "--max-cost" => {
+                let text = value()?;
+                let dollars: f64 = text.parse().unwrap_or(f64::NAN);
+                if !(dollars.is_finite() && dollars > 0.0) {
+                    return Err("--max-cost takes a number of dollars greater than 0.".to_owned());
+                }
+                options.max_cost = Some(dollars);
+            }
+            "--min-accuracy" => {
+                let text = value()?;
+                let bar: f64 = text
+                    .parse()
+                    .map_err(|_| "--min-accuracy takes a number from 0 to 1.".to_owned())?;
+                if !(0.0..=1.0).contains(&bar) {
+                    return Err("--min-accuracy takes a number from 0 to 1.".to_owned());
+                }
+                options.min_accuracy = Some(bar);
+            }
             "--mock" => options.mock = true,
             "--json" => options.json = true,
             other => {
@@ -171,6 +219,26 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         options.file = path;
     }
     Ok(options)
+}
+
+/// The flags `eval` reads differently from the other commands.
+///
+/// `--state` is the interesting one: a page's state is what the cases replace, so passing one
+/// would quietly judge the same text forty times.
+fn check_eval_options(options: &Options) -> Result<(), String> {
+    if options.state.is_some() {
+        return Err("--state does not apply to eval: the cases carry the states.".to_owned());
+    }
+    let Some(cases) = &options.cases else {
+        return Err("--cases <file> is required: jev eval page.jev --cases cases.jsonl".to_owned());
+    };
+    if cases == "-" && options.file == "-" {
+        return Err("the page and the cases cannot both come from stdin.".to_owned());
+    }
+    if options.max_cost.is_some() && options.rates.is_none() {
+        return Err("--max-cost needs rates: pass --price <in>/<out> or set JEV_PRICE.".to_owned());
+    }
+    Ok(())
 }
 
 /// The page: a file, or everything on stdin when the path is `-`.
@@ -194,6 +262,12 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
             return BAD_USAGE;
         }
     };
+    if command == "eval"
+        && let Err(e) = check_eval_options(&options)
+    {
+        eprintln!("jev {command}: {e}");
+        return BAD_USAGE;
+    }
 
     let text = match read_input(&options.file) {
         Ok(text) => text,
@@ -241,6 +315,10 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
         .clone()
         .or_else(|| client.as_ref().map(|c| c.default_model().to_owned()))
         .unwrap_or_else(|| "jev-latest".to_owned());
+
+    if command == "eval" {
+        return run_eval(session, &options, &model, client).await;
+    }
 
     match command {
         "json" => {
@@ -315,6 +393,187 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
             FAILED
         }
     }
+}
+
+/// Simulated answers for a case, the same deterministic ones `jev run --mock` prints.
+async fn mock_ask(session: Session) -> Outcome {
+    Outcome::Ok {
+        answers: headless::mock_answers(&session),
+        usage: None,
+    }
+}
+
+/// The cache key: the request body this case would POST, hashed.
+fn cache_key(session: &Session, model: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(session.request_json_compact(model));
+    format!("{:x}", hasher.finalize())
+}
+
+/// A cached response, or `None` when there is none this run can use.
+fn cached(file: &Path, session: &Session) -> Option<(Vec<Answered>, Option<Usage>)> {
+    // A file this version cannot read is not worth failing a case over; send the request instead.
+    let body: Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+    headless::cached_answers(session, &body)
+}
+
+/// One live call for a case, through the cache when there is one.
+async fn live_ask(
+    client: &Client,
+    model: &str,
+    timeout: Option<Duration>,
+    cache: Option<&str>,
+    session: Session,
+) -> Outcome {
+    let file = cache.map(|dir| Path::new(dir).join(format!("{}.json", cache_key(&session, model))));
+    if let Some(file) = &file
+        && let Some((answers, usage)) = cached(file, &session)
+    {
+        return Outcome::Ok { answers, usage };
+    }
+    let mut request = client
+        .system_one(session.state.clone(), session.to_questions())
+        .model(model.to_owned());
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    match request.await {
+        Ok(response) => {
+            if let Some(file) = &file {
+                let body = serde_json::to_string(&response.raw).unwrap_or_default();
+                let _ = std::fs::write(file, format!("{body}\n"));
+            }
+            Outcome::Ok {
+                answers: headless::live_answers(&session, &response),
+                usage: Some(response.usage.clone()),
+            }
+        }
+        Err(e) => Outcome::Failed {
+            error: error_text(&e),
+        },
+    }
+}
+
+/// The same explanation `jev run` prints when a call fails, as one string.
+fn error_text(err: &typesafe::Error) -> String {
+    jev_repl::format::error_lines(err)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
+}
+
+/// `jev eval`: the page over a file of labelled states, scored.
+///
+/// The order matters. Nothing is sent until the cases have parsed and the estimate has been shown,
+/// because a cases file is the one input that turns a typo into a bill.
+async fn run_eval(session: Session, options: &Options, model: &str, client: Option<Client>) -> u8 {
+    let text = match read_input(options.cases.as_deref().unwrap_or("-")) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("jev eval: {e}");
+            return FAILED;
+        }
+    };
+    let cases = match evaluate::parse_cases(&text, &session) {
+        Ok(cases) => cases,
+        Err(e) => {
+            eprintln!("jev eval: {e}");
+            return FAILED;
+        }
+    };
+
+    let live = client.is_some();
+    if live {
+        let estimate = evaluate::preflight(&session, &cases, model, options.rates);
+        let money = match (estimate.cost, options.rates) {
+            (Some(cost), Some(rates)) => format!(
+                ", ≈ {} at {}",
+                cost::usd(cost.total),
+                cost::format_rates(rates)
+            ),
+            _ => String::new(),
+        };
+        let plural = if estimate.cases == 1 { "" } else { "s" };
+        eprintln!(
+            "jev eval: {} case{plural}, ≈ {} in / {} out tokens{money}",
+            estimate.cases, estimate.input_tokens, estimate.output_tokens
+        );
+        if let (Some(max), Some(cost)) = (options.max_cost, estimate.cost)
+            && cost.total > max
+        {
+            eprintln!(
+                "jev eval: refusing to send: ≈ {} is above --max-cost {}.",
+                cost::usd(cost.total),
+                cost::usd(max)
+            );
+            return FAILED;
+        }
+        if let Some(dir) = &options.cache
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            eprintln!("jev eval: could not use {dir}: {e}");
+            return FAILED;
+        }
+    }
+
+    let outcomes = match client {
+        None => evaluate::run(&session, &cases, mock_ask, options.concurrency).await,
+        Some(client) => {
+            let model = model.to_owned();
+            let timeout = options.timeout;
+            let cache = options.cache.clone();
+            let ask = move |one: Session| {
+                let (client, model, cache) = (client.clone(), model.clone(), cache.clone());
+                async move { live_ask(&client, &model, timeout, cache.as_deref(), one).await }
+            };
+            evaluate::run(&session, &cases, ask, options.concurrency).await
+        }
+    };
+
+    let report = evaluate::report(
+        &session,
+        &cases,
+        &outcomes,
+        evaluate::ReportOptions {
+            model,
+            threshold: options.threshold,
+            rates: options.rates,
+        },
+    );
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&evaluate::report_json(&report)).unwrap_or_default()
+        );
+    } else {
+        print!("{}", evaluate::report_text(&report));
+    }
+    if !live {
+        eprintln!(
+            "Simulated answers: deterministic noise, not judgement. Set TYPESAFE_API_KEY for real ones."
+        );
+    }
+
+    let mut code = if report.errors.is_empty() { OK } else { FAILED };
+    if let Some(bar) = options.min_accuracy {
+        for (name, accuracy) in evaluate::below_bar(&report, bar) {
+            eprintln!(
+                "jev eval: {name} accuracy {} is below {}.",
+                evaluate::two(accuracy),
+                evaluate::two(bar)
+            );
+            code = FAILED;
+        }
+    }
+    code
 }
 
 /// The REPL itself: the terminal, the event loop, the draw.
