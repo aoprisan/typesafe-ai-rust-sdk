@@ -435,22 +435,7 @@ pub fn report(
             .iter()
             .filter_map(|(name, answer)| answer.clone().map(|a| (name.clone(), a)))
             .collect();
-        let mut wrong = None;
-        for (name, expectation) in &one.expect {
-            match answers.iter().find(|(n, _)| n == name).map(|(_, a)| a) {
-                None => wrong = Some(format!("no answer came back for {name}")),
-                Some(answer) if answer.kind() != expectation.kind() => {
-                    wrong = Some(format!(
-                        "{name} came back as a {}, not a {}",
-                        answer.kind(),
-                        expectation.kind()
-                    ));
-                }
-                Some(_) => continue,
-            }
-            break;
-        }
-        if let Some(message) = wrong {
+        if let Some(message) = unscorable(&one.expect, &answers) {
             failed(message);
             continue;
         }
@@ -490,6 +475,25 @@ pub fn report(
     }
 }
 
+/// Why this case cannot be scored, if it cannot: the first label that got no answer, or one whose
+/// answer came back as another kind.
+fn unscorable(expect: &[(String, Expectation)], answers: &[(String, Answer)]) -> Option<String> {
+    for (name, expectation) in expect {
+        match answers.iter().find(|(n, _)| n == name).map(|(_, a)| a) {
+            None => return Some(format!("no answer came back for {name}")),
+            Some(answer) if answer.kind() != expectation.kind() => {
+                return Some(format!(
+                    "{name} came back as a {}, not a {}",
+                    answer.kind(),
+                    expectation.kind()
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    None
+}
+
 /// Questions whose accuracy is below `bar`, for --min-accuracy.
 pub fn below_bar(report: &Report, bar: f64) -> Vec<(String, f64)> {
     report
@@ -527,13 +531,11 @@ fn noul_report(name: &str, rows: &[&Scored<'_>], threshold: f64) -> QuestionRepo
         .find(|row| row.threshold == threshold)
         .map(|row| row.accuracy)
         .unwrap_or(0.0);
-    let mut best = Best { threshold, f1: 0.0 };
-    if let Some(first) = sweep.first() {
-        best = Best {
-            threshold: first.threshold,
-            f1: first.f1,
-        };
-    }
+    // The sweep is in ascending order and the comparison is strict, so a tie keeps the lowest.
+    let mut best = Best {
+        threshold,
+        f1: f64::NEG_INFINITY,
+    };
     for row in &sweep {
         if row.f1 > best.f1 {
             best = Best {
