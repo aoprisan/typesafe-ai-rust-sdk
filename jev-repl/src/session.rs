@@ -8,7 +8,7 @@ use typesafe::{Choice, Noul, Question, Questions, Score};
 pub type Entry = (String, Question);
 
 /// Everything the next `:ask` will send.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Session {
     /// The text or JSON the model reasons about.
     pub state: Value,

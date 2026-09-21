@@ -216,6 +216,11 @@ be reordered. A page with problems is never applied; the cursor jumps to the fir
 The page is a file format too: `:save triage.jev` writes it, `:open triage.jev` reads it back, and
 `:sketch show` prints the current session in the notation.
 
+`jev` is also an MCP server and a skill, for when the one writing the rubric is an agent:
+`jev install` registers both with Claude Code, the Codex CLI, OpenCode or pi, and `jev mcp` serves
+the same one-shot commands over JSON-RPC on stdin and stdout.
+[`jev-repl/README.md`](jev-repl/README.md#in-a-coding-agent) has the table of what goes where.
+
 The REPL lives in [`jev-repl/`](jev-repl) as a separate workspace member and is published as its
 own crate, [`jev-repl`](https://crates.io/crates/jev-repl), so its TUI dependencies stay out of
 the library.

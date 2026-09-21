@@ -1,5 +1,7 @@
 //! Ready-made sessions to poke at: `:preset <name>`.
 
+use crate::session::{self, Session};
+
 pub struct Preset {
     pub name: &'static str,
     pub about: &'static str,
@@ -52,4 +54,34 @@ pub const PRESETS: &[Preset] = &[
 
 pub fn find(name: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.name == name)
+}
+
+/// A preset as the session it builds.
+///
+/// The scripts are REPL lines because that is how the REPL loads them; anything outside a terminal
+/// (the MCP server, the docs) wants the session, or the page [`crate::sketch::render`] makes of it.
+pub fn to_session(preset: &Preset) -> Session {
+    let mut built = Session::new();
+    for line in preset.script {
+        let (command, args) = match line.find(char::is_whitespace) {
+            Some(at) => (&line[..at], line[at + 1..].trim_start()),
+            None => (*line, ""),
+        };
+        if command == ":state" {
+            built.state = serde_json::Value::String(args.to_owned());
+            continue;
+        }
+        let parsed = match command {
+            ":noul" => session::parse_noul(args),
+            ":choice" => session::parse_choice(args),
+            ":score" => session::parse_score(args),
+            ":raw" => session::parse_raw(args),
+            _ => continue,
+        };
+        // A preset that does not parse is a bug in this file, not in the caller's input.
+        if let Ok((name, question)) = parsed {
+            built.insert(name, question);
+        }
+    }
+    built
 }
