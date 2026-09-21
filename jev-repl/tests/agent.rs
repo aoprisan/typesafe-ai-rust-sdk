@@ -691,6 +691,45 @@ fn exits_2_on_a_command_line_it_cannot_parse() {
 }
 
 #[test]
+fn answers_initialize_before_the_client_says_anything_else() {
+    // A real client sends `initialize` and waits on the reply before its next message, so the
+    // server must flush an answer when it is ready — not when the next line happens to arrive.
+    use std::io::{BufRead, BufReader};
+    let mut child = Command::new(JEV)
+        .arg("mcp")
+        .env("TYPESAFE_API_KEY", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("jev starts");
+    let mut stdin = child.stdin.take().expect("stdin is a pipe");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is a pipe"));
+    let handshake = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18" },
+    });
+    writeln!(stdin, "{handshake}").expect("the handshake goes in");
+    stdin.flush().expect("and is flushed");
+    let (sender, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = stdout.read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let reply = received
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the handshake is answered while stdin is still open");
+    let reply: Value = serde_json::from_str(&reply).expect("the reply is JSON");
+    assert_eq!(reply["id"], 1);
+    assert_eq!(result_of(&reply)["serverInfo"]["name"], "jev");
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
 fn serves_the_protocol_on_stdin_and_stdout() {
     let call = json!({
         "jsonrpc": "2.0",
