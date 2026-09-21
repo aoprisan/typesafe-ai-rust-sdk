@@ -10,6 +10,7 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::crossterm::event;
@@ -21,8 +22,9 @@ use jev_repl::app::{App, Msg};
 use jev_repl::cost::Rates;
 use jev_repl::evaluate::{self, Outcome};
 use jev_repl::headless::Answered;
+use jev_repl::mcp::{self, Host, Sent};
 use jev_repl::session::Session;
-use jev_repl::{cost, headless, ui};
+use jev_repl::{cost, headless, installer, serve, ui};
 use typesafe::{Client, Usage};
 
 /// 0 when it worked, 1 when the call or the file did not, 2 when the command line did not parse.
@@ -37,6 +39,12 @@ async fn main() -> ExitCode {
     if let Some(command) = args.first().filter(|a| headless::is_command(a)) {
         let command = command.clone();
         return ExitCode::from(one_shot(&command, &args[1..]).await);
+    }
+    if args.first().is_some_and(|a| a == "mcp") {
+        return ExitCode::from(serve_mcp(&args[1..]).await);
+    }
+    if args.first().is_some_and(|a| a == "install") {
+        return ExitCode::from(installer::run(&args[1..]));
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{}", help());
@@ -77,7 +85,10 @@ fn help() -> String {
          Set TYPESAFE_API_KEY for live answers; without one, answers are simulated locally.\n\n\
          \x20 jev                    the REPL: :help for commands, :lesson for the guided track,\n\
          \x20                        :sketch to write a request as one page, :quit to leave\n\
-         \x20 jev <command> [file]   one shot, no terminal needed\n\n\
+         \x20 jev <command> [file]   one shot, no terminal needed\n\
+         \x20 jev mcp                serve the same commands to an agent over MCP, on stdin/stdout\n\
+         \x20 jev install            register the MCP server and the jev skill with an agent\n\
+         \x20                        (Claude Code, Codex, OpenCode, pi) — jev install --help\n\n\
          Commands\n{commands}\n\
          The file is a .jev sketch page or a request body; `-`, or no file at all, reads stdin.\n\n\
          Options\n\
@@ -392,6 +403,107 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
             }
             FAILED
         }
+    }
+}
+
+/// `jev mcp`: the one-shot commands again, this time as tools an agent can call.
+async fn serve_mcp(args: &[String]) -> u8 {
+    let options = match parse_options(args) {
+        Ok(options) => options,
+        Err(e) => {
+            eprintln!("jev mcp: {e}");
+            return BAD_USAGE;
+        }
+    };
+    if options.file != "-" {
+        eprintln!("jev mcp: takes no file: the pages arrive in the tool calls.");
+        return BAD_USAGE;
+    }
+    if options.state.is_some() || options.cases.is_some() {
+        eprintln!("jev mcp: --state and --cases belong to a tool call, not to the server.");
+        return BAD_USAGE;
+    }
+
+    let client = if options.mock {
+        None
+    } else {
+        Client::from_env().ok()
+    };
+    let model = options
+        .model
+        .clone()
+        .or_else(|| client.as_ref().map(|c| c.default_model().to_owned()))
+        .unwrap_or_else(|| "jev-latest".to_owned());
+    let live = client.is_some();
+
+    let timeout = options.timeout;
+    let fallback = model.clone();
+    let ask: mcp::Ask = match client {
+        None => Arc::new(move |session: Session| {
+            Box::pin(async move {
+                Sent {
+                    outcome: Outcome::Ok {
+                        answers: headless::mock_answers(&session),
+                        usage: None,
+                    },
+                    raw: None,
+                }
+            })
+        }),
+        Some(client) => {
+            let client = Arc::new(client);
+            Arc::new(move |session: Session| {
+                let client = Arc::clone(&client);
+                let fallback = fallback.clone();
+                Box::pin(async move { mcp_ask(&client, &fallback, timeout, session).await })
+            })
+        }
+    };
+
+    // stdout carries the protocol and nothing else, so the greeting goes to stderr.
+    let state = if live {
+        format!("live, model {model}")
+    } else {
+        "no API key — every answer is simulated".to_owned()
+    };
+    eprintln!("jev mcp {}: {state}", env!("CARGO_PKG_VERSION"));
+    serve::serve(Host {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        model,
+        live,
+        rates: options.rates,
+        ask,
+    })
+    .await;
+    OK
+}
+
+/// One live call for an MCP tool, with the page's own model when it pins one.
+///
+/// `jev run` resolves the model once, on the command line; a server answers pages it has never
+/// seen, so each one gets to say what it should be asked with.
+async fn mcp_ask(
+    client: &Client,
+    fallback: &str,
+    timeout: Option<Duration>,
+    session: Session,
+) -> Sent {
+    let model = session.model.clone().unwrap_or_else(|| fallback.to_owned());
+    let mut request = client
+        .system_one(session.state.clone(), session.to_questions())
+        .model(model);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    match request.await {
+        Ok(response) => Sent {
+            outcome: Outcome::Ok {
+                answers: headless::live_answers(&session, &response),
+                usage: Some(response.usage.clone()),
+            },
+            raw: Some(response.raw.clone()),
+        },
+        Err(e) => Sent::failed(error_text(&e)),
     }
 }
 

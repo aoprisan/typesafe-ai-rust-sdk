@@ -158,5 +158,38 @@ errored or a bar was missed, 2 when the command line did not parse.
 Without `TYPESAFE_API_KEY` it starts in mock mode: answers are simulated locally (deterministic,
 not predictive) so the shapes can be learned offline. `:key <api-key>` switches to live calls.
 
+## In a coding agent
+
+`jev` is also an MCP server and a skill, so an agent can shape and send a page without you
+pasting one in. One command registers both with whichever agents you have:
+
+```sh
+jev install                      # every agent found under your home directory
+jev install --client codex       # or name one: claude-code, codex, opencode, pi
+jev install mcp --scope project  # just the server, into the repository in front of you
+jev install --list               # the agents, and the file each one gets
+```
+
+The MCP server is the one-shot commands again, offered as tools: `jev_notation` (the notation
+itself, for when a page will not parse), `jev_check`, `jev_request`, `jev_cost`, `jev_ask`,
+`jev_eval`, `jev_code` and `jev_presets`. It speaks JSON-RPC over stdin and stdout — `jev mcp`
+runs it by hand — and it holds no key of its own: the agent starts it, so it inherits the agent's
+environment, or you write one in with `--env TYPESAFE_API_KEY=…`.
+
+The skill is [`skills/jev/SKILL.md`](skills/jev/SKILL.md): the notation, what makes a question
+worth asking, and the check-price-run-score loop. It is the SKILL.md format every one of these
+agents reads, so it works the same in all four.
+
+| Agent | MCP entry | Skill |
+| --- | --- | --- |
+| Claude Code | `~/.claude.json`, or `.mcp.json` in the project | `~/.claude/skills/jev/` |
+| Codex CLI | `~/.codex/config.toml` | `~/.codex/skills/jev/` |
+| OpenCode | `~/.config/opencode/opencode.json` | `~/.config/opencode/skills/jev/` |
+| pi | `~/.pi/agent/mcp.json` | `~/.pi/agent/skills/jev/` |
+
+Nothing else in those files is touched — the entry is merged in, and a config that cannot be
+parsed is reported rather than rewritten. pi has no MCP client of its own yet, so its entry is
+written in the shape its MCP extensions read; the skill works there as it is.
+
 Unofficial. Not affiliated with TypeSafe AI. MIT licensed; source and issues at
 [aoprisan/typesafe-ai-rust-sdk](https://github.com/aoprisan/typesafe-ai-rust-sdk).
