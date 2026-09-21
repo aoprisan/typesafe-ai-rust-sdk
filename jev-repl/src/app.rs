@@ -13,7 +13,7 @@ use crate::builder::{Builder, Outcome};
 use crate::editor::{self, Editor};
 use crate::format::*;
 use crate::session::{self, Session};
-use crate::{codegen, cost, highlight, lessons, mock, presets, sketch};
+use crate::{codegen, cost, highlight, lessons, mock, presets, sketch, words};
 
 /// Everything that can move the app forward.
 pub enum Msg {
@@ -276,6 +276,20 @@ impl App {
             self.sketch_key(key);
             return;
         }
+        if words::is_word_left(&key) {
+            let chars: Vec<char> = self.input.chars().collect();
+            self.cursor = words::word_left(&chars, self.cursor);
+            return;
+        }
+        if words::is_word_right(&key) {
+            let chars: Vec<char> = self.input.chars().collect();
+            self.cursor = words::word_right(&chars, self.cursor);
+            return;
+        }
+        if words::is_delete_word_left(&key) {
+            self.delete_word();
+            return;
+        }
         match key.code {
             KeyCode::Char('c' | 'd') if ctrl => self.quit = true,
             KeyCode::Char('b') if ctrl => self.open_builder(""),
@@ -293,7 +307,7 @@ impl App {
                 self.cursor = 0;
             }
             KeyCode::Char('w') if ctrl => self.delete_word(),
-            KeyCode::Char(c) => self.insert(c),
+            KeyCode::Char(c) if words::is_typed(&key) => self.insert(c),
             KeyCode::Backspace => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
@@ -816,6 +830,15 @@ impl App {
         }
     }
 
+    /// The names the session already holds, so the builder can say what it would overwrite.
+    fn question_names(&self) -> Vec<String> {
+        self.session
+            .questions
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Builder mode: the same question, built in a form, with the JSON shown as it is typed.
     fn open_builder(&mut self, name: &str) {
         let state = match &self.session.state {
@@ -823,7 +846,8 @@ impl App {
             Value::Null => String::new(),
             other => other.to_string(),
         };
-        self.builder = Some(Builder::new(state, name.trim()));
+        let existing = self.question_names();
+        self.builder = Some(Builder::new(state, name.trim()).over(existing));
         self.note("builder mode — Tab moves, Ctrl-S adds the question, Esc closes.");
     }
 
@@ -839,6 +863,7 @@ impl App {
             }
             Outcome::Commit(name, question, state) => {
                 let command = builder.as_command();
+                let kind = builder.kind;
                 if !state.trim().is_empty() && Value::String(state.clone()) != self.session.state {
                     self.session.state = Value::String(state.clone());
                 }
@@ -849,8 +874,15 @@ impl App {
                 ]));
                 self.note("(what builder mode just built — the one-line form does the same thing)");
                 self.add(Ok((name, *question)));
-                // Stay in the form so the next question is one keystroke away.
-                self.builder = Some(Builder::new(state, ""));
+                // Stay in the form, on the same type: a rubric is usually several questions of one
+                // shape, and re-picking `choice` for every one of them is what made the form
+                // slower than typing the command.
+                let existing = self.question_names();
+                self.builder = Some(Builder::new(state, "").of_kind(kind).over(existing));
+                self.note(format!(
+                    "still in the builder, type still `{}` — name the next one, or Esc to close.",
+                    kind.label()
+                ));
             }
         }
     }

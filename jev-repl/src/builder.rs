@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 use typesafe::{Choice, Noul, Question, Score};
 
 use crate::session::value;
+use crate::words;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -83,6 +84,10 @@ pub struct Builder {
     pub focus: usize,
     pub cursor: usize,
     pub message: Option<String>,
+    /// The names the session already holds, so the form can say what it would overwrite.
+    pub existing: Vec<String>,
+    /// Ctrl-S over one of those names asks once before replacing it.
+    replace_armed: bool,
 }
 
 impl Builder {
@@ -115,7 +120,25 @@ impl Builder {
                 name.chars().count()
             },
             message: None,
+            existing: Vec::new(),
+            replace_armed: false,
         }
+    }
+
+    /// Open on this type rather than a noul.
+    ///
+    /// This is how a second question of the same type costs nothing to reach: after one is added
+    /// the form reopens on the type just used, instead of falling back to a noul every time.
+    pub fn of_kind(mut self, kind: Kind) -> Self {
+        self.kind = kind;
+        self.focus = self.focus.min(self.fields().len() - 1);
+        self
+    }
+
+    /// The names the session already holds; committing over one of them asks first.
+    pub fn over(mut self, existing: Vec<String>) -> Self {
+        self.existing = existing;
+        self
     }
 
     /// The focusable fields, in tab order, for the current question type.
@@ -171,6 +194,18 @@ impl Builder {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         self.message = None;
+        // Alt-←/→ cross a word, except on the type row, where ← → switch the type.
+        if self.focused() != Field::Kind
+            && (words::is_word_left(&key) || words::is_word_right(&key))
+        {
+            let chars: Vec<char> = self.text(self.focused()).chars().collect();
+            self.cursor = if words::is_word_left(&key) {
+                words::word_left(&chars, self.cursor)
+            } else {
+                words::word_right(&chars, self.cursor)
+            };
+            return Outcome::Open;
+        }
         match key.code {
             KeyCode::Esc => return Outcome::Cancel,
             KeyCode::Char('s') if ctrl => return self.commit(),
@@ -210,7 +245,7 @@ impl Builder {
                 let at = self.cursor;
                 self.remove(at);
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if words::is_typed(&key) => {
                 let _ = shift;
                 self.insert(c);
             }
@@ -220,6 +255,9 @@ impl Builder {
     }
 
     fn set_kind(&mut self, kind: Kind) {
+        if kind != self.kind {
+            self.replace_armed = false;
+        }
         self.kind = kind;
         self.focus = self.focus.min(self.fields().len() - 1);
     }
@@ -238,6 +276,9 @@ impl Builder {
     fn insert(&mut self, c: char) {
         let cursor = self.cursor;
         let field = self.focused();
+        if field == Field::Name {
+            self.replace_armed = false;
+        }
         if let Some(s) = self.text_mut(field) {
             let at = byte_at(s, cursor);
             s.insert(at, c);
@@ -247,6 +288,9 @@ impl Builder {
 
     fn remove(&mut self, index: usize) {
         let field = self.focused();
+        if field == Field::Name {
+            self.replace_armed = false;
+        }
         if let Some(s) = self.text_mut(field)
             && index < s.chars().count()
         {
@@ -393,6 +437,13 @@ impl Builder {
         let instructions = self.instructions.trim();
         if instructions.is_empty() {
             self.message = Some("Instructions are what the model actually reads.".into());
+            return Outcome::Open;
+        }
+        if self.existing.iter().any(|n| n == &name) && !self.replace_armed {
+            self.replace_armed = true;
+            self.message = Some(format!(
+                "`{name}` is already a question — Ctrl-S again replaces it, or rename this one."
+            ));
             return Outcome::Open;
         }
         let question: Question = match self.kind {

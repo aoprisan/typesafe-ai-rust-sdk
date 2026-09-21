@@ -20,4 +20,5 @@ pub mod session;
 pub mod sketch;
 pub mod skill;
 pub mod ui;
+pub mod words;
 pub mod wrap;

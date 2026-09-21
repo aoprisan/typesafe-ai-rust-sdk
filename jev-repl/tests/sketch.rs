@@ -312,6 +312,37 @@ fn lines_can_be_cut_pasted_and_moved() {
 }
 
 #[test]
+fn alt_arrow_crosses_and_deletes_words() {
+    let mut ed = Editor::new("is_urgent? conveys urgency\n---");
+    press(&mut ed, KeyCode::End);
+    ed.key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(ed.col, 19, "onto the start of `urgency`");
+    // The same keypress from a terminal that reports Alt as Meta.
+    ed.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER));
+    assert_eq!(ed.col, 11);
+    ed.key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+    assert_eq!(ed.col, 18);
+    // Alt-b / Alt-f are the same keys in a terminal that sends those instead.
+    ed.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    assert_eq!(ed.col, 11);
+    ed.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+    assert_eq!(ed.col, 18);
+    assert_eq!(
+        ed.lines[0], "is_urgent? conveys urgency",
+        "and nothing was typed"
+    );
+
+    // At the edges it steps to the neighbouring line, the way a plain arrow does.
+    press(&mut ed, KeyCode::Home);
+    ed.key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!((ed.row, ed.col), (0, 0));
+
+    press(&mut ed, KeyCode::End);
+    ed.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+    assert_eq!(ed.lines[0], "is_urgent? conveys ");
+}
+
+#[test]
 fn esc_asks_before_discarding_edits_and_preview_cycles() {
     let mut ed = Editor::new("\n---\n");
     assert!(matches!(press(&mut ed, KeyCode::Esc), Outcome::Cancel));

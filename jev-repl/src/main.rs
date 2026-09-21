@@ -13,7 +13,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ratatui::crossterm::event;
+use ratatui::crossterm::event::{
+    self, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use ratatui::crossterm::{execute, terminal};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -710,11 +713,15 @@ async fn run_eval(session: Session, options: &Options, model: &str, client: Opti
 
 /// The REPL itself: the terminal, the event loop, the draw.
 async fn repl() -> std::io::Result<()> {
+    let mut terminal = ratatui::init();
+    // Asked for before the reader thread starts: the query is answered on stdin, and the thread
+    // would eat the answer.
+    let enhanced = push_key_disambiguation();
+
     let (tx, mut rx) = mpsc::unbounded_channel();
     spawn_input(tx.clone());
     spawn_ticker(tx.clone());
 
-    let mut terminal = ratatui::init();
     let mut app = App::new(tx);
     let mut redraw = true;
     let result = loop {
@@ -731,8 +738,28 @@ async fn repl() -> std::io::Result<()> {
             break Ok(());
         }
     };
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     ratatui::restore();
     result
+}
+
+/// Ask the terminal to report modified keys unambiguously, and say whether it agreed.
+///
+/// A terminal that spells Alt as "prefix with Esc" sends `Esc Esc [ A` for Alt-Up, which arrives
+/// as an Esc followed by the literal characters `[` and `A` — the arrow is lost and the page gets
+/// typed into. Terminals that know the keyboard enhancement protocol report the modifier instead.
+/// The ones that do not are left as they were; `Alt-b` / `Alt-f` and Ctrl-←/→ cover them.
+fn push_key_disambiguation() -> bool {
+    if !matches!(terminal::supports_keyboard_enhancement(), Ok(true)) {
+        return false;
+    }
+    execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok()
 }
 
 /// Terminal events come from a blocking thread so the async side stays free for API calls.

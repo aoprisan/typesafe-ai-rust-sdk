@@ -1,7 +1,7 @@
 //! The REPL driven without a terminal: commands in, transcript and session out.
 
 use jev_repl::app::{App, Msg};
-use jev_repl::builder::{Builder, Outcome};
+use jev_repl::builder::{Builder, Field, Kind, Outcome};
 use jev_repl::{codegen, highlight, mock, session, sketch, ui, wrap};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -251,6 +251,100 @@ fn builder_mode_refuses_an_incomplete_question() {
 }
 
 #[test]
+fn builder_keeps_the_type_for_the_next_question_of_the_same_shape() {
+    let mut app = app();
+    app.exec(":state A ticket");
+    key(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+    assert_eq!(
+        app.builder.as_ref().map(|b| b.kind),
+        Some(Kind::Noul),
+        "a fresh builder opens on a noul"
+    );
+
+    build_choice(&mut app, "department", true);
+    assert_eq!(names(&app), ["department"]);
+    // The form stays open on `choice`, so a second choice costs no keystrokes.
+    let b = app.builder.as_ref().expect("still in the builder");
+    assert_eq!(b.kind, Kind::Choice);
+    assert_eq!(b.existing, ["department"]);
+    assert!(transcript(&app).contains("type still `choice`"));
+
+    build_choice(&mut app, "owner", false);
+    assert_eq!(names(&app), ["department", "owner"]);
+}
+
+#[test]
+fn builder_asks_before_a_new_question_replaces_one() {
+    let mut b = Builder::new("A ticket".into(), "")
+        .of_kind(Kind::Noul)
+        .over(vec!["is_urgent".into()]);
+    type_text(&mut b, "is_urgent");
+    press(&mut b, KeyCode::Tab); // type
+    press(&mut b, KeyCode::Tab); // instructions
+    type_text(&mut b, "Conveys urgency");
+    assert!(matches!(b.key(ctrl(KeyCode::Char('s'))), Outcome::Open));
+    assert!(b.message.as_deref().unwrap().contains("already a question"));
+    // Saying it again means it.
+    assert!(matches!(
+        b.key(ctrl(KeyCode::Char('s'))),
+        Outcome::Commit(..)
+    ));
+
+    // Renaming disarms the warning, so the next one is added rather than replaced.
+    let mut c = Builder::new("A ticket".into(), "").over(vec!["is_urgent".into()]);
+    type_text(&mut c, "is_urgent");
+    press(&mut c, KeyCode::Tab);
+    press(&mut c, KeyCode::Tab);
+    type_text(&mut c, "Conveys urgency");
+    assert!(matches!(c.key(ctrl(KeyCode::Char('s'))), Outcome::Open));
+    press(&mut c, KeyCode::Up);
+    press(&mut c, KeyCode::Up);
+    type_text(&mut c, "_too");
+    match c.key(ctrl(KeyCode::Char('s'))) {
+        Outcome::Commit(name, ..) => assert_eq!(name, "is_urgent_too"),
+        _ => panic!("a renamed question is added, not held back"),
+    }
+}
+
+#[test]
+fn builder_crosses_a_word_with_alt_arrow() {
+    let mut b = Builder::new("the payout failed again".into(), "");
+    assert_eq!(b.focused(), Field::Name);
+    press(&mut b, KeyCode::Up); // onto the state field, cursor at its end
+    assert_eq!(b.cursor, 23);
+    b.key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(b.cursor, 18);
+    b.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+    assert_eq!(b.cursor, 23);
+    assert_eq!(b.state, "the payout failed again", "and nothing was typed");
+    // The type row keeps ← → for switching the type.
+    let mut typed = Builder::new(String::new(), "tone");
+    assert_eq!(typed.focused(), Field::Kind);
+    typed.key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(typed.kind, Kind::Score);
+}
+
+#[test]
+fn alt_arrow_crosses_and_deletes_words_on_the_input_line() {
+    let mut app = app();
+    for c in ":noul is_urgent conveys urgency".chars() {
+        key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    assert_eq!(app.cursor, 31);
+    key(&mut app, KeyCode::Left, KeyModifiers::ALT);
+    assert_eq!(app.cursor, 24);
+    key(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
+    assert_eq!(
+        app.cursor, 16,
+        "Ctrl-← is the other spelling of the same key"
+    );
+    key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT);
+    assert_eq!(app.cursor, 23);
+    key(&mut app, KeyCode::Backspace, KeyModifiers::ALT);
+    assert_eq!(app.input, ":noul is_urgent  urgency");
+}
+
+#[test]
 fn builder_rows_can_be_added_and_dropped() {
     let mut b = Builder::new(String::new(), "tone");
     press(&mut b, KeyCode::Char('s')); // score
@@ -358,6 +452,45 @@ fn every_preset_loads() {
             preset.name
         );
     }
+}
+
+/// A key straight into the app, the way the terminal thread delivers one.
+fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle(Msg::Term(Event::Key(KeyEvent::new(code, modifiers))));
+}
+
+fn names(app: &App) -> Vec<String> {
+    app.session
+        .questions
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Fill the app's open builder in as a two-option choice and add it.
+fn build_choice(app: &mut App, name: &str, pick_choice: bool) {
+    assert!(app.builder.is_some(), "the builder is not open");
+    for c in name.chars() {
+        key(app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    key(app, KeyCode::Tab, KeyModifiers::NONE); // type
+    if pick_choice {
+        key(app, KeyCode::Char('c'), KeyModifiers::NONE);
+    }
+    key(app, KeyCode::Tab, KeyModifiers::NONE); // instructions
+    for c in "Which team".chars() {
+        key(app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    key(app, KeyCode::Tab, KeyModifiers::NONE);
+    for c in "billing".chars() {
+        key(app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    key(app, KeyCode::Tab, KeyModifiers::NONE);
+    key(app, KeyCode::Tab, KeyModifiers::NONE);
+    for c in "technical".chars() {
+        key(app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    key(app, KeyCode::Char('s'), KeyModifiers::CONTROL);
 }
 
 fn press(b: &mut Builder, code: KeyCode) {
