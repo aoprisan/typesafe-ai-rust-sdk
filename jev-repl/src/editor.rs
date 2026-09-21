@@ -5,6 +5,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::sketch::{self, Parsed};
+use crate::words;
 
 /// What the right-hand pane shows next to the page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,9 +101,22 @@ impl Editor {
 
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let alt = words::is_alt(&key);
         self.message = None;
         let armed = std::mem::take(&mut self.esc_armed);
+        // Alt-←/→ cross a word, Alt-Backspace takes one out; Alt-↑/↓ below move the whole line.
+        if words::is_word_left(&key) {
+            self.word_left();
+            return Outcome::Open;
+        }
+        if words::is_word_right(&key) {
+            self.word_right();
+            return Outcome::Open;
+        }
+        if words::is_delete_word_left(&key) {
+            self.delete_word_left();
+            return Outcome::Open;
+        }
         match key.code {
             KeyCode::Esc => {
                 if self.dirty && !armed {
@@ -248,6 +262,48 @@ impl Editor {
             }
             None => self.message = Some("nothing cut yet — ^X cuts the current line".into()),
         }
+    }
+
+    fn chars(&self) -> Vec<char> {
+        self.lines[self.row].chars().collect()
+    }
+
+    /// Alt-←: to the start of the word before the cursor, or onto the end of the line above.
+    fn word_left(&mut self) {
+        if self.col == 0 {
+            if self.row > 0 {
+                self.row -= 1;
+                self.col = self.len();
+            }
+            return;
+        }
+        self.col = words::word_left(&self.chars(), self.col);
+    }
+
+    /// Alt-→: past the end of the word after the cursor, or onto the start of the line below.
+    fn word_right(&mut self) {
+        if self.col >= self.len() {
+            if self.row + 1 < self.lines.len() {
+                self.row += 1;
+                self.col = 0;
+            }
+            return;
+        }
+        self.col = words::word_right(&self.chars(), self.col);
+    }
+
+    /// Alt-Backspace: take the word before the cursor out.
+    fn delete_word_left(&mut self) {
+        if self.col == 0 {
+            self.backspace();
+            return;
+        }
+        let chars = self.chars();
+        let at = words::word_left(&chars, self.col);
+        let kept: String = chars[..at].iter().chain(chars[self.col..].iter()).collect();
+        self.lines[self.row] = kept;
+        self.col = at;
+        self.dirty = true;
     }
 
     /// Alt-Up / Alt-Down: move the current line, which is how questions and levels get reordered.

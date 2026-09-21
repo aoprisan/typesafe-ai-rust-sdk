@@ -259,7 +259,7 @@ fn builder(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
         )))
         .title_bottom(Line::from(dim(
-            " Tab move · ^O add row · ^X drop row · ^S add question · Esc close ",
+            " Tab move · Alt-←→ word · ^O add row · ^X drop row · ^S add question · Esc close ",
         )));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -369,6 +369,12 @@ fn form(b: &Builder, width: usize) -> (Vec<Line<'static>>, Option<(usize, usize)
         Field::Name,
         "answers come back under this",
     );
+    if !b.existing.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(LABEL)),
+            dim(format!("already asked: {}", b.existing.join(", "))),
+        ]));
+    }
 
     // The type row is a cycler, not a text field.
     let kind_focused = focused == Field::Kind;
@@ -475,7 +481,7 @@ fn sketch(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
         )))
         .title_bottom(Line::from(dim(
-            " ^S apply · ^G apply & send · ^P preview · ^X/^U cut/paste line · Alt-↑↓ move line · Esc close ",
+            " ^S apply · ^G apply & send · ^P preview · ^X/^U cut/paste line · Alt-↑↓ move line · Alt-←→ word · Esc close ",
         )));
     let inner = block.inner(area);
     frame.render_widget(block, area);

@@ -60,9 +60,15 @@ jev            # with TYPESAFE_API_KEY for live answers; without it, answers are
   is already plain text becomes the first turn rather than being thrown away. Answers stay out of
   it: what comes back is a distribution, not something to reason over next turn.
 
-- `:build` opens a form for one question; `:json` shows the exact request body, `:last` the raw
-  response, `:rust` the session as a program against
+- `:build` (Ctrl-B) opens a form for one question and stays open on the type just added, so a
+  rubric of three nouls is three names rather than three type-pickings; it lists what the session
+  already holds and asks before a new question replaces one of them. `:json` shows the exact
+  request body, `:last` the raw response, `:rust` the session as a program against
   [`typesafe-ai-sdk`](https://crates.io/crates/typesafe-ai-sdk).
+- Alt-←/→ cross a word wherever there is text to edit, Alt-Backspace deletes one, and Alt-↑/↓ move
+  the line under the cursor in sketch mode. Terminals spell Alt in several ways — a modified
+  arrow, the Meta bit, an Esc prefix, or `Alt-b`/`Alt-f` — and all of them are read; Ctrl-←/→ works
+  too, for the terminals that send only that.
 - `:cost` says what a call is about to cost, per question and on both sides of the wire — a choice
   over eight labels comes back with eight probabilities, a score echoes its whole legend:
 

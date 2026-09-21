@@ -214,7 +214,10 @@ the page cycles (Ctrl-P) between the JSON that would be sent, simulated answers 
 the response is visible before anything is sent, the same request as Rust, and what the call would
 cost. Ctrl-S applies the
 page to the session, Ctrl-G applies and sends it, Alt-↑/↓ moves lines so questions and levels can
-be reordered. A page with problems is never applied; the cursor jumps to the first one instead.
+be reordered, and Alt-←/→ cross a word (Alt-Backspace deletes one) wherever there is text to edit.
+Terminals spell Alt in several ways — a modified arrow, the Meta bit, an Esc prefix, or
+`Alt-b`/`Alt-f` — and all of them are read; Ctrl-←/→ works too. A page with problems is never
+applied; the cursor jumps to the first one instead.
 
 The page is a file format too: `:save triage.jev` writes it, `:open triage.jev` reads it back, and
 `:sketch show` prints the current session in the notation.
