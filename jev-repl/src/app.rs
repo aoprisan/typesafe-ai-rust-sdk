@@ -35,6 +35,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         ":state",
         "set the state — :state <text> | :state json {…} | :state clear",
     ),
+    (
+        ":turn",
+        "grow the state into a conversation — :turn <who>: <text> | :turn list | :turn drop",
+    ),
     (":noul", ":noul <name> <instructions> [| yes: …] [| no: …]"),
     (
         ":choice",
@@ -463,6 +467,7 @@ impl App {
             ":try" => self.load_suggestion(),
             ":preset" => self.preset(args),
             ":state" | ":s" => self.state_cmd(args),
+            ":turn" => self.turn_cmd(args),
             ":noul" => self.add(session::parse_noul(args)),
             ":choice" => self.add(session::parse_choice(args)),
             ":score" => self.add(session::parse_score(args)),
@@ -530,6 +535,10 @@ impl App {
                 (
                     "confidence",
                     "How concentrated the distribution is. Gate automation on it and send the rest to a human.",
+                ),
+                (
+                    "conversation",
+                    "A state that is a list of turns instead of one message. The questions stay fixed and the thread grows, so the same rubric can be re-read after every reply. `:turn` builds one.",
                 ),
                 (
                     "names",
@@ -647,6 +656,10 @@ impl App {
     fn state_cmd(&mut self, args: &str) {
         match args {
             "" => {
+                if self.session.turns().is_some() {
+                    self.show_turns();
+                    return;
+                }
                 self.heading("state");
                 if self.session.state_is_empty() {
                     self.note("empty — type any text (no colon) or `:state <text>` to set it.");
@@ -668,6 +681,83 @@ impl App {
                 _ => self.set_state(Value::String(args.to_owned())),
             },
         }
+    }
+
+    /// `:turn` — the state as a conversation.
+    ///
+    /// Nothing new goes on the wire: the state becomes a list of turns and grows by one each time,
+    /// so the questions stay exactly as they were and Enter re-reads the whole thread. Watching a
+    /// noul move across the turns is the thing this is for.
+    fn turn_cmd(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() || trimmed == "list" {
+            self.show_turns();
+            return;
+        }
+        if trimmed == "drop" || trimmed == "pop" {
+            match self.session.drop_turn() {
+                Some(dropped) => {
+                    self.note(format!("dropped {}", session::turn_text(&dropped)));
+                    if self.session.state_is_empty() {
+                        self.note("that was the last one; the state is empty.");
+                    }
+                }
+                None => self.warn("no turns to drop — the state is not a conversation yet."),
+            }
+            return;
+        }
+        let turn = match session::parse_turn(trimmed) {
+            Ok(turn) => turn,
+            Err(e) => {
+                self.bad(e);
+                return;
+            }
+        };
+        // Before it is added, so the note below can say what became of the text that was there.
+        let seeded = !self.session.state_is_empty() && self.session.turns().is_none();
+        let turns = match self.session.add_turn(turn.clone()) {
+            Ok(turns) => turns,
+            Err(e) => {
+                self.bad(e);
+                self.note("`:state clear` starts one from nothing.");
+                return;
+            }
+        };
+        if seeded {
+            self.note("the state you had became the first turn.");
+        }
+        self.extend(turn_lines(turns.len() - 1, &turn));
+        if turn.who.is_none() {
+            self.note("nobody named — `:turn customer: …` attributes it.");
+        }
+        if turns.len() == 1 {
+            self.note(
+                "add the reply with another :turn; Enter re-asks every question over the thread.",
+            );
+        }
+    }
+
+    fn show_turns(&mut self) {
+        let Some(turns) = self.session.turns() else {
+            self.heading("state");
+            if self.session.state_is_empty() {
+                self.note("empty — `:turn customer: <text>` starts a conversation.");
+            } else {
+                let pretty = serde_json::to_string_pretty(&self.session.state)
+                    .unwrap_or_else(|_| self.session.state_preview());
+                self.extend(highlight::json(&pretty));
+                self.note(
+                    "not a conversation — `:turn <who>: <text>` makes this text the first turn.",
+                );
+            }
+            return;
+        };
+        let plural = if turns.len() == 1 { "" } else { "s" };
+        self.heading(format!("conversation ({} turn{plural})", turns.len()));
+        for (i, turn) in turns.iter().enumerate() {
+            self.extend(turn_lines(i, turn));
+        }
+        self.note("`:turn drop` takes the last one back; `:json` shows it as the state it is.");
     }
 
     fn set_state(&mut self, value: Value) {
@@ -888,12 +978,14 @@ impl App {
         }
         let model = self.model_name();
         let estimate = cost::estimate(&self.session, &model);
+        let thread = cost::thread(&self.session, &model);
         let rates = self.rates;
         self.heading(format!("cost estimate  ·  {model}"));
         self.extend(cost_lines(
             &estimate,
             rates,
             ":cost 0.20/1.00 prices it: dollars per million tokens, input then output",
+            thread.as_ref(),
         ));
         self.note(
             "Tokens are estimated from the body, not counted by the API's tokenizer; `usage` on a live answer is the real thing.",

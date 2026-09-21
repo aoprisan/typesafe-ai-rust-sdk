@@ -42,6 +42,24 @@ jev            # with TYPESAFE_API_KEY for live answers; without it, answers are
     Calm < Frustrated but civil < Very angry
   ```
 
+- `:turn` grows the state into a conversation, so a rubric can be re-read after every reply
+  instead of sampled once. The questions stay exactly as they are and only the state gets longer:
+
+  ```text
+  :turn customer: The payout failed again, third time this month.
+  :turn agent: Sorry about that — can you confirm the last four digits?
+  <Enter>                                          # every question, over the whole thread
+  :turn customer: I have sent them twice already. I want a refund now.
+  <Enter>                                          # the same questions again; watch is_urgent move
+  ```
+
+  Nothing new goes on the wire — the `state` is simply an array, `[{"who": …, "said": …}, …]`,
+  which is why a page can hold one and `jev eval` can score one without knowing anything new. The
+  speaker is the first word only when it ends in a colon, so a line typed without one keeps all of
+  its words. `:turn list` shows the thread, `:turn drop` takes the last one back, and a state that
+  is already plain text becomes the first turn rather than being thrown away. Answers stay out of
+  it: what comes back is a distribution, not something to reason over next turn.
+
 - `:build` opens a form for one question; `:json` shows the exact request body, `:last` the raw
   response, `:rust` the session as a program against
   [`typesafe-ai-sdk`](https://crates.io/crates/typesafe-ai-sdk).
@@ -58,6 +76,16 @@ jev            # with TYPESAFE_API_KEY for live answers; without it, answers are
   total                  228   186   414 tokens per call
     $0.000232 per call   ·   $0.2316 per 1,000 calls
     at $0.20/$1.00 per Mtok
+  ```
+
+  A conversation is priced as what it is — a call per turn over a state that keeps growing, so the
+  tokens climb faster than the transcript does:
+
+  ```text
+  state        3 turns    84     ·
+  total                  272   186   458 tokens per call
+    $0.000240 per call   ·   $0.2404 per 1,000 calls
+    asked after every turn: 3 calls, 732 in / 558 out   1290 tokens for the thread   ·   $0.000704
   ```
 
   Rates are yours to supply, because nothing here knows what a model charges: `:cost 0.20/1.00` is
@@ -93,6 +121,16 @@ at all, reads stdin.
 ```sh
 jev run triage.jev --state "$(cat ticket.txt)" --json | jq '.answers.is_urgent.noul'
 ```
+
+`--turn` appends to the state instead of replacing it, and repeats, so a thread can be driven from
+a script the same way it is typed in the REPL:
+
+```sh
+jev run thread.jev --turn "agent: We are looking into it." --turn "customer: I want a refund now."
+```
+
+A page can also start out as a conversation: put the array above the `---` and it is read back as
+one, by `jev run`, by `jev cost`, and by a `state` in a `jev eval` case.
 
 `--state <text>` sets or replaces the state, `--model <name>` picks the model, `--threshold <0-1>`
 says what counts as a yes for a noul, `--price <in>/<out>` prices the table, `--timeout <seconds>`

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use typesafe::Usage;
 
 use crate::mock;
-use crate::session::Session;
+use crate::session::{Session, turns_to_json};
 
 /// Environment variable holding `<input>/<output>` dollars per million tokens.
 pub const PRICE_ENV: &str = "JEV_PRICE";
@@ -175,6 +175,42 @@ pub fn estimate(session: &Session, model: &str) -> Estimate {
         input_tokens,
         output_tokens,
     }
+}
+
+/// What a conversation has cost, as opposed to what one call costs.
+///
+/// A thread is not cheap the way it looks: the state is sent whole every time, so asking again
+/// after each turn is a call per turn over a state that keeps growing, and the tokens add up
+/// faster than the transcript does. This is the number that surprises people, so it is worth
+/// printing next to the per-call one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thread {
+    /// Turns in the state.
+    pub turns: usize,
+    /// One estimate per turn: what asking after that turn cost.
+    pub calls: Vec<Estimate>,
+    /// Every call's input tokens, added up.
+    pub input_tokens: usize,
+    /// Every call's output tokens, added up.
+    pub output_tokens: usize,
+}
+
+/// Estimate a call per turn, or `None` when the state is not a conversation.
+pub fn thread(session: &Session, model: &str) -> Option<Thread> {
+    let turns = session.turns()?;
+    let mut so_far = session.clone();
+    let calls: Vec<Estimate> = (1..=turns.len())
+        .map(|n| {
+            so_far.state = turns_to_json(&turns[..n]);
+            estimate(&so_far, model)
+        })
+        .collect();
+    Some(Thread {
+        turns: turns.len(),
+        input_tokens: calls.iter().map(|c| c.input_tokens).sum(),
+        output_tokens: calls.iter().map(|c| c.output_tokens).sum(),
+        calls,
+    })
 }
 
 /// Price a pair of token counts.

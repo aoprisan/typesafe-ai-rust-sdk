@@ -161,6 +161,9 @@ just repl                         # from this checkout (or: cargo run -p jev-rep
 - `:lesson` walks an eleven-step track from "what is a noul" to what a call costs.
 - `:sketch` opens the whole request as one page of text (below).
 - `:build` opens a form for composing a question, with the JSON it will send rendered as you type.
+- `:turn <who>: <text>` grows the state into a conversation instead of replacing it, so the same
+  fixed questions can be re-read after every reply. Nothing new goes on the wire: the `state` is
+  an array of `{who, said}`, which is why a page can carry one and `jev eval` can score one.
 - `:json` shows the exact request body, `:last` the raw response, and `:rust` the same session as a
   program written against this SDK.
 - `:cost` estimates what a call spends before it is sent — tokens per question for the request and

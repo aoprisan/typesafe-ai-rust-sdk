@@ -98,9 +98,17 @@ fn describe(session: &Session) -> String {
         format!("{n} question{plural}: {kinds}")
     };
     if session.state_is_empty() {
-        format!("{head}\nno state — pass --state <text> before sending")
-    } else {
-        head
+        return format!("{head}\nno state — pass --state <text> before sending");
+    }
+    match session.turns() {
+        Some(turns) => {
+            let plural = if turns.len() == 1 { "" } else { "s" };
+            format!(
+                "{head}\nthe state is a conversation of {} turn{plural}",
+                turns.len()
+            )
+        }
+        None => head,
     }
 }
 
@@ -222,7 +230,12 @@ pub fn answers_json(answers: &[Answered], model: &str, raw: Option<&Value>) -> S
 pub fn cost_text(session: &Session, model: &str, rates: Option<Rates>) -> String {
     let estimate = cost::estimate(session, model);
     let hint = "--price 0.20/1.00 prices it: dollars per million tokens, input then output";
-    plain(cost_lines(&estimate, rates, hint))
+    plain(cost_lines(
+        &estimate,
+        rates,
+        hint,
+        cost::thread(session, model).as_ref(),
+    ))
 }
 
 /// The one-line footer under an answer page: tokens, and money when the rates are known.
