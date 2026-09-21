@@ -28,16 +28,22 @@ pub async fn serve(host: Host) {
     });
 
     let mut answering = JoinSet::new();
-    while let Some(line) = incoming.recv().await {
-        let host = host.clone();
-        answering.spawn(async move { mcp::handle_line(&line, &host).await });
-        // Anything already answered goes out now, so a slow call does not hold up a fast one.
-        while let Some(done) = answering.try_join_next() {
-            write(done.ok().flatten());
+    let mut open = true;
+    // A reply goes out the moment it is ready, not when the next line happens to arrive: the
+    // client sends `initialize` and waits on the answer before it says anything else.
+    while open || !answering.is_empty() {
+        tokio::select! {
+            line = incoming.recv(), if open => match line {
+                Some(line) => {
+                    let host = host.clone();
+                    answering.spawn(async move { mcp::handle_line(&line, &host).await });
+                }
+                None => open = false,
+            },
+            Some(done) = answering.join_next(), if !answering.is_empty() => {
+                write(done.ok().flatten());
+            }
         }
-    }
-    while let Some(done) = answering.join_next().await {
-        write(done.ok().flatten());
     }
     let _ = reader.await;
 }
