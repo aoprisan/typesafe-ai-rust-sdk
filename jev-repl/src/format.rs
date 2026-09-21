@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 use typesafe::{Answer, Error, Question};
 
-use crate::cost::{Estimate, Rates, format_rates, price_estimate, usd};
+use crate::cost::{Estimate, Rates, Thread, format_rates, price, price_estimate, usd};
+use crate::session::Turn;
 
 pub const NOUL: Color = Color::Cyan;
 pub const CHOICE: Color = Color::Magenta;
@@ -167,8 +168,14 @@ fn confidence_span(c: f64) -> Span<'static> {
 
 /// The cost estimate as a small table: which question spends what, and — when rates are set — the
 /// money at the bottom. Tokens are estimated, so the numbers are a shape, not a bill. `hint` is how
-/// this host sets rates, since the terminal has `:cost` and other hosts have their own.
-pub fn cost_lines(estimate: &Estimate, rates: Option<Rates>, hint: &str) -> Vec<Line<'static>> {
+/// this host sets rates, since the terminal has `:cost` and other hosts have their own. `thread`
+/// is what the state costs when it is a conversation, which is more than the last call alone.
+pub fn cost_lines(
+    estimate: &Estimate,
+    rates: Option<Rates>,
+    hint: &str,
+    thread: Option<&Thread>,
+) -> Vec<Line<'static>> {
     let pad = estimate
         .questions
         .iter()
@@ -176,6 +183,15 @@ pub fn cost_lines(estimate: &Estimate, rates: Option<Rates>, hint: &str) -> Vec<
         .chain([5, 8, 5])
         .max()
         .unwrap_or(8);
+    // `noul` and `choice` fit the seven the table has always been; a long enough thread does not.
+    let turns = match thread {
+        Some(thread) => {
+            let plural = if thread.turns == 1 { "" } else { "s" };
+            format!("{} turn{plural}", thread.turns)
+        }
+        None => String::new(),
+    };
+    let kind_pad = turns.chars().count().max(7);
     let row = |name: &str, kind: &str, input: String, output: String, color: Option<Color>| {
         Line::from(vec![
             Span::raw("  "),
@@ -184,7 +200,7 @@ pub fn cost_lines(estimate: &Estimate, rates: Option<Rates>, hint: &str) -> Vec<
                 None => Span::raw(pad_end(name, pad)),
             },
             Span::raw("  "),
-            dim(pad_end(kind, 7)),
+            dim(pad_end(kind, kind_pad)),
             Span::raw(format!("{input:>6}")),
             Span::raw(format!("{output:>6}")),
         ])
@@ -194,7 +210,7 @@ pub fn cost_lines(estimate: &Estimate, rates: Option<Rates>, hint: &str) -> Vec<
         Span::raw("  "),
         dim(pad_end("", pad)),
         Span::raw("  "),
-        dim(pad_end("", 7)),
+        dim(pad_end("", kind_pad)),
         dim(format!("{:>6}", "in")),
         dim(format!("{:>6}", "out")),
     ])];
@@ -213,7 +229,7 @@ pub fn cost_lines(estimate: &Estimate, rates: Option<Rates>, hint: &str) -> Vec<
     }
     out.push(row(
         "state",
-        "",
+        &turns,
         estimate.state_tokens.to_string(),
         "·".to_owned(),
         None,
@@ -229,7 +245,7 @@ pub fn cost_lines(estimate: &Estimate, rates: Option<Rates>, hint: &str) -> Vec<
         Span::raw("  "),
         bold(pad_end("total", pad)),
         Span::raw("  "),
-        dim(pad_end("", 7)),
+        dim(pad_end("", kind_pad)),
         bold(format!("{:>6}", estimate.input_tokens)),
         bold(format!("{:>6}", estimate.output_tokens)),
         dim(format!(
@@ -243,6 +259,7 @@ pub fn cost_lines(estimate: &Estimate, rates: Option<Rates>, hint: &str) -> Vec<
             Span::raw("    "),
             dim(format!("no rates set — {hint}")),
         ]));
+        out.extend(thread_lines(thread, None));
         return out;
     };
     let cost = price_estimate(estimate, rates);
@@ -260,7 +277,53 @@ pub fn cost_lines(estimate: &Estimate, rates: Option<Rates>, hint: &str) -> Vec<
         Span::raw("    "),
         dim(format!("at {}", format_rates(rates))),
     ]));
+    out.extend(thread_lines(thread, Some(rates)));
     out
+}
+
+/// The line under the table when the state is a conversation: a call per turn, all of it added up.
+///
+/// A thread is sent whole every time it is asked about, so the tokens grow with the square of the
+/// turns rather than with the transcript. Saying so once, in numbers, is cheaper than finding out.
+fn thread_lines(thread: Option<&Thread>, rates: Option<Rates>) -> Vec<Line<'static>> {
+    let Some(thread) = thread else {
+        return Vec::new();
+    };
+    let plural = if thread.turns == 1 { "" } else { "s" };
+    let total = thread.input_tokens + thread.output_tokens;
+    let mut spans = vec![
+        Span::raw("    "),
+        dim("asked after every turn: "),
+        Span::raw(format!("{} call{plural}", thread.turns)),
+        dim(format!(
+            ", {} in / {} out",
+            thread.input_tokens, thread.output_tokens
+        )),
+        dim(format!("   {total} tokens for the thread")),
+    ];
+    if let Some(rates) = rates {
+        let spent = price(
+            thread.input_tokens as u64,
+            thread.output_tokens as u64,
+            rates,
+        );
+        spans.push(dim("   ·   "));
+        spans.push(Span::styled(usd(spent.total), Style::new().fg(SCORE)));
+    }
+    vec![Line::from(spans)]
+}
+
+/// One turn of the conversation held as the state, as `:turn` and `:state` echo it back.
+pub fn turn_lines(index: usize, turn: &Turn) -> Vec<Line<'static>> {
+    vec![Line::from(vec![
+        dim(format!("  {}. ", index + 1)),
+        match &turn.who {
+            Some(who) => Span::styled(who.clone(), Style::new().fg(ACCENT)),
+            None => dim("(unattributed)"),
+        },
+        Span::raw("  "),
+        Span::raw(turn.said.clone()),
+    ])]
 }
 
 fn pad_end(text: &str, width: usize) -> String {

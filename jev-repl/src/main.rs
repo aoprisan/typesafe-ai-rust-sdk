@@ -93,6 +93,7 @@ fn help() -> String {
          The file is a .jev sketch page or a request body; `-`, or no file at all, reads stdin.\n\n\
          Options\n\
          \x20 --state <text>         set the state, or replace the one on the page\n\
+         \x20 --turn <who>: <text>   append a turn, making the state a conversation; repeatable\n\
          \x20 --model <name>         the model to ask\n\
          \x20 --threshold <0-1>      what counts as a yes for a noul (default 0.5)\n\
          \x20 --price <in>/<out>     dollars per million tokens, input then output\n\
@@ -117,6 +118,8 @@ fn help() -> String {
 struct Options {
     file: String,
     state: Option<String>,
+    /// Turns appended to the state, in the order they were given.
+    turns: Vec<String>,
     model: Option<String>,
     threshold: f64,
     rates: Option<Rates>,
@@ -162,6 +165,10 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         };
         match name.as_str() {
             "--state" => options.state = Some(value()?),
+            "--turn" => {
+                let turn = value()?;
+                options.turns.push(turn);
+            }
             "--model" => options.model = Some(value()?),
             "--threshold" => {
                 let text = value()?;
@@ -235,10 +242,16 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
 /// The flags `eval` reads differently from the other commands.
 ///
 /// `--state` is the interesting one: a page's state is what the cases replace, so passing one
-/// would quietly judge the same text forty times.
+/// would quietly judge the same text forty times. `--turn` is the same thing said a turn at a
+/// time — a case that is a conversation carries its turns in its own `state`.
 fn check_eval_options(options: &Options) -> Result<(), String> {
     if options.state.is_some() {
         return Err("--state does not apply to eval: the cases carry the states.".to_owned());
+    }
+    if !options.turns.is_empty() {
+        return Err(
+            "--turn does not apply to eval: a case's own state carries its turns.".to_owned(),
+        );
     }
     let Some(cases) = &options.cases else {
         return Err("--cases <file> is required: jev eval page.jev --cases cases.jsonl".to_owned());
@@ -310,6 +323,13 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
     };
     if let Some(state) = &options.state {
         session.state = serde_json::Value::String(state.clone());
+    }
+    for text in &options.turns {
+        let added = jev_repl::session::parse_turn(text).and_then(|turn| session.add_turn(turn));
+        if let Err(e) = added {
+            eprintln!("jev {command}: --turn {e}");
+            return BAD_USAGE;
+        }
     }
     if let Some(model) = &options.model {
         session.model = Some(model.clone());
@@ -419,8 +439,8 @@ async fn serve_mcp(args: &[String]) -> u8 {
         eprintln!("jev mcp: takes no file: the pages arrive in the tool calls.");
         return BAD_USAGE;
     }
-    if options.state.is_some() || options.cases.is_some() {
-        eprintln!("jev mcp: --state and --cases belong to a tool call, not to the server.");
+    if options.state.is_some() || !options.turns.is_empty() || options.cases.is_some() {
+        eprintln!("jev mcp: --state, --turn and --cases belong to a tool call, not to the server.");
         return BAD_USAGE;
     }
 

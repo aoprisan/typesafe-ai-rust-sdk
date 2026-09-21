@@ -220,3 +220,11 @@ fn knows_its_own_subcommands() {
     assert!(!headless::is_command("triage.jev"));
     assert!(!headless::is_command("--help"));
 }
+
+#[test]
+fn check_says_when_the_state_is_a_conversation() {
+    let page =
+        "[{\"who\": \"customer\", \"said\": \"Refund me\"}]\n---\nis_urgent? conveys urgency\n";
+    let summary = headless::check_text(page).expect("the page parses");
+    assert!(summary.contains("conversation of 1 turn"), "{summary}");
+}

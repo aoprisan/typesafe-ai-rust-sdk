@@ -260,7 +260,7 @@ fn the_table_totals_what_it_lists() {
     let mut app = app();
     app.exec(":preset triage");
     let estimate = cost::estimate(&app.session, "jev-latest");
-    let text = cost_lines(&estimate, Some(RATES), "unused")
+    let text = cost_lines(&estimate, Some(RATES), "unused", None)
         .iter()
         .map(|l| {
             l.spans
@@ -275,4 +275,64 @@ fn the_table_totals_what_it_lists() {
     assert!(text.contains(&estimate.input_tokens.to_string()), "{text}");
     assert!(text.contains(&estimate.output_tokens.to_string()), "{text}");
     assert!(text.contains("per call"), "{text}");
+}
+
+/// A thread of three turns, built the way it is typed: one `:turn` at a time.
+fn thread_app() -> App {
+    let mut app = app();
+    app.exec(":preset triage");
+    app.exec(":state clear");
+    app.exec(":turn customer: The payout failed again, third time this month.");
+    app.exec(":turn agent: Sorry about that — can you confirm the last four digits?");
+    app.exec(":turn customer: I have sent them twice already. I want a refund now.");
+    app
+}
+
+#[test]
+fn a_thread_is_one_call_per_turn_over_a_longer_state() {
+    let app = thread_app();
+    let thread = cost::thread(&app.session, "jev-latest").expect("a conversation");
+    assert_eq!(thread.turns, 3);
+    let inputs: Vec<usize> = thread.calls.iter().map(|c| c.input_tokens).collect();
+    assert_eq!(inputs.len(), 3);
+    assert!(inputs[0] < inputs[1], "{inputs:?}");
+    assert!(inputs[1] < inputs[2], "{inputs:?}");
+    assert_eq!(thread.input_tokens, inputs.iter().sum::<usize>());
+}
+
+#[test]
+fn a_thread_costs_more_than_its_last_call_alone() {
+    let app = thread_app();
+    let one = cost::estimate(&app.session, "jev-latest");
+    let whole = cost::thread(&app.session, "jev-latest").expect("a conversation");
+    assert!(whole.input_tokens > one.input_tokens);
+    assert_eq!(whole.calls[2].input_tokens, one.input_tokens);
+}
+
+#[test]
+fn a_state_that_is_not_a_conversation_has_no_thread() {
+    let mut app = app();
+    app.exec(":preset triage");
+    assert!(cost::thread(&app.session, "jev-latest").is_none());
+}
+
+#[test]
+fn the_table_counts_the_turns_and_totals_the_thread() {
+    let mut app = thread_app();
+    app.rates = Some(RATES);
+    app.transcript.clear();
+    app.exec(":cost");
+    let text = transcript(&app);
+    assert!(text.contains("3 turns"), "{text}");
+    assert!(text.contains("asked after every turn: 3 calls"), "{text}");
+    assert!(text.contains("tokens for the thread"), "{text}");
+}
+
+#[test]
+fn the_table_is_unchanged_when_the_state_is_one_message() {
+    let mut app = app();
+    app.exec(":preset triage");
+    app.transcript.clear();
+    app.exec(":cost");
+    assert!(!transcript(&app).contains("asked after every turn"));
 }

@@ -70,6 +70,7 @@ fn lists_the_commands_in_help() {
         assert!(help.contains(command), "{help}");
     }
     assert!(help.contains("--state"), "{help}");
+    assert!(help.contains("--turn"), "{help}");
 }
 
 #[test]
@@ -129,6 +130,61 @@ fn takes_the_state_off_the_command_line() {
     let out = jev(&["json", "--state", "All fine, thanks!"], PAGE, &[]);
     let parsed: Value = serde_json::from_str(&out.stdout).expect("valid JSON");
     assert_eq!(parsed["state"], "All fine, thanks!");
+}
+
+#[test]
+fn appends_turns_to_the_state_in_the_order_they_were_given() {
+    let out = jev(
+        &[
+            "json",
+            "--turn",
+            "agent: We are looking into it.",
+            "--turn",
+            "customer: Refund me.",
+        ],
+        PAGE,
+        &[],
+    );
+    let parsed: Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    let turns = parsed["state"].as_array().expect("a conversation");
+    assert_eq!(turns.len(), 3);
+    assert!(turns[0]["said"].is_string(), "{}", out.stdout);
+    assert_eq!(
+        turns[1],
+        json!({"who": "agent", "said": "We are looking into it."})
+    );
+    assert_eq!(turns[2], json!({"who": "customer", "said": "Refund me."}));
+}
+
+#[test]
+fn refuses_a_turn_on_a_state_that_is_not_a_conversation() {
+    let body =
+        r#"{"state": {"ticket": 1}, "questions": {"a": {"type": "noul", "instructions": "x"}}}"#;
+    let out = jev(&["json", "--turn", "agent: hello"], body, &[]);
+    assert_eq!(out.status, 2);
+    assert!(out.stderr.contains("not a conversation"), "{}", out.stderr);
+}
+
+#[test]
+fn counts_the_thread_in_the_cost_table() {
+    let out = jev(
+        &[
+            "cost",
+            "--turn",
+            "agent: We are looking into it.",
+            "--price",
+            "0.20/1.00",
+        ],
+        PAGE,
+        &[],
+    );
+    assert_eq!(out.status, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("2 turns"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("asked after every turn: 2 calls"),
+        "{}",
+        out.stdout
+    );
 }
 
 #[test]
@@ -387,6 +443,18 @@ fn exits_2_on_a_command_line_eval_cannot_use() {
                 .contains("--state does not apply to eval: the cases carry the states."),
             "{}",
             state.stderr
+        );
+
+        let turn = jev(
+            &["eval", page, "--cases", cases, "--mock", "--turn", "a: b"],
+            "",
+            &[],
+        );
+        assert_eq!(turn.status, 2);
+        assert!(
+            turn.stderr.contains("--turn does not apply to eval"),
+            "{}",
+            turn.stderr
         );
 
         let rateless = jev(

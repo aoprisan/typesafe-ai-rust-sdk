@@ -2,7 +2,7 @@
 
 use jev_repl::app::{App, Msg};
 use jev_repl::builder::{Builder, Outcome};
-use jev_repl::{codegen, highlight, mock, session, ui, wrap};
+use jev_repl::{codegen, highlight, mock, session, sketch, ui, wrap};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -393,5 +393,152 @@ fn an_api_key_is_never_echoed_or_remembered() {
     assert!(
         text.contains("…-key"),
         "the tail is enough to tell keys apart: {text}"
+    );
+}
+
+// ---- a conversation as the state ------------------------------------------------------------
+
+#[test]
+fn turns_grow_the_state_one_at_a_time() {
+    let mut app = app();
+    app.exec(":turn customer: The payout failed again.");
+    app.exec(":turn agent: Can you confirm the last four digits?");
+    assert_eq!(
+        app.session.state,
+        json!([
+            {"who": "customer", "said": "The payout failed again."},
+            {"who": "agent", "said": "Can you confirm the last four digits?"},
+        ])
+    );
+    assert_eq!(app.session.turns().map(|t| t.len()), Some(2));
+}
+
+#[test]
+fn a_speaker_is_named_only_when_the_first_word_ends_in_a_colon() {
+    let turn = session::parse_turn("customer: I want a refund").expect("a turn");
+    assert_eq!(turn.who.as_deref(), Some("customer"));
+    assert_eq!(turn.said, "I want a refund");
+
+    let bare = session::parse_turn("I want a refund now").expect("a turn");
+    assert_eq!(bare.who, None);
+    assert_eq!(bare.said, "I want a refund now");
+
+    assert!(session::parse_turn("customer:").is_err());
+    assert!(session::parse_turn("   ").is_err());
+}
+
+#[test]
+fn the_text_already_in_the_state_becomes_the_first_turn() {
+    let mut app = app();
+    app.exec("The payout failed again.");
+    app.exec(":turn agent: We are looking into it.");
+    assert_eq!(
+        app.session.state,
+        json!([
+            {"said": "The payout failed again."},
+            {"who": "agent", "said": "We are looking into it."},
+        ])
+    );
+    assert!(transcript(&app).contains("the state you had became the first turn"));
+}
+
+#[test]
+fn a_state_that_is_not_a_conversation_is_refused_not_reshaped() {
+    let mut app = app();
+    app.exec(r#":state json {"ticket": 1}"#);
+    app.exec(":turn agent: We are looking into it.");
+    assert_eq!(app.session.state, json!({"ticket": 1}));
+    assert!(transcript(&app).contains("not a conversation"));
+}
+
+#[test]
+fn dropping_takes_the_last_turn_back_and_the_last_of_all_empties_the_state() {
+    let mut app = app();
+    app.exec(":turn customer: The payout failed again.");
+    app.exec(":turn agent: We are looking into it.");
+    app.exec(":turn drop");
+    assert_eq!(
+        app.session.state,
+        json!([{"who": "customer", "said": "The payout failed again."}])
+    );
+    app.exec(":turn drop");
+    assert!(app.session.state_is_empty());
+    app.transcript.clear();
+    app.exec(":turn drop");
+    assert!(transcript(&app).contains("no turns to drop"));
+}
+
+#[test]
+fn a_transcript_written_with_chat_api_keys_reads_as_turns() {
+    let mut app = app();
+    app.exec(r#":state json [{"role": "user", "content": "Refund me"}]"#);
+    let turns = app.session.turns().expect("a conversation");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].who.as_deref(), Some("user"));
+    assert_eq!(turns[0].said, "Refund me");
+    app.exec(":turn agent: Looking into it.");
+    assert_eq!(app.session.turns().map(|t| t.len()), Some(2));
+}
+
+#[test]
+fn the_questions_stay_fixed_so_one_rubric_reads_the_whole_thread() {
+    let mut app = app();
+    app.exec(":preset triage");
+    app.exec(":state clear");
+    let before: Vec<String> = app
+        .session
+        .questions
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    app.exec(":turn customer: The payout failed again.");
+    app.exec(":turn customer: I want a refund now.");
+    let after: Vec<String> = app
+        .session
+        .questions
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    assert_eq!(after, before);
+
+    let body: Value = serde_json::from_str(&app.session.request_json("jev-latest")).unwrap();
+    assert!(body["state"].is_array(), "{body}");
+    let asked: Vec<&String> = body["questions"]
+        .as_object()
+        .expect("the questions")
+        .keys()
+        .collect();
+    assert_eq!(asked, before.iter().collect::<Vec<_>>());
+}
+
+#[test]
+fn the_state_command_lists_the_turns_instead_of_raw_json() {
+    let mut app = app();
+    app.exec(":turn customer: The payout failed again.");
+    app.transcript.clear();
+    app.exec(":state");
+    let text = transcript(&app);
+    assert!(text.contains("conversation (1 turn)"), "{text}");
+    assert!(text.contains("The payout failed again."), "{text}");
+}
+
+#[test]
+fn a_conversation_survives_a_round_trip_through_a_sketch_page() {
+    let mut app = app();
+    app.exec(":preset triage");
+    app.exec(":turn agent: Have you tried another browser?");
+    let page = sketch::render(&app.session);
+    let back = sketch::parse(&page).to_session();
+    assert_eq!(back.turns(), app.session.turns());
+}
+
+#[test]
+fn the_panel_preview_counts_the_turns() {
+    let mut app = app();
+    app.exec(":turn customer: The payout failed again.");
+    app.exec(":turn agent: Looking into it.");
+    assert_eq!(
+        app.session.state_preview(),
+        "2 turns · agent: Looking into it."
     );
 }

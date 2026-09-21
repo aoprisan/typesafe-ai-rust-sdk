@@ -7,6 +7,72 @@ use typesafe::{Choice, Noul, Question, Questions, Score};
 /// A question under construction, kept in the order it was added (answers come back in that order).
 pub type Entry = (String, Question);
 
+/// One turn of a conversation held as the state: who spoke, and what they said.
+///
+/// A conversation is not a new field on the wire — it is the `state`, shaped as an array. The
+/// questions stay fixed and the state grows, which is the whole point: the same rubric, re-read
+/// after every reply, so a noul can be watched moving rather than sampled once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    /// The speaker, when the line names one.
+    pub who: Option<String>,
+    /// What was said.
+    pub said: String,
+}
+
+/// Keys a turn's speaker may arrive under, so a transcript from elsewhere still reads as one.
+const WHO_KEYS: [&str; 4] = ["who", "role", "speaker", "from"];
+/// Keys a turn's text may arrive under, for the same reason.
+const SAID_KEYS: [&str; 4] = ["said", "text", "content", "message"];
+
+/// Read a state as a conversation, or `None` when it is not one.
+///
+/// Only an array whose every element carries some text counts, so a string state, a row of
+/// numbers or an object of fields is never mistaken for a thread and quietly reshaped. The key
+/// names are read loosely because a transcript pasted in from a chat API is still a transcript.
+pub fn turns_of(state: &Value) -> Option<Vec<Turn>> {
+    let items = state.as_array().filter(|a| !a.is_empty())?;
+    let mut turns = Vec::with_capacity(items.len());
+    for item in items {
+        let object = item.as_object()?;
+        let pick = |keys: [&str; 4]| {
+            keys.into_iter()
+                .find_map(|k| object.get(k).and_then(Value::as_str))
+        };
+        let said = pick(SAID_KEYS)?;
+        turns.push(Turn {
+            who: pick(WHO_KEYS).filter(|w| !w.is_empty()).map(str::to_owned),
+            said: said.to_owned(),
+        });
+    }
+    Some(turns)
+}
+
+/// Turns as they go on the wire: `who` only when there is one, so nothing empty is paid for.
+pub fn turns_to_json(turns: &[Turn]) -> Value {
+    Value::Array(
+        turns
+            .iter()
+            .map(|t| {
+                let mut map = serde_json::Map::new();
+                if let Some(who) = &t.who {
+                    map.insert("who".to_owned(), Value::String(who.clone()));
+                }
+                map.insert("said".to_owned(), Value::String(t.said.clone()));
+                Value::Object(map)
+            })
+            .collect(),
+    )
+}
+
+/// `customer: The payout failed again` — one turn on one line.
+pub fn turn_text(turn: &Turn) -> String {
+    match &turn.who {
+        Some(who) => format!("{who}: {}", turn.said),
+        None => turn.said.clone(),
+    }
+}
+
 /// Everything the next `:ask` will send.
 #[derive(Debug, Default, Clone)]
 pub struct Session {
@@ -33,9 +99,64 @@ impl Session {
 
     /// One-line preview of the state for the side panel.
     pub fn state_preview(&self) -> String {
+        if let Some(turns) = self.turns()
+            && let Some(last) = turns.last()
+        {
+            let plural = if turns.len() == 1 { "" } else { "s" };
+            return format!("{} turn{plural} · {}", turns.len(), turn_text(last));
+        }
         match &self.state {
             Value::String(s) => s.clone(),
             other => other.to_string(),
+        }
+    }
+
+    /// The state read as a conversation, or `None` when it is something else.
+    pub fn turns(&self) -> Option<Vec<Turn>> {
+        turns_of(&self.state)
+    }
+
+    /// Append a turn to the state.
+    ///
+    /// An empty state starts a thread and a thread grows by one. A state that is plain text
+    /// becomes the first turn, because that is how a session usually begins — one message, then
+    /// the reply to it. Any other JSON is refused rather than reshaped: whatever it is, it is not
+    /// a conversation, and guessing at one would lose it.
+    pub fn add_turn(&mut self, turn: Turn) -> Result<Vec<Turn>, String> {
+        let Some(mut turns) = self.turns().or_else(|| self.seed_turns()) else {
+            return Err(
+                "The state is JSON that is not a conversation, so there is no thread to add to."
+                    .to_owned(),
+            );
+        };
+        turns.push(turn);
+        self.state = turns_to_json(&turns);
+        Ok(turns)
+    }
+
+    /// Take the last turn back. The last one of all leaves the state empty again.
+    pub fn drop_turn(&mut self) -> Option<Turn> {
+        let mut turns = self.turns()?;
+        let last = turns.pop()?;
+        self.state = if turns.is_empty() {
+            Value::String(String::new())
+        } else {
+            turns_to_json(&turns)
+        };
+        Some(last)
+    }
+
+    /// What a thread starts from: nothing, or the text that was already there.
+    fn seed_turns(&self) -> Option<Vec<Turn>> {
+        if self.state_is_empty() {
+            return Some(Vec::new());
+        }
+        match &self.state {
+            Value::String(s) => Some(vec![Turn {
+                who: None,
+                said: s.clone(),
+            }]),
+            _ => None,
         }
     }
 
@@ -191,6 +312,35 @@ pub fn parse_raw(args: &str) -> Result<Entry, String> {
     )?;
     let v: Value = serde_json::from_str(&rest).map_err(|e| format!("Not valid JSON: {e}"))?;
     Ok((name, Question::Raw(v)))
+}
+
+/// `who: what they said`, or just what they said.
+///
+/// The speaker is the first word and only when that word ends in a colon, so a line typed without
+/// one keeps all of its words instead of donating the first to a speaker nobody named.
+pub fn parse_turn(args: &str) -> Result<Turn, String> {
+    let text = args.trim();
+    let example = ":turn customer: The payout failed again";
+    if text.is_empty() {
+        return Err(format!("A turn needs something said. Try: {example}"));
+    }
+    let (head, rest) = match text.split_once(char::is_whitespace) {
+        Some((head, rest)) => (head, rest.trim()),
+        None => (text, ""),
+    };
+    let Some(who) = head.strip_suffix(':').filter(|w| !w.is_empty()) else {
+        return Ok(Turn {
+            who: None,
+            said: text.to_owned(),
+        });
+    };
+    if rest.is_empty() {
+        return Err(format!("Nothing said after {head:?}. Try: {example}"));
+    }
+    Ok(Turn {
+        who: Some(who.to_owned()),
+        said: rest.to_owned(),
+    })
 }
 
 fn split_name(args: &str, example: &str) -> Result<(String, String), String> {

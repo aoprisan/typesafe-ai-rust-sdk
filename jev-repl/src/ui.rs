@@ -640,6 +640,7 @@ fn sketch(frame: &mut Frame, area: Rect, app: &mut App) {
                     &cost::estimate(&session, &model),
                     rates,
                     ":cost 0.20/1.00 prices it, dollars per million tokens",
+                    cost::thread(&session, &model).as_ref(),
                 ));
             }
         }

@@ -63,6 +63,31 @@ Rules worth remembering:
 Question names are the keys of the answer object, so name them the way you want to
 read them back: `is_urgent`, `department`, `severity`.
 
+## A conversation as the state
+
+The state does not have to be one message. Written as an array of turns it is a thread,
+and the same fixed questions can be re-read after every reply — which is the point: a
+noul that climbs from 0.2 to 0.9 over four turns says something a single call cannot.
+
+```text
+[
+  { "who": "customer", "said": "The payout failed again, third time this month." },
+  { "who": "agent", "said": "Can you confirm the last four digits?" },
+  { "who": "customer", "said": "I sent them twice already. I want a refund." }
+]
+---
+is_urgent? The message conveys urgency or time-sensitivity
+```
+
+Nothing new goes on the wire, so this works everywhere a state does — in a page, in a
+`jev eval` case, in an MCP tool call. `jev run page.jev --turn "customer: refund me"`
+appends a turn instead of replacing the state, and repeats. `jev cost` counts a call per
+turn, because the thread is sent whole every time and the tokens grow faster than it does.
+
+Do not feed answers back into the state. What comes back is a distribution, not a fact,
+and reasoning over it next turn compounds confidence instead of adding information — it
+also stops a run being reproducible from its page.
+
 ## Writing good questions
 
 - One question asks about one thing. Split `is_urgent_and_angry` into two.
@@ -92,6 +117,7 @@ jev check page.jev                  # parse problems, or what it parsed into
 jev json  page.jev                  # the exact body POSTed to /v1/systemone
 jev cost  page.jev --price 0.20/1.00
 jev run   page.jev --state "..." --threshold 0.7
+jev run   page.jev --turn "customer: ..." --turn "agent: ..."   # append turns
 jev run   page.jev --json           # the raw response body, for jq
 jev eval  page.jev --cases cases.jsonl --min-accuracy 0.9
 jev rust  page.jev                  # the session as a Rust program
