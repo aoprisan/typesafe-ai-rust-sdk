@@ -6,8 +6,9 @@
 //! Behaviour follows the official Python SDK (`typesafe-sdk`): the same environment variables,
 //! defaults, retry semantics, error classification and forward-compatible decoding.
 //!
-//! Enable the `blocking` feature for a synchronous client in [`blocking`], and `reqwest-client`
-//! to supply your own `reqwest::Client`.
+//! Enable the `blocking` feature for a synchronous client in [`blocking`], `reqwest-client`
+//! to supply your own `reqwest::Client`, and `derive` for `#[derive(Rubric)]`: a struct that
+//! describes the questions and receives the answers (see [`rubric`]).
 #![warn(missing_docs)]
 
 mod client;
@@ -16,6 +17,7 @@ pub mod error;
 pub mod question;
 pub mod response;
 pub mod retry;
+pub mod rubric;
 
 #[cfg(feature = "blocking")]
 pub mod blocking;
@@ -28,6 +30,10 @@ pub use response::{
     SystemOneResponse, Usage,
 };
 pub use retry::RetryPolicy;
+pub use rubric::{AskRequest, ChoiceOf, Rubric, RubricChoice};
+/// `#[derive(Rubric)]` and `#[derive(RubricChoice)]` (feature `derive`); see [`rubric`].
+#[cfg(feature = "derive")]
+pub use typesafe_derive::{Rubric, RubricChoice};
 
 /// Re-exported so callers can build headers without adding a dependency.
 pub use http;

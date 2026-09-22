@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::question::Questions;
 use crate::response::{ListModelsResponse, SystemOneResponse};
 use crate::retry::RetryPolicy;
+use crate::rubric::Rubric;
 
 /// Blocking TypeSafe client.
 #[derive(Debug)]
@@ -43,6 +44,14 @@ impl Client {
         SystemOneRequest {
             rt: &self.rt,
             req: self.inner.system_one(state, questions),
+        }
+    }
+
+    /// See [`crate::Client::ask`].
+    pub fn ask<R: Rubric>(&self, state: impl Serialize) -> AskRequest<'_, R> {
+        AskRequest {
+            rt: &self.rt,
+            req: self.inner.ask(state),
         }
     }
 
@@ -94,6 +103,39 @@ impl SystemOneRequest<'_> {
 
     /// Send and wait.
     pub fn send(self) -> Result<SystemOneResponse> {
+        self.rt.block_on(self.req.send())
+    }
+}
+
+/// Blocking [`crate::Client::ask`].
+#[must_use = "call .send()"]
+#[derive(Debug)]
+pub struct AskRequest<'a, R> {
+    rt: &'a tokio::runtime::Runtime,
+    req: crate::AskRequest<R>,
+}
+
+impl<R: Rubric> AskRequest<'_, R> {
+    forward!(
+        retry(policy: RetryPolicy),
+        timeout(timeout: Duration),
+        header(name: HeaderName, value: HeaderValue),
+    );
+
+    /// Override the model for this call.
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.req = self.req.model(model);
+        self
+    }
+
+    /// Add a top-level body field.
+    pub fn extra_body(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.req = self.req.extra_body(key, value);
+        self
+    }
+
+    /// Send, wait, and decode the answers.
+    pub fn send(self) -> Result<R> {
         self.rt.block_on(self.req.send())
     }
 }

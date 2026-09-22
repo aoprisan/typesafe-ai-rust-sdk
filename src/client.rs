@@ -21,7 +21,7 @@ use crate::response::{
 };
 use crate::retry::RetryPolicy;
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Builder for [`Client`]. Explicit settings win over environment variables; empty or
 /// whitespace-only environment values are ignored.

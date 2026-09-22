@@ -21,6 +21,7 @@ defaults, retry semantics, error classification and forward-compatible response 
 typesafe-ai-sdk = "0.2"                                                 # async (bring your own Tokio runtime)
 # typesafe-ai-sdk = { version = "0.2", features = ["blocking"] }        # sync client
 # typesafe-ai-sdk = { version = "0.2", features = ["reqwest-client"] }  # bring your own reqwest::Client
+# typesafe-ai-sdk = { version = "0.2", features = ["derive"] }          # #[derive(Rubric)]
 ```
 
 The library is imported as `typesafe`. MSRV: Rust 1.88. TLS is rustls; `HTTPS_PROXY`-style
@@ -106,6 +107,57 @@ impl std::str::FromStr for Dept { /* … */ }
 
 let dept: Dept = res.choice("department").unwrap().parse()?;
 ```
+
+`#[derive(RubricChoice)]` (below) writes that `FromStr` for you, and the options with it.
+
+### Rubrics as types
+
+With the `derive` feature, a struct is the rubric: each field is a question, named after the
+field, and the answers come back into it. A misspelled name or an answer read as the wrong type
+is a compile error rather than a `None` at runtime.
+
+```rust,ignore
+use typesafe::{ChoiceOf, NoulAnswer, Rubric, RubricChoice, ScoreAnswer};
+
+#[derive(Rubric)]
+struct Triage {
+    #[noul("The message conveys urgency", yes = "A deadline", no = "Routine")]
+    is_urgent: NoulAnswer,
+    #[choice("Which team should handle this")]
+    department: ChoiceOf<Department>,
+    #[score("How frustrated", levels = ["Calm", "Frustrated but civil", "Very angry"])]
+    frustration: ScoreAnswer,
+}
+
+#[derive(Debug, RubricChoice)]
+enum Department {
+    #[option("Payment or subscription issues")]
+    Billing,
+    /// Bugs or integration problems
+    Technical,
+}
+
+let t: Triage = client.ask(state).await?;              // or client.ask::<Triage>(state)
+if t.department.confidence() > 0.5 {
+    println!("route to {:?}", *t.department);
+}
+```
+
+- A variant's label is its name in snake_case (`Billing` → `billing`); its description is
+  `#[option("…")]` or else its doc comment. `#[rubric(rename = "…")]` renames a field's question
+  or a variant's label.
+- A choice field may be the enum itself, `ChoiceOf<E>` (the enum plus the distribution),
+  `ChoiceAnswer` or `String`; the last two list their options as `labels = ["a", "b"]`. Noul and
+  score fields may be `f64` when the probability or the score is all you need.
+- Instructions left out of the attribute are read from the field's doc comment.
+- `client.ask` takes the same per-call options as `system_one`; the blocking client has it too.
+  `Triage::questions()` and `Triage::from_response(&res)` do the two halves by hand.
+- An answer the struct cannot hold — missing, of another type, or a label the enum lacks — is
+  `Error::ResponseValidation`, with `field_path` naming it (`answers.department.choice`).
+
+The trait is `typesafe::Rubric` whether or not the feature is on; the feature only adds the
+derive, from the [`typesafe-derive`](typesafe-derive) proc-macro crate. `cargo run --example
+derive --features derive` runs it against the API.
 
 ### Per-call options
 
@@ -327,10 +379,11 @@ just publish        # upload; needs a crates.io token (`cargo login`)
 ```
 
 The REPL is released the same way with `just publish-repl-dry` / `just publish-repl`; it depends
-on a published library version, so publish the library first when both change.
+on a published library version, so publish the library first when both change. The derive macros
+(`typesafe-derive`) come before the library in the same way: `just publish-derive`.
 
 Or let CI do it: push a tag matching the crate's `version` — `v0.1.0` for the library,
-`jev-v0.1.0` for the REPL (`git tag v0.1.0 && git push origin v0.1.0`). That runs
+`jev-v0.1.0` for the REPL, `derive-v0.1.0` for the macros (`git tag v0.1.0 && git push origin v0.1.0`). That runs
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which re-runs fmt, clippy and
 the tests, checks the tag against that crate's manifest version, and publishes it with the
 `CARGO_REGISTRY_TOKEN` repository secret.

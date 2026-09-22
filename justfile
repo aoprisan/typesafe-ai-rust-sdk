@@ -6,9 +6,10 @@ check: fmt-check clippy test repl-check
 test:
     cargo test --all-features
     cargo test --no-default-features
+    cargo test -p typesafe-derive
 
 clippy:
-    cargo clippy --all-features --all-targets -- -D warnings
+    cargo clippy -p typesafe-ai-sdk -p typesafe-derive --all-features --all-targets -- -D warnings
 
 fmt:
     cargo fmt
@@ -32,6 +33,13 @@ repl-check:
 
 doc:
     cargo doc --all-features --no-deps --open
+
+# the derive macros are their own crate; publish them before a library version that needs them
+publish-derive-dry:
+    cargo publish -p typesafe-derive --dry-run --locked
+
+publish-derive:
+    cargo publish -p typesafe-derive --locked
 
 publish-dry:
     cargo publish -p typesafe-ai-sdk --dry-run --locked

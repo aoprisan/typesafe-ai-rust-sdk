@@ -17,14 +17,16 @@ cargo run --example triage
 | [`concurrent`](concurrent.rs)                 | classifying a batch: cloned clients, per-call timeouts, one failure at a time      |
 | [`retries`](retries.rs)                       | a patient policy for a background job, no retries at all behind a user             |
 | [`forward_compat`](forward_compat.rs)         | hand-built questions, `extra_body`, and reading answers from `raw`                 |
+| [`derive`](derive.rs)                         | the rubric as a struct, the answers decoded into it — `--features derive`          |
 | [`blocking`](blocking.rs)                     | the same API from a plain `fn main` — `--features blocking`                        |
 | [`custom_client`](custom_client.rs)           | full `ClientBuilder` configuration and your own `reqwest::Client` — `--features reqwest-client` |
 
-The two feature-gated ones need the feature on the command line:
+The three feature-gated ones need the feature on the command line:
 
 ```sh
 cargo run --example blocking --features blocking
 cargo run --example custom_client --features reqwest-client
+cargo run --example derive --features derive
 ```
 
 To shape questions before writing any of this, the [`jev`](../jev-repl) REPL sends them
