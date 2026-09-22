@@ -193,7 +193,8 @@ a confidence bar buys — 0.95 accuracy over 55% of the tickets, with the rest g
 
 `--cases <file>` is the only new flag that is required; `-` reads them from stdin, which the page
 cannot also do. `--concurrency <n>` sends that many at a time (default 4), `--cache <dir>` keeps
-each response so a second run sends nothing, `--max-cost <dollars>` refuses a run whose estimate is
+each response so a second run sends nothing (the directory is in the SDK's cassette format, so
+`TYPESAFE_REPLAY=<dir>` replays it through the library), `--max-cost <dollars>` refuses a run whose estimate is
 above it (rates required), and `--min-accuracy <0-1>` exits 1 when a question scores below it. A
 live run prints its estimate on stderr before sending anything. `--state` does not apply: the cases
 carry the states. Exit status is 0 when every case answered and every bar was met, 1 when a case

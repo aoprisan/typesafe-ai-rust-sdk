@@ -18,7 +18,6 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::{execute, terminal};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use jev_repl::app::{App, Msg};
@@ -538,11 +537,10 @@ async fn mock_ask(session: Session) -> Outcome {
     }
 }
 
-/// The cache key: the request body this case would POST, hashed.
+/// The cache key: the request body this case would POST, hashed. It is the SDK's cassette key,
+/// so a cache directory can be replayed with `TYPESAFE_REPLAY` and a recording used as a cache.
 fn cache_key(session: &Session, model: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(session.request_json_compact(model));
-    format!("{:x}", hasher.finalize())
+    typesafe::cassette::key(&session.state, model, &session.to_questions())
 }
 
 /// A cached response, or `None` when there is none this run can use.

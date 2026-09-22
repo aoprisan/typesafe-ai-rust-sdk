@@ -11,6 +11,7 @@
 //! describes the questions and receives the answers (see [`rubric`]).
 #![warn(missing_docs)]
 
+pub mod cassette;
 mod client;
 pub mod constants;
 pub mod error;

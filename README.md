@@ -293,9 +293,39 @@ the library.
 | `timeout`       |                           | 10 s per attempt          |
 | `retry`         |                           | `RetryPolicy::default()`  |
 | `http_client`   |                           | a fresh `reqwest::Client` (feature `reqwest-client`) |
+| `record`        | `TYPESAFE_RECORD`         | off; a directory to record responses into |
+| `replay`        | `TYPESAFE_REPLAY`         | off; a directory to replay responses from |
 
 Explicit values win; blank environment values are ignored. Header types come from the `http` crate,
 re-exported as `typesafe::http`.
+
+## Recording and replaying
+
+Tests that call the API are slow, cost money and need a key. Record their answers once and
+replay them after that:
+
+```sh
+TYPESAFE_RECORD=tests/cassettes cargo test    # live: each successful response is kept
+TYPESAFE_REPLAY=tests/cassettes cargo test    # offline: no network, no API key
+```
+
+```rust,no_run
+# fn main() -> typesafe::Result<()> {
+let client = typesafe::Client::builder().replay("tests/cassettes").build()?;
+# Ok(()) }
+```
+
+- A response is kept at `<dir>/<key>.json`, where the key is the SHA-256 of the exact request
+  body: state, model, questions in order, and any `extra_body` fields. Change any of them and it
+  is a different recording. `typesafe::cassette::key` computes it.
+- A request with no recording fails with `Error::ReplayMiss { key, path }`. A replaying client
+  never falls back to the network, so a test cannot quietly start spending.
+- A recording that no longer decodes is `ResponseValidation`, like a bad live body. Replayed
+  responses report `meta.attempts == 0` and no headers; `models().list()` is not recorded, and a
+  replaying client refuses it with `Config`.
+- Setting both is a `Config` error. Only System One calls that succeed and decode are recorded.
+- The files are what `jev eval --cache` keeps — the same key, and the body as compact JSON in
+  server order — so an eval cache replays through the SDK and a recording serves as a cache.
 
 ## Retries
 
@@ -333,12 +363,13 @@ match client.system_one(state, questions).await {
 
 | Variant              | When                                                                   |
 | -------------------- | ---------------------------------------------------------------------- |
-| `Config`             | missing API key, invalid base URL, zero timeout, invalid retry policy   |
+| `Config`             | missing API key, invalid base URL, zero timeout, invalid retry policy, record and replay both set |
 | `InvalidRequest`     | no questions, empty choice/score criteria, malformed raw question, unencodable state |
 | `Api`                | non-2xx after retries; `kind`, `message`, `body`, `request_id()`, `retry_after()` |
 | `Connection`         | no response (DNS, connect, reset, body read); HTTP client error in `source()` |
 | `Timeout`            | an attempt exceeded its timeout                                         |
 | `ResponseValidation` | 2xx body missing required data; `field_path` like `answers.tone.confidence` |
+| `ReplayMiss`         | replaying, and this request was never recorded; `key`, `path`           |
 
 Error messages from FastAPI-style validation bodies are flattened, e.g.
 `questions.frustration.criteria: List should have at least 2 items`.

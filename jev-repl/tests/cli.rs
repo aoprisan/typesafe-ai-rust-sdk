@@ -678,6 +678,49 @@ async fn answers_a_second_run_from_the_cache_without_sending_anything() {
     assert_eq!(again.stdout, first.stdout);
 }
 
+/// The eval cache is the SDK's cassette format: a client replaying the cache directory answers
+/// every request `jev eval` sent, byte for byte the same body, without a server or a key.
+#[tokio::test]
+async fn a_cache_directory_replays_through_the_sdk() {
+    let server = answering_from_the_state().await;
+    let dir = scratch("cassette");
+    let cases = live_cases("cassette-cases", EVAL_LIVE_CASES);
+    let out = live_eval(
+        &server,
+        cases.to_str().expect("a path"),
+        &["--cache", dir.to_str().expect("a path")],
+    )
+    .await;
+    assert_eq!(out.status, 0, "{}", out.stderr);
+
+    let replaying = typesafe::Client::builder()
+        .replay(&dir)
+        .build()
+        .expect("replaying needs no key");
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 4);
+    for request in requests {
+        let body: Value = serde_json::from_slice(&request.body).expect("a JSON body");
+        // Raw questions re-send the objects exactly as jev sent them.
+        let questions: typesafe::Questions = body["questions"]
+            .as_object()
+            .expect("questions")
+            .iter()
+            .map(|(name, q)| (name.clone(), q.clone()))
+            .collect();
+        let replayed = replaying
+            .system_one(body["state"].clone(), questions)
+            .model(body["model"].as_str().expect("a model"))
+            .await
+            .expect("the cache holds this request");
+        assert_eq!(replayed.meta.attempts, 0);
+        let state = body["state"].as_str().expect("a text state");
+        let urgent = replayed.noul("is_urgent").expect("answered").noul;
+        assert_eq!(urgent >= 0.5, state.starts_with("urgent"), "{state}");
+    }
+    assert_eq!(asked(&server).await, 4);
+}
+
 #[tokio::test]
 async fn refuses_to_send_when_the_estimate_is_above_max_cost() {
     let server = answering_from_the_state().await;

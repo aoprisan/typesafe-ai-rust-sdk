@@ -8,6 +8,10 @@ pub const API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 pub const BASE_URL_ENV: &str = "TYPESAFE_BASE_URL";
 /// Environment variable for the default model.
 pub const DEFAULT_MODEL_ENV: &str = "TYPESAFE_DEFAULT_MODEL";
+/// Environment variable naming a directory to record responses into.
+pub const RECORD_ENV: &str = "TYPESAFE_RECORD";
+/// Environment variable naming a directory to replay responses from.
+pub const REPLAY_ENV: &str = "TYPESAFE_REPLAY";
 
 /// Default API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
