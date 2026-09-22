@@ -881,3 +881,474 @@ fn adds_up_what_every_case_would_cost_before_anything_is_sent() {
     assert!(all.cost.expect("a price").total > 0.0);
     assert_eq!(one.cost, None);
 }
+
+// ---- two pages over the same cases ------------------------------------------------------------
+
+/// The candidate: the same noul and choice, a score renamed away, a noul of its own added.
+const PAGE_B: &str = "A payout failed for the third time.
+---
+is_urgent? The message conveys urgency or time pressure
+department: Which team should handle this
+  billing = Payment or subscription issues
+  technical = Bugs or integration problems
+  sales = Pricing and plans
+frustration? Is the customer frustrated
+sarcasm? Is the customer being sarcastic
+";
+
+fn session_b() -> Session {
+    headless::load(PAGE_B).expect("page b parses")
+}
+
+const LABELS: evaluate::Labels<'static> = evaluate::Labels {
+    a: "a.jev",
+    b: "b.jev",
+};
+
+fn names(expect: &[(String, Expectation)]) -> Vec<&str> {
+    expect.iter().map(|(name, _)| name.as_str()).collect()
+}
+
+#[test]
+fn gives_each_page_the_expectations_for_its_own_questions() {
+    let (a, b) = evaluate::parse_compare_cases(
+        concat!(
+            r#"{"state": "one", "expect": {"is_urgent": true, "sarcasm": false}}"#,
+            "\n",
+            r#"{"state": "two", "expect": {"sarcasm": true}}"#,
+        ),
+        &session(),
+        &session_b(),
+        LABELS,
+    )
+    .expect("these cases parse");
+    // The second case asks nothing of page a, so page a does not send it.
+    assert_eq!(a.iter().map(|c| c.line).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(names(&a[0].expect), vec!["is_urgent"]);
+    assert_eq!(b.iter().map(|c| c.line).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(names(&b[0].expect), vec!["is_urgent", "sarcasm"]);
+}
+
+#[test]
+fn names_a_question_on_neither_page_and_the_page_a_label_does_not_fit() {
+    let why2 = |line: &str| {
+        evaluate::parse_compare_cases(line, &session(), &session_b(), LABELS)
+            .expect_err("expected these cases to be rejected")
+    };
+    assert_eq!(
+        why2(r#"{"state": "a", "expect": {"nope": true}}"#),
+        r#"cases line 1: no question named "nope" on either page."#
+    );
+    // frustration is a score on page a and a noul on page b: `2` only fits one of them.
+    assert_eq!(
+        why2(r#"{"state": "a", "expect": {"frustration": 2}}"#),
+        "cases line 1: b.jev: frustration is a noul: expected true or false, got 2."
+    );
+    assert!(why2("\nnot json").starts_with("cases line 2: not valid JSON"));
+}
+
+#[test]
+fn tests_the_discordant_pairs_as_a_binomial_tail() {
+    let six = evaluate::mcnemar(0, 6);
+    assert_eq!(six.discordant, 6);
+    assert!(close(six.p, 2.0 / 64.0), "{}", six.p);
+    assert_eq!(six.verdict, evaluate::Verdict::Worse);
+    assert_eq!(evaluate::mcnemar(6, 0).verdict, evaluate::Verdict::Better);
+    let one = evaluate::mcnemar(1, 5);
+    assert!(close(one.p, 14.0 / 64.0), "{}", one.p);
+    assert_eq!(one.verdict, evaluate::Verdict::Same);
+}
+
+#[test]
+fn says_too_few_below_six_pairs_where_no_p_can_reach_the_level() {
+    let five = evaluate::mcnemar(0, 5);
+    assert_eq!(five.discordant, 5);
+    assert!(close(five.p, 2.0 / 32.0), "{}", five.p);
+    assert_eq!(five.verdict, evaluate::Verdict::TooFew);
+    let none = evaluate::mcnemar(0, 0);
+    assert_eq!((none.discordant, none.p), (0, 1.0));
+    assert_eq!(none.verdict.as_str(), "too few");
+}
+
+#[test]
+fn stays_a_number_when_two_to_the_n_is_not_one() {
+    let test = evaluate::mcnemar(1500, 1600);
+    assert!(test.p.is_finite());
+    assert!(test.p > 0.05 && test.p < 1.0, "{}", test.p);
+    assert_eq!(
+        evaluate::mcnemar(1000, 1400).verdict,
+        evaluate::Verdict::Worse
+    );
+}
+
+const COMPARED: [&str; 4] = [
+    r#"{"id": "t-1", "state": "one", "expect": {"is_urgent": true, "department": "billing"}}"#,
+    r#"{"state": "two", "expect": {"is_urgent": false, "department": "technical"}}"#,
+    r#"{"state": "three", "expect": {"is_urgent": true, "department": "sales"}}"#,
+    r#"{"state": "four", "expect": {"is_urgent": false, "sarcasm": true}}"#,
+];
+
+fn comparison() -> evaluate::Comparison {
+    let (a, b) = (session(), session_b());
+    let (cases_a, cases_b) =
+        evaluate::parse_compare_cases(&COMPARED.join("\n"), &a, &b, LABELS).expect("they parse");
+    let outcomes_a = vec![
+        answered(
+            &[
+                ("is_urgent", noul(0.9)),
+                ("department", choice("billing", 0.9)),
+            ],
+            None,
+        ),
+        answered(
+            &[
+                ("is_urgent", noul(0.8)),
+                ("department", choice("billing", 0.6)),
+            ],
+            None,
+        ),
+        answered(
+            &[
+                ("is_urgent", noul(0.2)),
+                ("department", choice("billing", 0.5)),
+            ],
+            None,
+        ),
+        answered(&[("is_urgent", noul(0.1))], None),
+    ];
+    let outcomes_b = vec![
+        // Broke: a said yes and was right, b says no.
+        answered(
+            &[
+                ("is_urgent", noul(0.3)),
+                ("department", choice("billing", 0.9)),
+            ],
+            None,
+        ),
+        // Fixed both: a was wrong on both questions, b is right.
+        answered(
+            &[
+                ("is_urgent", noul(0.1)),
+                ("department", choice("technical", 0.8)),
+            ],
+            None,
+        ),
+        // Changed: a and b both pick a wrong department, a different one each.
+        answered(
+            &[
+                ("is_urgent", noul(0.2)),
+                ("department", choice("technical", 0.7)),
+            ],
+            None,
+        ),
+        failed("Timeout"),
+    ];
+    evaluate::compare(
+        evaluate::Side {
+            label: "a.jev",
+            session: &a,
+            cases: &cases_a,
+            outcomes: &outcomes_a,
+            model: "jev-latest",
+        },
+        evaluate::Side {
+            label: "b.jev",
+            session: &b,
+            cases: &cases_b,
+            outcomes: &outcomes_b,
+            model: "jev-2",
+        },
+        evaluate::CompareOptions {
+            threshold: 0.5,
+            rates: None,
+        },
+    )
+}
+
+fn shared<'a>(comparison: &'a evaluate::Comparison, name: &str) -> &'a evaluate::Shared {
+    comparison
+        .questions
+        .iter()
+        .find(|q| q.name == name)
+        .unwrap_or_else(|| panic!("no shared question {name}"))
+}
+
+#[test]
+fn pairs_only_the_cases_both_pages_scored() {
+    let comparison = comparison();
+    let urgent = shared(&comparison, "is_urgent");
+    assert_eq!(urgent.paired, 3);
+    let metrics: Vec<(&str, f64, f64)> = urgent.metrics.iter().map(|m| (m.key, m.a, m.b)).collect();
+    assert_eq!(metrics[0], ("threshold", 0.5, 0.5));
+    assert_eq!(metrics[1].0, "brier");
+    assert!(close(metrics[1].1, (0.01 + 0.64 + 0.64) / 3.0));
+    assert!(close(metrics[1].2, 1.14 / 3.0));
+    assert_eq!(metrics[2], ("accuracy", 1.0 / 3.0, 1.0 / 3.0));
+    assert_eq!(metrics[3], ("f1", 0.5, 0.0));
+}
+
+#[test]
+fn calls_each_flip_fixed_broke_or_changed() {
+    let comparison = comparison();
+    let urgent = shared(&comparison, "is_urgent");
+    assert_eq!(
+        urgent.flips,
+        vec![
+            evaluate::Flip {
+                case: 1,
+                id: Some("t-1".to_owned()),
+                expected: json!(true),
+                a: json!(true),
+                b: json!(false),
+                status: "broke",
+            },
+            evaluate::Flip {
+                case: 2,
+                id: None,
+                expected: json!(false),
+                a: json!(true),
+                b: json!(false),
+                status: "fixed",
+            },
+        ]
+    );
+    let department = shared(&comparison, "department");
+    assert_eq!(
+        (department.fixed, department.broke, department.changed),
+        (1, 0, 1)
+    );
+    assert_eq!(department.mcnemar.verdict, evaluate::Verdict::TooFew);
+}
+
+#[test]
+fn lists_what_could_not_be_compared() {
+    let comparison = comparison();
+    let names: Vec<&str> = comparison
+        .questions
+        .iter()
+        .map(|q| q.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["is_urgent", "department"]);
+    assert!(comparison.only_a.is_empty());
+    assert_eq!(comparison.only_b, vec!["sarcasm"]);
+    assert_eq!(
+        comparison.mismatched,
+        vec![evaluate::Mismatch {
+            name: "frustration".to_owned(),
+            a: "score",
+            b: "noul",
+        }]
+    );
+    assert_eq!(comparison.cases, 4);
+    assert_eq!(
+        comparison.b.report.errors,
+        vec![CaseError {
+            case: 4,
+            id: None,
+            message: "Timeout".to_owned(),
+        }]
+    );
+}
+
+/// Whether some line of `text` matches every part of `parts` in order, with any run of spaces
+/// between them — the Rust spelling of the reference's `toMatch(/a\s+b\s+c/)`.
+fn has_row(text: &str, parts: &[&str]) -> bool {
+    text.lines().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let wanted: Vec<&str> = parts.iter().flat_map(|p| p.split_whitespace()).collect();
+        words.windows(wanted.len()).any(|w| w == wanted.as_slice())
+    })
+}
+
+#[test]
+fn draws_the_difference_and_says_what_the_test_can_and_cannot_tell() {
+    let text = evaluate::compare_text(&comparison());
+    for wanted in [
+        "  a  a.jev  jev-latest · 4 cases",
+        "  b  b.jev  jev-2 · 4 cases",
+        "1 fixed · 1 broke · 0 changed",
+        "McNemar: too few discordant pairs to call (2; 6 are needed for p < 0.05)",
+        "only in b: sarcasm",
+        "mismatched: frustration is a score in a and a noul in b",
+        "b case 4: Timeout",
+        "4 cases · a 4 answered, 0 errors · b 3 answered, 1 error",
+    ] {
+        assert!(text.contains(wanted), "{wanted:?} in\n{text}");
+    }
+    for row in [
+        &["is_urgent", "noul", "3 paired cases"][..],
+        &["accuracy", "0.33", "0.33", "+0.00"],
+        &["f1", "0.50", "0.00", "-0.50"],
+        &["case 1 (t-1)", "yes → no", "broke"],
+        &["case 3", "billing → technical", "changed"],
+    ] {
+        assert!(has_row(&text, row), "{row:?} in\n{text}");
+    }
+}
+
+#[test]
+fn prints_the_json_a_script_reads() {
+    let json = evaluate::compare_json(&comparison());
+    assert_eq!(json["a"]["page"], "a.jev");
+    assert_eq!(json["a"]["model"], "jev-latest");
+    assert_eq!(json["a"]["cases"], 4);
+    assert_eq!(json["b"]["page"], "b.jev");
+    assert_eq!(json["b"]["model"], "jev-2");
+    assert_eq!(json["b"]["answered"], 3);
+    let first_key = json["a"].as_object().and_then(|o| o.keys().next().cloned());
+    assert_eq!(first_key.as_deref(), Some("page"));
+    let urgent = &json["questions"]["is_urgent"];
+    assert_eq!(urgent["kind"], "noul");
+    assert_eq!(urgent["paired"], 3);
+    assert_eq!(urgent["a"]["threshold"], 0.5);
+    assert_eq!(urgent["a"]["accuracy"], 1.0 / 3.0);
+    assert_eq!(urgent["a"]["f1"], 0.5);
+    assert_eq!(urgent["b"]["f1"], 0);
+    assert_eq!(urgent["delta"]["accuracy"], 0);
+    assert_eq!(urgent["delta"]["f1"], -0.5);
+    assert_eq!(
+        urgent["delta"]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["brier", "accuracy", "f1"]
+    );
+    assert_eq!((&urgent["fixed"], &urgent["broke"]), (&json!(1), &json!(1)));
+    assert_eq!(urgent["changed"], 0);
+    assert_eq!(
+        urgent["mcnemar"],
+        json!({"discordant": 2, "p": 1, "verdict": "too few"})
+    );
+    assert_eq!(
+        urgent["flips"][0],
+        json!({"case": 1, "id": "t-1", "expected": true, "a": true, "b": false, "status": "broke"})
+    );
+    let department = &json["questions"]["department"];
+    assert_eq!(department["kind"], "choice");
+    assert_eq!(department["a"]["accuracy"], 1.0 / 3.0);
+    assert_eq!(department["b"]["accuracy"], 2.0 / 3.0);
+    assert_eq!(json["onlyA"], json!([]));
+    assert_eq!(json["onlyB"], json!(["sarcasm"]));
+    assert_eq!(
+        json["mismatched"],
+        json!([{"name": "frustration", "a": "score", "b": "noul"}])
+    );
+    assert_eq!(json["unpaired"], json!([]));
+    assert_eq!(json["regressions"], json!([]));
+    assert_eq!(json["usage"]["estimated"], true);
+}
+
+#[test]
+fn names_the_questions_b_is_significantly_worse_at() {
+    let (a, b) = (session(), session_b());
+    let many: Vec<String> = (0..8)
+        .map(|i| format!(r#"{{"state": "s{i}", "expect": {{"is_urgent": true}}}}"#))
+        .collect();
+    let (left, right) =
+        evaluate::parse_compare_cases(&many.join("\n"), &a, &b, LABELS).expect("they parse");
+    let high: Vec<Outcome> = left
+        .iter()
+        .map(|_| answered(&[("is_urgent", noul(0.9))], None))
+        .collect();
+    let low: Vec<Outcome> = right
+        .iter()
+        .map(|_| answered(&[("is_urgent", noul(0.1))], None))
+        .collect();
+    let worse = evaluate::compare(
+        evaluate::Side {
+            label: "a",
+            session: &a,
+            cases: &left,
+            outcomes: &high,
+            model: "m",
+        },
+        evaluate::Side {
+            label: "b",
+            session: &b,
+            cases: &right,
+            outcomes: &low,
+            model: "m",
+        },
+        evaluate::CompareOptions {
+            threshold: 0.5,
+            rates: None,
+        },
+    );
+    let names: Vec<&str> = evaluate::regressions(&worse)
+        .iter()
+        .map(|q| q.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["is_urgent"]);
+    assert!(
+        evaluate::compare_text(&worse)
+            .contains("McNemar p 0.008 over 8 discordant pairs: b is significantly worse")
+    );
+}
+
+#[tokio::test]
+async fn runs_both_pages_through_one_pool_and_hands_each_its_outcomes_in_order() {
+    let (a, b) = (session(), session_b());
+    let (cases_a, cases_b) =
+        evaluate::parse_compare_cases(&COMPARED.join("\n"), &a, &b, LABELS).expect("they parse");
+    let flying = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let ask = |tag: &'static str| {
+        let (flying, most) = (Arc::clone(&flying), Arc::clone(&most));
+        move |one: Session| {
+            let (flying, most) = (Arc::clone(&flying), Arc::clone(&most));
+            async move {
+                let now = flying.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(3)).await;
+                flying.fetch_sub(1, Ordering::SeqCst);
+                failed(&format!("{tag}:{}", one.state.as_str().unwrap_or_default()))
+            }
+        }
+    };
+    let (left, right) = evaluate::run_compare(
+        evaluate::Leg {
+            session: &a,
+            cases: &cases_a,
+            ask: ask("a"),
+        },
+        evaluate::Leg {
+            session: &b,
+            cases: &cases_b,
+            ask: ask("b"),
+        },
+        3,
+    )
+    .await;
+    assert_eq!(most.load(Ordering::SeqCst), 3);
+    let errors = |outcomes: &[Outcome]| -> Vec<String> {
+        outcomes
+            .iter()
+            .map(|o| match o {
+                Outcome::Failed { error } => error.clone(),
+                Outcome::Ok { .. } => String::new(),
+            })
+            .collect()
+    };
+    assert_eq!(errors(&left), vec!["a:one", "a:two", "a:three", "a:four"]);
+    assert_eq!(errors(&right), vec!["b:one", "b:two", "b:three", "b:four"]);
+}
+
+#[test]
+fn writes_decimals_the_way_to_fixed_does_even_off_a_tie() {
+    // 0.475 is a hair below itself in binary, so `toFixed(2)` rounds it down; scaling by 100 first
+    // would land on 47.5 and round it up.
+    assert_eq!(evaluate::two(0.475), "0.47");
+    assert_eq!(evaluate::two(1.005), "1.00");
+    assert_eq!(evaluate::two(0.375), "0.38");
+    assert_eq!(evaluate::two(-0.125), "-0.13");
+    assert_eq!(evaluate::two(-0.0), "0.00");
+    assert_eq!(evaluate::two(9.995), "9.99");
+    assert_eq!(evaluate::two(0.995), "0.99");
+    assert_eq!(evaluate::two(99.875), "99.88");
+    assert_eq!(evaluate::three(0.0625), "0.063");
+    assert_eq!(evaluate::three(0.0078125), "0.008");
+    assert_eq!(evaluate::signed(-0.001), "+0.00");
+    assert_eq!(evaluate::signed(0.05), "+0.05");
+    assert_eq!(evaluate::signed(-0.5), "-0.50");
+}

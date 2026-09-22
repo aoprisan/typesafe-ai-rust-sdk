@@ -69,26 +69,36 @@ pub fn answer(state: &Value, name: &str, question: &Value) -> Option<Answer> {
 /// measures to say what an answer of this shape costs.
 pub fn answer_json(answer: &Answer) -> Value {
     match answer {
-        Answer::Noul(a) => json!({"type": "noul", "noul": a.noul}),
+        Answer::Noul(a) => json!({"type": "noul", "noul": number(a.noul)}),
         Answer::Choice(a) => json!({
             "type": "choice", "choice": a.choice,
             "probabilities": a.probabilities.iter()
-                .map(|(k, v)| (k.clone(), json!(v)))
+                .map(|(k, v)| (k.clone(), number(*v)))
                 .collect::<serde_json::Map<String, Value>>(),
-            "confidence": a.confidence,
+            "confidence": number(a.confidence),
         }),
         Answer::Score(a) => json!({
-            "type": "score", "score": a.score, "confidence": a.confidence,
+            "type": "score", "score": number(a.score), "confidence": number(a.confidence),
             "legend": a.legend.iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect::<serde_json::Map<String, Value>>(),
             "probabilities": a.probabilities.iter()
-                .map(|(k, v)| (k.to_string(), json!(v)))
+                .map(|(k, v)| (k.to_string(), number(*v)))
                 .collect::<serde_json::Map<String, Value>>(),
         }),
         // An answer variant a later SDK adds: this one has no shape to measure or print.
         _ => Value::Null,
     }
+}
+
+/// A number the way the wire writes it: a whole score is `1`, not `1.0`. The cost estimate counts
+/// these characters, so the TypeScript port and this one only agree on a price when they agree
+/// on the text.
+fn number(x: f64) -> Value {
+    if x.fract() == 0.0 && x.abs() < 9e15 {
+        return json!(x as i64);
+    }
+    json!(x)
 }
 
 /// What `:models` shows offline.

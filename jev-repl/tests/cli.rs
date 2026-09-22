@@ -539,9 +539,266 @@ fn lists_eval_and_its_flags_in_help() {
         "--cache",
         "--max-cost",
         "--min-accuracy",
+        "--compare",
+        "--fail-on-regression",
     ] {
         assert!(help.contains(flag), "{help}");
     }
+}
+
+/// The candidate page: is_urgent asked another way, frustration dropped, sarcasm added.
+const EVAL_PAGE_B: &str = "placeholder
+---
+is_urgent? The message conveys urgency or time pressure
+department: Which team should handle this
+  billing = Payment or subscription issues
+  technical = Bugs or integration problems
+  sales = Pricing and plans
+sarcasm? The customer is being sarcastic
+";
+
+/// A directory holding two pages and a cases file, for the duration of one test.
+fn with_pages(name: &str, cases: &str, run: impl FnOnce(&str, &str, &str)) {
+    let dir = scratch(name);
+    let (a, b, path) = (
+        dir.join("a.jev"),
+        dir.join("b.jev"),
+        dir.join("cases.jsonl"),
+    );
+    std::fs::write(&a, EVAL_PAGE).expect("page a is written");
+    std::fs::write(&b, EVAL_PAGE_B).expect("page b is written");
+    std::fs::write(&path, cases).expect("the cases are written");
+    run(
+        a.to_str().expect("a path"),
+        b.to_str().expect("a path"),
+        path.to_str().expect("a path"),
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Whether some line of `text` holds `parts` in order with only spaces between them.
+fn has_row(text: &str, parts: &[&str]) -> bool {
+    let wanted: Vec<&str> = parts.iter().flat_map(|p| p.split_whitespace()).collect();
+    text.lines().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        words.windows(wanted.len()).any(|w| w == wanted.as_slice())
+    })
+}
+
+#[test]
+fn reports_the_difference_per_shared_question_and_what_only_one_page_asks() {
+    with_pages("compare", EVAL_CASES, |a, b, cases| {
+        let out = jev(
+            &["eval", a, "--compare", b, "--cases", cases, "--mock"],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        assert!(
+            has_row(&out.stdout, &["is_urgent", "noul", "2 paired cases"]),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            has_row(&out.stdout, &["department", "choice", "3 paired cases"]),
+            "{}",
+            out.stdout
+        );
+        for wanted in [
+            "McNemar",
+            "only in a: frustration",
+            "only in b: sarcasm",
+            "3 cases · a 3 answered, 0 errors · b 3 answered, 0 errors",
+        ] {
+            assert!(out.stdout.contains(wanted), "{wanted:?} in\n{}", out.stdout);
+        }
+        assert!(out.stderr.contains("Simulated answers"), "{}", out.stderr);
+    });
+}
+
+#[test]
+fn prints_both_reports_and_the_comparison_as_json() {
+    with_pages("compare-json", EVAL_CASES, |a, b, cases| {
+        let out = jev(
+            &[
+                "eval",
+                a,
+                "--compare",
+                b,
+                "--cases",
+                cases,
+                "--mock",
+                "--json",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        let report: Value = serde_json::from_str(&out.stdout).expect("a JSON report");
+        assert_eq!(report["a"]["page"], a);
+        assert_eq!(report["b"]["page"], b);
+        let names: Vec<&String> = report["questions"]
+            .as_object()
+            .expect("questions")
+            .keys()
+            .collect();
+        assert_eq!(names, vec!["is_urgent", "department"]);
+        assert_eq!(report["onlyB"], json!(["sarcasm"]));
+        assert_eq!(report["regressions"], json!([]));
+    });
+}
+
+#[test]
+fn names_the_page_a_label_does_not_fit() {
+    let cases = r#"{"state": "x", "expect": {"frustration": 2, "sarcasm": 1}}"#;
+    with_pages("compare-misfit", cases, |a, b, cases| {
+        let out = jev(
+            &["eval", a, "--compare", b, "--cases", cases, "--mock"],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 1);
+        assert!(
+            out.stderr
+                .contains(&format!("cases line 1: {b}: sarcasm is a noul")),
+            "{}",
+            out.stderr
+        );
+    });
+}
+
+#[test]
+fn exits_2_when_the_pages_cannot_be_told_apart_on_the_command_line() {
+    with_pages("compare-usage", EVAL_CASES, |a, b, cases| {
+        let both = jev(
+            &["eval", "--compare", "-", "--cases", cases, "--mock"],
+            "x",
+            &[],
+        );
+        assert_eq!(both.status, 2);
+        assert!(
+            both.stderr
+                .contains("only one of the page, --compare and --cases can come from stdin."),
+            "{}",
+            both.stderr
+        );
+        let lonely = jev(
+            &[
+                "eval",
+                a,
+                "--cases",
+                cases,
+                "--mock",
+                "--fail-on-regression",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(lonely.status, 2);
+        assert!(
+            lonely.stderr.contains(
+                "--fail-on-regression needs --compare: there is nothing to regress from."
+            ),
+            "{}",
+            lonely.stderr
+        );
+        assert_eq!(
+            jev(&["eval", a, "--compare", b, "--mock"], "", &[]).status,
+            2
+        );
+    });
+}
+
+/// What the simulator says about `state` for an is_urgent asked with `instructions`, at 0.5.
+fn simulated_yes(instructions: &str, state: &str) -> bool {
+    let question = json!({"type": "noul", "instructions": instructions});
+    match jev_repl::mock::answer(&json!(state), "is_urgent", &question) {
+        Some(typesafe::Answer::Noul(answer)) => answer.is_yes(0.5),
+        _ => false,
+    }
+}
+
+#[test]
+fn fails_on_a_regression_the_test_can_see_and_only_when_asked_to() {
+    // Label every state the way page a answers it, so page a is always right and every case page
+    // b answers differently is one it broke. The simulator is deterministic, so this holds.
+    let mut lines = Vec::new();
+    let mut broke = 0;
+    let mut i = 0;
+    while broke < 8 {
+        let state = format!("ticket {i}");
+        let a = simulated_yes("The message conveys urgency", &state);
+        if a != simulated_yes("The message conveys urgency or time pressure", &state) {
+            broke += 1;
+        }
+        lines.push(json!({"state": state, "expect": {"is_urgent": a}}).to_string());
+        i += 1;
+    }
+    with_pages("regression", &lines.join("\n"), |a, b, cases| {
+        let args = ["eval", a, "--compare", b, "--cases", cases, "--mock"];
+        let quiet = jev(&args, "", &[]);
+        assert_eq!(quiet.status, 0, "{}", quiet.stderr);
+        assert!(
+            quiet.stdout.contains("0 fixed · 8 broke · 0 changed"),
+            "{}",
+            quiet.stdout
+        );
+        assert!(
+            quiet.stdout.contains("b is significantly worse"),
+            "{}",
+            quiet.stdout
+        );
+        let strict = jev(&[&args[..], &["--fail-on-regression"]].concat(), "", &[]);
+        assert_eq!(strict.status, 1);
+        assert!(
+            strict.stderr.contains(&format!(
+                "jev eval: is_urgent is significantly worse in {b} (McNemar p 0.008)."
+            )),
+            "{}",
+            strict.stderr
+        );
+    });
+}
+
+#[test]
+fn holds_both_pages_to_min_accuracy_and_says_which_one_missed() {
+    // States both pages answer alike, labelled the other way: both pages score 0.
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while lines.len() < 3 {
+        let state = format!("ticket {i}");
+        let a = simulated_yes("The message conveys urgency", &state);
+        if a == simulated_yes("The message conveys urgency or time pressure", &state) {
+            lines.push(json!({"state": state, "expect": {"is_urgent": !a}}).to_string());
+        }
+        i += 1;
+    }
+    with_pages("compare-bar", &lines.join("\n"), |a, b, cases| {
+        let out = jev(
+            &[
+                "eval",
+                a,
+                "--compare",
+                b,
+                "--cases",
+                cases,
+                "--mock",
+                "--min-accuracy",
+                "0.5",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 1);
+        for page in [a, b] {
+            let wanted = format!("jev eval: {page}: is_urgent accuracy 0.00 is below 0.50.");
+            assert!(
+                out.stderr.contains(&wanted),
+                "{wanted:?} in\n{}",
+                out.stderr
+            );
+        }
+    });
 }
 
 const PAGE_ONE: &str = "placeholder\n---\nis_urgent? The message conveys urgency\n";
@@ -734,6 +991,76 @@ async fn refuses_to_send_when_the_estimate_is_above_max_cost() {
     assert_eq!(out.status, 1);
     assert_eq!(asked(&server).await, 0);
     assert!(out.stderr.contains("refusing to send"), "{}", out.stderr);
+}
+
+#[tokio::test]
+async fn compares_two_pages_over_one_pool_one_preflight_and_one_cache() {
+    let server = answering_from_the_state().await;
+    let dir = scratch("live-compare");
+    let other = dir.join("b.jev");
+    std::fs::write(
+        &other,
+        "placeholder\n---\nis_urgent? Something needs doing now\n",
+    )
+    .expect("page b is written");
+    let cache = dir.join("cache");
+    let cases = live_cases("live-compare-cases", EVAL_LIVE_CASES);
+    let cases = cases.to_str().expect("a path");
+    let (other, cache) = (
+        other.to_str().expect("a path"),
+        cache.to_str().expect("a path"),
+    );
+    let args = ["--compare", other, "--cache", cache, "--price", "0.20/1.00"];
+    let first = live_eval(&server, cases, &args).await;
+    assert_eq!(first.status, 0, "{}", first.stderr);
+    assert_eq!(asked(&server).await, 8);
+    assert!(
+        first
+            .stderr
+            .contains("jev eval: 4 + 4 cases over two pages, ≈"),
+        "{}",
+        first.stderr
+    );
+    assert!(
+        first.stderr.contains("at $0.20/$1.00 per Mtok"),
+        "{}",
+        first.stderr
+    );
+    assert!(
+        first.stdout.contains("80 in / 40 out tokens"),
+        "{}",
+        first.stdout
+    );
+    assert!(
+        first
+            .stdout
+            .contains("McNemar: no discordant pairs, nothing to test"),
+        "{}",
+        first.stdout
+    );
+    let again = live_eval(&server, cases, &args).await;
+    assert_eq!(asked(&server).await, 8);
+    assert_eq!(again.stdout, first.stdout);
+    let refused = live_eval(
+        &server,
+        cases,
+        &[
+            "--compare",
+            other,
+            "--max-cost",
+            "0.000001",
+            "--price",
+            "0.20/1.00",
+        ],
+    )
+    .await;
+    assert_eq!(refused.status, 1);
+    assert!(
+        refused.stderr.contains("refusing to send"),
+        "{}",
+        refused.stderr
+    );
+    assert_eq!(asked(&server).await, 8);
 }
 
 #[tokio::test]

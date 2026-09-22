@@ -223,6 +223,13 @@ pub fn tools() -> Value {
                         "description": "How many cases are in the air at once. Defaults to 4.",
                         "minimum": 1,
                     },
+                    "compare": {
+                        "type": "string",
+                        "description":
+                            "A second page to run over the same cases. The report becomes the \
+                             difference: deltas per question, the cases whose answer flipped, and \
+                             an exact McNemar test.",
+                    },
                     "json": {
                         "type": "boolean",
                         "description": "Return the report as JSON instead of a table.",
@@ -374,26 +381,28 @@ async fn ask(args: &Value, host: &Host) -> Result<ToolResult, String> {
 
 async fn score(args: &Value, host: &Host) -> Result<ToolResult, String> {
     let (session, model) = session_arg(args, host)?;
+    let threshold = threshold_arg(args)?;
+    let concurrency = concurrency_arg(args)?;
+    let rates = rates_arg(args, host)?;
+    if let Some(second) = optional_string(args, "compare")? {
+        return compared(
+            args,
+            host,
+            &second,
+            (session, model),
+            threshold,
+            concurrency,
+            rates,
+        )
+        .await;
+    }
     let cases = evaluate::parse_cases(&string_arg(args, "cases")?, &session)?;
     if cases.is_empty() {
         return Err("cases is empty: nothing to score.".to_owned());
     }
-    let threshold = threshold_arg(args)?;
-    let rates = rates_arg(args, host)?;
-    let concurrency = concurrency_arg(args)?;
     let json_wanted = bool_arg(args, "json")?;
 
-    let send = Arc::clone(&host.ask);
-    let outcomes = evaluate::run(
-        &session,
-        &cases,
-        move |one: Session| {
-            let send = Arc::clone(&send);
-            async move { send(one).await.outcome }
-        },
-        concurrency,
-    )
-    .await;
+    let outcomes = evaluate::run(&session, &cases, asker(host), concurrency).await;
     let report = evaluate::report(
         &session,
         &cases,
@@ -410,6 +419,81 @@ async fn score(args: &Value, host: &Host) -> Result<ToolResult, String> {
         return Ok(ToolResult::ok(format!("{body}\n")));
     }
     let mut text = evaluate::report_text(&report);
+    if !host.live {
+        text.push_str(SIMULATED);
+    }
+    Ok(ToolResult::ok(text))
+}
+
+/// The host's `ask`, as the eval runner wants it: a function from a session to an outcome.
+fn asker(
+    host: &Host,
+) -> impl Fn(Session) -> Pin<Box<dyn Future<Output = Outcome> + Send>> + Send + Sync + Clone + 'static
+{
+    let send = Arc::clone(&host.ask);
+    move |one: Session| {
+        let send = Arc::clone(&send);
+        Box::pin(async move { send(one).await.outcome })
+    }
+}
+
+/// `jev_eval` with `compare`: both pages over the same cases, labelled `a` and `b`.
+async fn compared(
+    args: &Value,
+    host: &Host,
+    second: &str,
+    (a, model_a): (Session, String),
+    threshold: f64,
+    concurrency: usize,
+    rates: Option<Rates>,
+) -> Result<ToolResult, String> {
+    let mut b = headless::load(second).map_err(|e| format!("compare: {e}"))?;
+    // A model named in the call overrides both pages, the way --model does on the command line.
+    if let Some(model) = optional_string(args, "model")? {
+        b.model = Some(model);
+    }
+    let model_b = b.model.clone().unwrap_or_else(|| host.model.clone());
+    let labels = evaluate::Labels { a: "a", b: "b" };
+    let (cases_a, cases_b) =
+        evaluate::parse_compare_cases(&string_arg(args, "cases")?, &a, &b, labels)?;
+    let json_wanted = bool_arg(args, "json")?;
+    let (outcomes_a, outcomes_b) = evaluate::run_compare(
+        evaluate::Leg {
+            session: &a,
+            cases: &cases_a,
+            ask: asker(host),
+        },
+        evaluate::Leg {
+            session: &b,
+            cases: &cases_b,
+            ask: asker(host),
+        },
+        concurrency,
+    )
+    .await;
+    let comparison = evaluate::compare(
+        evaluate::Side {
+            label: "a",
+            session: &a,
+            cases: &cases_a,
+            outcomes: &outcomes_a,
+            model: &model_a,
+        },
+        evaluate::Side {
+            label: "b",
+            session: &b,
+            cases: &cases_b,
+            outcomes: &outcomes_b,
+            model: &model_b,
+        },
+        evaluate::CompareOptions { threshold, rates },
+    );
+    if json_wanted {
+        let body = serde_json::to_string_pretty(&evaluate::compare_json(&comparison))
+            .map_err(|e| e.to_string())?;
+        return Ok(ToolResult::ok(format!("{body}\n")));
+    }
+    let mut text = evaluate::compare_text(&comparison);
     if !host.live {
         text.push_str(SIMULATED);
     }

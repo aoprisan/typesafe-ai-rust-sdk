@@ -320,6 +320,34 @@ async fn scores_a_page_over_labelled_cases() {
 }
 
 #[tokio::test]
+async fn compares_two_pages_over_the_same_cases() {
+    let cases = "{\"state\": \"My card was declined\", \"expect\": {\"department\": \"billing\", \"tone\": true}}\n\
+                 {\"state\": \"The webhook returns 500\", \"expect\": {\"department\": \"technical\"}}";
+    let other = format!("{PAGE}tone? The customer is polite\n");
+    let args = json!({ "page": PAGE, "compare": other, "cases": cases, "json": true });
+    let (text, is_error) = call_tool("jev_eval", args, &offline()).await;
+    assert!(!is_error, "{text}");
+    let report: Value = serde_json::from_str(&text).expect("a comparison");
+    let names: Vec<&String> = report["questions"]
+        .as_object()
+        .expect("questions")
+        .keys()
+        .collect();
+    assert_eq!(names, vec!["department"]);
+    assert_eq!(report["onlyB"], json!(["tone"]));
+    assert_eq!(report["unpaired"], json!([]));
+
+    let args = json!({ "page": PAGE, "compare": other, "cases": cases });
+    let (table, _) = call_tool("jev_eval", args, &offline()).await;
+    assert!(table.contains("McNemar"), "{table}");
+    assert!(table.contains("Simulated answers"), "{table}");
+    let args = json!({ "page": PAGE, "compare": "nothing here", "cases": cases });
+    let (broken, is_error) = call_tool("jev_eval", args, &offline()).await;
+    assert!(is_error, "{broken}");
+    assert!(broken.contains("compare:"), "{broken}");
+}
+
+#[tokio::test]
 async fn writes_the_page_out_as_a_program() {
     let (text, is_error) = call_tool("jev_code", json!({ "page": PAGE }), &offline()).await;
     assert!(!is_error, "{text}");

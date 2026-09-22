@@ -200,6 +200,38 @@ live run prints its estimate on stderr before sending anything. `--state` does n
 carry the states. Exit status is 0 when every case answered and every bar was met, 1 when a case
 errored or a bar was missed, 2 when the command line did not parse.
 
+### Comparing two pages
+
+A new page reads better than the old one on the three tickets you tried it on; that is not the same
+as being better. `--compare` runs a second page over the same cases and says what moved, case by
+case, and whether it moved more than chance would:
+
+```sh
+jev eval triage.jev --compare triage-v2.jev --cases cases.jsonl
+```
+
+```text
+  department   choice  40 paired cases
+                  a       b       Δ
+    accuracy      0.78    0.90    +0.12
+    9 fixed · 1 broke · 2 changed
+    McNemar p 0.021 over 10 discordant pairs: b is significantly better
+    case 2           sales → billing       fixed
+    case 17 (t-017)  billing → technical   broke
+```
+
+The first page is `a`, the one after `--compare` is `b`, and every delta is `b − a`, measured only
+on the cases both pages answered. A flip is `fixed` when `b` put right what `a` got wrong, `broke`
+the other way round, and `changed` when both were wrong in different ways. The significance line is
+an exact McNemar test over the fixed and broke cases; with fewer than six of them no difference can
+reach p < 0.05, and it says so rather than printing a number that would be read as one.
+
+A question only one page asks is listed as such, and a label may name a question on either page.
+Both runs share one estimate for `--max-cost`, one pool for `--concurrency` and one `--cache`, so a
+comparison costs what the two runs cost and a re-run costs nothing. `--fail-on-regression` exits 1
+when `b` is significantly worse on any question — the line to put in CI — and `--json` prints both
+reports whole next to the comparison.
+
 Without `TYPESAFE_API_KEY` it starts in mock mode: answers are simulated locally (deterministic,
 not predictive) so the shapes can be learned offline. `:key <api-key>` switches to live calls.
 
