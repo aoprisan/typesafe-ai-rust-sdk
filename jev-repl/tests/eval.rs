@@ -52,7 +52,13 @@ fn reads_a_labelled_state_per_line() {
     assert_eq!(parsed[0].id.as_deref(), Some("t-001"));
     assert_eq!(
         parsed[0].expect,
-        vec![("is_urgent".to_owned(), Expectation::Noul { yes: true })]
+        vec![(
+            "is_urgent".to_owned(),
+            Expectation::Noul {
+                yes: true,
+                by_turn: None
+            }
+        )]
     );
     assert_eq!(parsed[1].state, json!({"subject": "Invoice"}));
     assert_eq!(parsed[1].id, None);
@@ -478,11 +484,13 @@ fn names_cases_that_did_not_answer_and_leaves_them_out_of_every_metric() {
         report.errors,
         vec![
             CaseError {
+                turn: None,
                 case: 1,
                 id: Some("t-001".to_owned()),
                 message: "Timeout  the request did not complete".to_owned(),
             },
             CaseError {
+                turn: None,
                 case: 2,
                 id: None,
                 message: "no answer came back for department".to_owned(),
@@ -1095,6 +1103,7 @@ fn calls_each_flip_fixed_broke_or_changed() {
         urgent.flips,
         vec![
             evaluate::Flip {
+                turn: None,
                 case: 1,
                 id: Some("t-1".to_owned()),
                 expected: json!(true),
@@ -1103,6 +1112,7 @@ fn calls_each_flip_fixed_broke_or_changed() {
                 status: "broke",
             },
             evaluate::Flip {
+                turn: None,
                 case: 2,
                 id: None,
                 expected: json!(false),
@@ -1143,6 +1153,7 @@ fn lists_what_could_not_be_compared() {
     assert_eq!(
         comparison.b.report.errors,
         vec![CaseError {
+            turn: None,
             case: 4,
             id: None,
             message: "Timeout".to_owned(),
@@ -1449,6 +1460,7 @@ fn compares_each_page_at_its_own_threshold() {
     assert_eq!(
         urgent.flips,
         vec![evaluate::Flip {
+            turn: None,
             case: 2,
             id: None,
             expected: json!(true),
@@ -1630,4 +1642,318 @@ fn says_what_it_wrote_and_what_it_left_alone() {
         evaluate::not_calibrating(2),
         "not calibrating: 2 cases came back with errors, so the numbers are incomplete."
     );
+}
+
+// ---- a conversation labelled per turn ---------------------------------------------------------
+
+const THREAD: &str = r#"[{"who":"customer","said":"Hi"},{"who":"customer","said":"It is down"},{"who":"customer","said":"We lose money every minute"}]"#;
+
+fn yes_of(case: &evaluate::Case, name: &str) -> Option<bool> {
+    case.expect
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, e)| matches!(e, Expectation::Noul { yes: true, .. }))
+}
+
+#[test]
+fn sends_a_conversation_once_per_turn_each_prefix_a_case_of_its_own() {
+    let parsed = cases(
+        &format!(
+            r#"{{"id": "t-9", "state": {THREAD}, "expect": {{"is_urgent": {{"by_turn": 2}}, "department": "technical"}}}}"#
+        ),
+        &session(),
+    );
+    let shape: Vec<_> = parsed
+        .iter()
+        .map(|c| (c.line, c.turn, c.turns, c.id.as_deref()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (1, Some(1), Some(3), Some("t-9")),
+            (1, Some(2), Some(3), Some("t-9")),
+            (1, Some(3), Some(3), Some("t-9")),
+        ]
+    );
+    let lengths: Vec<usize> = parsed
+        .iter()
+        .map(|c| c.state.as_array().map_or(0, Vec::len))
+        .collect();
+    assert_eq!(lengths, vec![1, 2, 3]);
+    let yes: Vec<Option<bool>> = parsed.iter().map(|c| yes_of(c, "is_urgent")).collect();
+    assert_eq!(yes, vec![Some(false), Some(true), Some(true)]);
+    // A plain label was written about the whole conversation, so only the last prefix carries it.
+    let department: Vec<bool> = parsed
+        .iter()
+        .map(|c| c.expect.iter().any(|(n, _)| n == "department"))
+        .collect();
+    assert_eq!(department, vec![false, false, true]);
+}
+
+#[test]
+fn reads_null_as_never_and_leaves_a_case_without_by_turn_exactly_as_it_was() {
+    let never = cases(
+        &format!(r#"{{"state": {THREAD}, "expect": {{"is_urgent": {{"by_turn": null}}}}}}"#),
+        &session(),
+    );
+    let yes: Vec<Option<bool>> = never.iter().map(|c| yes_of(c, "is_urgent")).collect();
+    assert_eq!(yes, vec![Some(false); 3]);
+    let plain = cases(
+        &format!(r#"{{"state": {THREAD}, "expect": {{"is_urgent": true}}}}"#),
+        &session(),
+    );
+    assert_eq!(plain.len(), 1);
+    assert_eq!(plain[0].turn, None);
+}
+
+#[test]
+fn says_what_is_wrong_with_a_per_turn_label_by_line() {
+    let s = session();
+    assert_eq!(
+        why(
+            r#"{"state": "text", "expect": {"is_urgent": {"by_turn": 1}}}"#,
+            &s
+        ),
+        "cases line 1: is_urgent gives by_turn, but the state is not a conversation of turns."
+    );
+    assert_eq!(
+        why(
+            &format!(r#"{{"state": {THREAD}, "expect": {{"is_urgent": {{"by_turn": 7}}}}}}"#),
+            &s
+        ),
+        "cases line 1: is_urgent by_turn must be a whole turn from 1 to 3, or null for never; got 7."
+    );
+    assert!(
+        why(
+            &format!(r#"{{"state": {THREAD}, "expect": {{"is_urgent": {{"by_turn": 1.5}}}}}}"#),
+            &s
+        )
+        .contains("got 1.5.")
+    );
+    assert_eq!(
+        why(
+            &format!(r#"{{"state": {THREAD}, "expect": {{"is_urgent": {{"when": 3}}}}}}"#),
+            &s
+        ),
+        r#"cases line 1: is_urgent: a per-turn expectation is {"by_turn": n}, the turn it becomes true, or null for never; got {"when":3}."#
+    );
+    assert_eq!(
+        why(
+            &format!(r#"{{"state": {THREAD}, "expect": {{"department": {{"by_turn": 2}}}}}}"#),
+            &s
+        ),
+        "cases line 1: by_turn is for a noul, and department is a choice."
+    );
+}
+
+fn latency_lines() -> Vec<String> {
+    vec![
+        format!(
+            r#"{{"id": "on-time", "state": {THREAD}, "expect": {{"is_urgent": {{"by_turn": 2}}}}}}"#
+        ),
+        format!(
+            r#"{{"id": "early", "state": {THREAD}, "expect": {{"is_urgent": {{"by_turn": 3}}}}}}"#
+        ),
+        format!(
+            r#"{{"id": "missed", "state": {THREAD}, "expect": {{"is_urgent": {{"by_turn": 3}}}}}}"#
+        ),
+        format!(
+            r#"{{"id": "quiet", "state": {THREAD}, "expect": {{"is_urgent": {{"by_turn": null}}}}}}"#
+        ),
+        format!(
+            r#"{{"id": "broken", "state": {THREAD}, "expect": {{"is_urgent": {{"by_turn": 1}}}}}}"#
+        ),
+        r#"{"state": "plain", "expect": {"is_urgent": true}}"#.to_owned(),
+    ]
+}
+
+fn latency_report() -> Report {
+    const PROBABILITIES: [[f64; 3]; 5] = [
+        [0.1, 0.8, 0.9],
+        [0.2, 0.7, 0.9],
+        [0.1, 0.1, 0.2],
+        [0.1, 0.6, 0.1],
+        [0.9, 0.9, 0.9],
+    ];
+    let s = session();
+    let parsed = cases(&latency_lines().join("\n"), &s);
+    let outcomes: Vec<Outcome> = parsed
+        .iter()
+        .enumerate()
+        .map(|(at, one)| match one.turn {
+            None => answered(&[("is_urgent", noul(0.9))], None),
+            Some(2) if one.id.as_deref() == Some("broken") => failed("Timeout"),
+            Some(turn) => answered(
+                &[("is_urgent", noul(PROBABILITIES[at / 3][turn - 1]))],
+                None,
+            ),
+        })
+        .collect();
+    evaluate::report(
+        &s,
+        &parsed,
+        &outcomes,
+        ReportOptions {
+            model: "jev-latest",
+            threshold: 0.5,
+            rates: None,
+        },
+    )
+}
+
+fn latency_of(report: &Report) -> &evaluate::Latency {
+    match question(report, "is_urgent") {
+        QuestionReport::Noul {
+            latency: Some(latency),
+            ..
+        } => latency,
+        _ => panic!("is_urgent has a latency"),
+    }
+}
+
+#[test]
+fn counts_every_prefix_as_the_case_it_is() {
+    let report = latency_report();
+    assert_eq!(report.cases, 16);
+    assert_eq!(
+        report.errors,
+        vec![CaseError {
+            case: 5,
+            turn: Some(2),
+            id: Some("broken".to_owned()),
+            message: "Timeout".to_owned(),
+        }]
+    );
+    assert_eq!(question(&report, "is_urgent").cases(), 15);
+}
+
+#[test]
+fn finds_the_first_turn_at_the_threshold_and_how_far_off_it_was() {
+    let report = latency_report();
+    let latency = latency_of(&report);
+    assert_eq!(
+        (
+            latency.threads,
+            latency.on_time,
+            latency.early,
+            latency.late,
+            latency.missed,
+            latency.false_alarms,
+            latency.mean
+        ),
+        (4, 1, 1, 0, 1, 1, Some(-0.5))
+    );
+    let thread = |case, id: &str, expected, detected, lag| evaluate::ThreadLatency {
+        case,
+        id: Some(id.to_owned()),
+        expected,
+        detected,
+        latency: lag,
+    };
+    assert_eq!(
+        latency.cases,
+        vec![
+            thread(1, "on-time", Some(2), Some(2), Some(0)),
+            thread(2, "early", Some(3), Some(2), Some(-1)),
+            thread(3, "missed", Some(3), None, None),
+            thread(4, "quiet", None, Some(2), None),
+        ]
+    );
+}
+
+#[test]
+fn prints_it_under_the_sweep_and_in_the_json() {
+    let report = latency_report();
+    let text = evaluate::report_text(&report);
+    assert!(
+        text.contains(
+            "    by turn  4 threads · 1 on time · 1 early · 0 late · 1 missed · 1 false alarm · mean latency -0.50 turns"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("case 5 turn 2 (broken): Timeout"), "{text}");
+    let json = evaluate::report_json(&report);
+    let latency = &json["questions"]["is_urgent"]["latency"];
+    assert_eq!(latency["threads"], 4);
+    assert_eq!(latency["falseAlarms"], 1);
+    assert_eq!(latency["mean"], -0.5);
+    assert_eq!(
+        latency["cases"][3],
+        json!({"case": 4, "id": "quiet", "expected": null, "detected": 2, "latency": null})
+    );
+    let keys: Vec<&String> = json["questions"]["is_urgent"]
+        .as_object()
+        .expect("an object")
+        .keys()
+        .collect();
+    assert_eq!(keys.last().map(|k| k.as_str()), Some("latency"));
+    assert_eq!(
+        json["errors"][0],
+        json!({"case": 5, "turn": 2, "id": "broken", "message": "Timeout"})
+    );
+}
+
+#[test]
+fn leaves_latency_out_when_nothing_was_labelled_per_turn() {
+    let report = urgent_report([0.9, 0.9, 0.9, 0.9], 0.5);
+    assert!(matches!(
+        question(&report, "is_urgent"),
+        QuestionReport::Noul { latency: None, .. }
+    ));
+    assert!(
+        evaluate::report_json(&report)["questions"]["is_urgent"]
+            .get("latency")
+            .is_none()
+    );
+}
+
+#[test]
+fn pairs_prefixes_by_line_and_turn_when_two_pages_are_compared() {
+    let (a, b) = (session(), session_b());
+    let (left, right) =
+        evaluate::parse_compare_cases(&latency_lines()[0], &a, &b, LABELS).expect("they parse");
+    let urgent = |ps: [f64; 3]| -> Vec<Outcome> {
+        ps.iter()
+            .map(|p| answered(&[("is_urgent", noul(*p))], None))
+            .collect()
+    };
+    let (outcomes_a, outcomes_b) = (urgent([0.1, 0.8, 0.9]), urgent([0.1, 0.3, 0.9]));
+    let comparison = evaluate::compare(
+        evaluate::Side {
+            label: "a",
+            session: &a,
+            cases: &left,
+            outcomes: &outcomes_a,
+            model: "m",
+        },
+        evaluate::Side {
+            label: "b",
+            session: &b,
+            cases: &right,
+            outcomes: &outcomes_b,
+            model: "m",
+        },
+        evaluate::CompareOptions {
+            threshold: 0.5,
+            rates: None,
+        },
+    );
+    assert_eq!(comparison.cases, 3);
+    assert_eq!(
+        comparison.questions[0].flips,
+        vec![evaluate::Flip {
+            case: 1,
+            turn: Some(2),
+            id: Some("on-time".to_owned()),
+            expected: json!(true),
+            a: json!(true),
+            b: json!(false),
+            status: "broke",
+        }]
+    );
+    assert_eq!(
+        evaluate::compare_json(&comparison)["questions"]["is_urgent"]["flips"][0],
+        json!({"case": 1, "turn": 2, "id": "on-time", "expected": true, "a": true, "b": false, "status": "broke"})
+    );
+    assert!(evaluate::compare_text(&comparison).contains("case 1 turn 2 (on-time)"));
 }

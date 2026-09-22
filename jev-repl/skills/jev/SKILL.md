@@ -142,6 +142,9 @@ A cases file for `jev eval` is JSON Lines, one labelled state per line:
 
 `expect` names questions from the page: `true`/`false` for a noul, a label for a
 choice, a level (name or index) for a score. Questions you leave out are not scored.
+When the state is a conversation, a noul can be labelled per turn: `{"by_turn": 3}` is
+false before turn 3 and true from it on (`null` for never). The case is sent once per
+turn and the report says how early or late the noul noticed.
 
 `--calibrate` writes the bars a run supports back into the page — each noul's best-F1
 `@threshold`, and the lowest `@confidence` at which a choice or score reaches

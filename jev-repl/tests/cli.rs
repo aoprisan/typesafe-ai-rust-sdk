@@ -530,6 +530,68 @@ fn exits_1_and_names_the_question_when_a_bar_is_not_met() {
 }
 
 #[test]
+fn scores_a_conversation_labelled_per_turn_and_says_when_the_noul_noticed() {
+    let thread = json!([
+        {"who": "customer", "said": "Hi there"},
+        {"who": "agent", "said": "How can I help?"},
+        {"who": "customer", "said": "Checkout has been down for an hour, we are losing orders"},
+    ]);
+    let cases = format!(
+        r#"{{"id": "th-1", "state": {thread}, "expect": {{"is_urgent": {{"by_turn": 3}}, "department": "technical"}}}}"#
+    );
+    with_files("by-turn", &cases, |page, path| {
+        let out = jev(&["eval", page, "--cases", path, "--mock"], "", &[]);
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        assert!(
+            has_row(&out.stdout, &["is_urgent", "noul", "3 cases"]),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            has_row(&out.stdout, &["department", "choice", "1 case", "·"]),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("    by turn  1 thread · "),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("3 cases · 3 answered · 0 errors"),
+            "{}",
+            out.stdout
+        );
+        let json = jev(
+            &["eval", page, "--cases", path, "--mock", "--json"],
+            "",
+            &[],
+        );
+        let report: Value = serde_json::from_str(&json.stdout).expect("a JSON report");
+        assert_eq!(report["questions"]["is_urgent"]["latency"]["threads"], 1);
+        assert_eq!(
+            report["questions"]["is_urgent"]["latency"]["cases"][0]["expected"],
+            3
+        );
+    });
+    with_files(
+        "by-turn-plain",
+        r#"{"state": "plain text", "expect": {"is_urgent": {"by_turn": 2}}}"#,
+        |page, path| {
+            let out = jev(&["eval", page, "--cases", path, "--mock"], "", &[]);
+            assert_eq!(out.status, 1);
+            assert!(
+                out.stderr.contains(
+                    "cases line 1: is_urgent gives by_turn, but the state is not a conversation of turns."
+                ),
+                "{}",
+                out.stderr
+            );
+        },
+    );
+}
+
+#[test]
 fn lists_eval_and_its_flags_in_help() {
     let help = jev(&["--help"], "", &[]).stdout;
     assert!(help.contains("eval"), "{help}");

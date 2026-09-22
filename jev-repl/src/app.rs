@@ -13,7 +13,7 @@ use crate::builder::{Builder, Outcome};
 use crate::editor::{self, Editor};
 use crate::format::*;
 use crate::session::{self, Session};
-use crate::{codegen, cost, highlight, lessons, mock, presets, sketch, words};
+use crate::{codegen, cost, headless, highlight, lessons, mock, presets, sketch, trend, words};
 
 /// Everything that can move the app forward.
 pub enum Msg {
@@ -21,6 +21,8 @@ pub enum Msg {
     Tick,
     Answered(Box<typesafe::Result<SystemOneResponse>>, Duration),
     Models(Box<typesafe::Result<ListModelsResponse>>),
+    /// What a live `:trend` came back with: a response per turn, or the first error.
+    Trend(Box<typesafe::Result<Vec<SystemOneResponse>>>),
 }
 
 pub const COMMANDS: &[(&str, &str)] = &[
@@ -38,6 +40,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         ":turn",
         "grow the state into a conversation — :turn <who>: <text> | :turn list | :turn drop",
+    ),
+    (
+        ":trend",
+        "every question after each turn of the conversation, as one line apiece",
     ),
     (":noul", ":noul <name> <instructions> [| yes: …] [| no: …]"),
     (
@@ -112,6 +118,8 @@ pub struct App {
     /// Some while sketch mode is open.
     pub sketch: Option<Editor>,
     pub quit: bool,
+    /// The prefixes a live `:trend` is asking about, so the answers can be lined up when they land.
+    trend_steps: Vec<Session>,
     tx: UnboundedSender<Msg>,
 }
 
@@ -142,6 +150,7 @@ impl App {
             builder: None,
             sketch: None,
             quit: false,
+            trend_steps: Vec::new(),
             tx,
         };
         app.banner();
@@ -234,6 +243,32 @@ impl App {
                 self.pending = false;
                 match *result {
                     Ok(res) => self.show_response(&res, elapsed),
+                    Err(e) => {
+                        self.blank();
+                        self.extend(error_lines(&e));
+                    }
+                }
+            }
+            Msg::Trend(result) => {
+                self.pending = false;
+                match *result {
+                    Ok(responses) => {
+                        let steps = std::mem::take(&mut self.trend_steps);
+                        let per_turn: Vec<Vec<headless::Answered>> = responses
+                            .iter()
+                            .enumerate()
+                            .map(|(i, response)| {
+                                headless::live_answers(
+                                    steps.get(i).unwrap_or(&self.session),
+                                    response,
+                                )
+                            })
+                            .collect();
+                        if let Some(last) = responses.last() {
+                            self.last_raw = serde_json::to_string_pretty(&last.raw).ok();
+                        }
+                        self.draw_trend(&steps, &per_turn, Some(&responses));
+                    }
                     Err(e) => {
                         self.blank();
                         self.extend(error_lines(&e));
@@ -482,6 +517,7 @@ impl App {
             ":preset" => self.preset(args),
             ":state" | ":s" => self.state_cmd(args),
             ":turn" => self.turn_cmd(args),
+            ":trend" => self.trend(),
             ":noul" => self.add(session::parse_noul(args)),
             ":choice" => self.add(session::parse_choice(args)),
             ":score" => self.add(session::parse_score(args)),
@@ -1264,6 +1300,119 @@ impl App {
             let res = req.await;
             let _ = tx.send(Msg::Answered(Box::new(res), started.elapsed()));
         });
+    }
+
+    /// `:trend` — every question asked again after each turn of the conversation, drawn as one line
+    /// per question: a spark across the turns, where it started and ended, and the turns it changed
+    /// its mind. A thread of n turns is n calls, so the cost line counts all of them.
+    pub fn trend(&mut self) {
+        if self.pending {
+            self.warn("a request is already in flight.");
+            return;
+        }
+        if self.session.questions.is_empty() {
+            self.warn(
+                "no questions yet — :noul, :choice or :score first (`:preset triage` loads a set).",
+            );
+            return;
+        }
+        let steps = trend::prefixes(&self.session);
+        if steps.is_empty() {
+            self.warn(
+                ":trend needs a conversation — `:turn <who>: <text>` builds one, a turn at a time.",
+            );
+            return;
+        }
+        if self.mock || self.client.is_none() {
+            let per_turn: Vec<Vec<headless::Answered>> =
+                steps.iter().map(headless::mock_answers).collect();
+            self.draw_trend(&steps, &per_turn, None);
+            return;
+        }
+        let client = self.client.clone().expect("checked");
+        let model = self.model_name();
+        let timeout = self.timeout;
+        let tx = self.tx.clone();
+        let asked: Vec<(Value, typesafe::Questions)> = steps
+            .iter()
+            .map(|step| (step.state.clone(), step.to_questions()))
+            .collect();
+        self.pending = true;
+        self.trend_steps = steps;
+        self.blank();
+        let n = asked.len();
+        let plural = if n == 1 { "" } else { "s" };
+        self.note(format!(
+            "asking after each of {n} turn{plural}: {n} call{plural}"
+        ));
+        // One after another: each prefix is its own call, and the thread is short.
+        tokio::spawn(async move {
+            let mut responses = Vec::with_capacity(asked.len());
+            for (state, questions) in asked {
+                let mut req = client.system_one(state, questions).model(model.clone());
+                if let Some(t) = timeout {
+                    req = req.timeout(t);
+                }
+                match req.await {
+                    Ok(response) => responses.push(response),
+                    Err(e) => {
+                        let _ = tx.send(Msg::Trend(Box::new(Err(e))));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(Msg::Trend(Box::new(Ok(responses))));
+        });
+    }
+
+    fn draw_trend(
+        &mut self,
+        steps: &[Session],
+        per_turn: &[Vec<headless::Answered>],
+        responses: Option<&[SystemOneResponse]>,
+    ) {
+        let n = steps.len();
+        let plural = if n == 1 { "" } else { "s" };
+        self.heading(format!("trend · {n} turn{plural}"));
+        self.extend(trend::trend_lines(&trend::series(
+            &self.session,
+            per_turn,
+            self.threshold,
+        )));
+        let model = self.model_name();
+        let calls = format!("over {n} call{plural}");
+        let counted = responses.is_some_and(|all| {
+            all.iter()
+                .all(|r| r.usage.input_tokens.is_some() && r.usage.output_tokens.is_some())
+        });
+        let (mut input, mut output) = (0u64, 0u64);
+        match responses {
+            Some(all) if counted => {
+                for r in all {
+                    input += r.usage.input_tokens.unwrap_or(0);
+                    output += r.usage.output_tokens.unwrap_or(0);
+                }
+            }
+            _ => {
+                for step in steps {
+                    let estimate = cost::estimate(step, &model);
+                    input += estimate.input_tokens as u64;
+                    output += estimate.output_tokens as u64;
+                }
+            }
+        }
+        let money = match self.rates {
+            Some(rates) => format!(" · {}", cost::usd(cost::price(input, output, rates).total)),
+            None => String::new(),
+        };
+        let tokens = format!("{input} in / {output} out tokens{money} {calls}");
+        if counted {
+            self.note(tokens);
+        } else if responses.is_none() {
+            self.note(format!("≈ {tokens} — estimated, since nothing was sent."));
+        } else {
+            self.note(format!("≈ {tokens} — estimated, nothing was counted."));
+        }
     }
 
     fn ask_mock(&mut self) {

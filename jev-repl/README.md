@@ -57,6 +57,21 @@ jev            # with TYPESAFE_API_KEY for live answers; without it, answers are
   <Enter>                                          # the same questions again; watch is_urgent move
   ```
 
+  `:trend` does the re-asking for you: every question after each turn — the first turn, the first
+  two, and so on — drawn as one line per question, so you can see when a rubric noticed rather than
+  only where it ended up. A choice is followed through the label it ended on, a score along its
+  levels, and the last column names every turn the answer changed:
+
+  ```text
+  trend · 4 turns
+    is_urgent    noul    ▂▂▅▇  0.12 → 0.91            turn 3 yes
+    department   choice  ▃▃▆▇  technical 0.35 → 0.80  turn 2 technical
+    frustration  score   ▂▂▄▇  0.20 → 1.70 of 2       turn 3 level 1 · turn 4 level 2
+    ≈ 612 in / 400 out tokens over 4 calls — estimated, since nothing was sent.
+  ```
+
+  It is a call per turn, live or not, and the cost line counts them all.
+
   Nothing new goes on the wire — the `state` is simply an array, `[{"who": …, "said": …}, …]`,
   which is why a page can hold one and `jev eval` can score one without knowing anything new. The
   speaker is the first word only when it ends in a colon, so a line typed without one keeps all of
@@ -190,6 +205,19 @@ levels. A bad line stops the run before anything is sent, named by its line in t
 
   40 cases · 40 answered · 0 errors
   4812 in / 3120 out tokens · $0.0041
+```
+
+A conversation can be labelled turn by turn. `{"by_turn": 3}` on a noul says it should be false
+for the first two turns and true from the third on (`{"by_turn": null}`: never); the case is then
+sent once per turn, each prefix is scored as a case of its own, and the case's other labels apply
+to the whole conversation only. The noul's block gains a line that says when it noticed:
+
+```jsonl
+{"id": "t-9", "state": [{"who": "customer", "said": "Hi"}, {"who": "customer", "said": "It is down"}, {"who": "customer", "said": "We lose money every minute"}], "expect": {"is_urgent": {"by_turn": 3}, "department": "technical"}}
+```
+
+```text
+    by turn  12 threads · 7 on time · 2 early · 2 late · 1 missed · 0 false alarms · mean latency +0.18 turns
 ```
 
 That is the whole point of the table: the sweep says what a threshold buys, and the gate says what

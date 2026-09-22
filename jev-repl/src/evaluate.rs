@@ -37,14 +37,43 @@ pub struct Case {
     /// session's questions. A `Vec` and not a map, because that is the shape `Session` uses for
     /// questions and it saves a dependency.
     pub expect: Vec<(String, Expectation)>,
+    /// For a case labelled per turn: which prefix of the conversation this is (1-based), and how
+    /// many turns the whole conversation has. Such a case is sent once per turn, and each is a case.
+    pub turn: Option<usize>,
+    pub turns: Option<usize>,
+}
+
+/// A per-turn label: the turn a noul becomes true from, or never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByTurn {
+    Turn(usize),
+    Never,
+}
+
+impl ByTurn {
+    /// The turn, or `None` for never — what the JSON report writes.
+    pub fn turn(self) -> Option<usize> {
+        match self {
+            ByTurn::Turn(k) => Some(k),
+            ByTurn::Never => None,
+        }
+    }
 }
 
 /// What one question is expected to answer, in the shape its kind is scored in.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expectation {
-    Noul { yes: bool },
-    Choice { label: String },
-    Score { level: usize },
+    Noul {
+        yes: bool,
+        /// Set when the label was `{"by_turn": k}`: the turn it becomes true, or never.
+        by_turn: Option<ByTurn>,
+    },
+    Choice {
+        label: String,
+    },
+    Score {
+        level: usize,
+    },
 }
 
 impl Expectation {
@@ -70,9 +99,12 @@ pub fn parse_cases(text: &str, session: &Session) -> Result<Vec<Case>, String> {
         for (name, value) in one.wanted {
             let question = question_of(session, name)
                 .ok_or_else(|| format!("no question named {name:?} on the page."))?;
-            expect.push((name.clone(), expected(name, question, value)?));
+            expect.push((
+                name.clone(),
+                expected(name, question, value, turn_count(one.state))?,
+            ));
         }
-        cases.push(case_of(&one, expect));
+        cases.extend(cases_of(&one, expect));
         Ok(())
     })?;
     Ok(cases)
@@ -113,17 +145,13 @@ pub fn parse_compare_cases(
                 (on_b, &mut expect_b, labels.b),
             ] {
                 let Some(question) = question else { continue };
-                let expectation =
-                    expected(name, question, value).map_err(|e| format!("{label}: {e}"))?;
+                let expectation = expected(name, question, value, turn_count(one.state))
+                    .map_err(|e| format!("{label}: {e}"))?;
                 into.push((name.clone(), expectation));
             }
         }
-        if !expect_a.is_empty() {
-            left.push(case_of(&one, expect_a));
-        }
-        if !expect_b.is_empty() {
-            right.push(case_of(&one, expect_b));
-        }
+        left.extend(cases_of(&one, expect_a));
+        right.extend(cases_of(&one, expect_b));
         Ok(())
     })?;
     Ok((left, right))
@@ -195,12 +223,77 @@ fn read_case(value: &Value, line: usize) -> Result<RawCase<'_>, String> {
     })
 }
 
-fn case_of(one: &RawCase<'_>, expect: Vec<(String, Expectation)>) -> Case {
-    Case {
+/// The cases one line becomes: itself, or — when a noul is labelled per turn — one case per prefix
+/// of the conversation. A per-turn noul expects `turn >= k` at every prefix; the line's other
+/// labels were written about the whole conversation, so they go on the last prefix only. A case
+/// left with nothing to score is not sent at all.
+fn cases_of(one: &RawCase<'_>, expect: Vec<(String, Expectation)>) -> Vec<Case> {
+    let named = |state: Value, expect, turn, turns| Case {
         line: one.line,
         id: one.id.clone(),
-        state: one.state.clone(),
+        state,
         expect,
+        turn,
+        turns,
+    };
+    if expect.is_empty() {
+        return Vec::new();
+    }
+    let per_turn = expect.iter().any(|(_, e)| {
+        matches!(
+            e,
+            Expectation::Noul {
+                by_turn: Some(_),
+                ..
+            }
+        )
+    });
+    let turns = session::turns_of(one.state);
+    let (true, Some(turns)) = (per_turn, turns) else {
+        return vec![named(one.state.clone(), expect, None, None)];
+    };
+    let n = turns.len();
+    let mut out = Vec::new();
+    for turn in 1..=n {
+        let mut at = Vec::new();
+        for (name, e) in &expect {
+            match e {
+                Expectation::Noul {
+                    by_turn: Some(by_turn),
+                    ..
+                } => {
+                    let yes = matches!(by_turn, ByTurn::Turn(k) if turn >= *k);
+                    at.push((
+                        name.clone(),
+                        Expectation::Noul {
+                            yes,
+                            by_turn: Some(*by_turn),
+                        },
+                    ));
+                }
+                _ if turn == n => at.push((name.clone(), e.clone())),
+                _ => {}
+            }
+        }
+        if at.is_empty() {
+            continue;
+        }
+        let state = session::turns_to_json(&turns[..turn]);
+        out.push(named(state, at, Some(turn), Some(n)));
+    }
+    out
+}
+
+/// How many turns a state has, when it is a conversation.
+fn turn_count(state: &Value) -> Option<usize> {
+    session::turns_of(state).map(|turns| turns.len())
+}
+
+/// A JSON value the way `JSON.stringify` writes it, whole numbers without a `.0`.
+fn compact(value: &Value) -> String {
+    match value.as_f64() {
+        Some(n) if value.is_f64() && n.fract() == 0.0 && n.abs() < 9e15 => (n as i64).to_string(),
+        _ => value.to_string(),
     }
 }
 
@@ -213,10 +306,29 @@ fn question_of<'a>(session: &'a Session, name: &str) -> Option<&'a Question> {
 }
 
 /// Check one expected value against the question it names, and store it the way it is scored.
-fn expected(name: &str, question: &Question, value: &Value) -> Result<Expectation, String> {
+fn expected(
+    name: &str,
+    question: &Question,
+    value: &Value,
+    turns: Option<usize>,
+) -> Result<Expectation, String> {
+    if let (Question::Choice(_) | Question::Score(_), Value::Object(object)) = (question, value)
+        && object.contains_key("by_turn")
+    {
+        let kind = if matches!(question, Question::Choice(_)) {
+            "choice"
+        } else {
+            "score"
+        };
+        return Err(format!("by_turn is for a noul, and {name} is a {kind}."));
+    }
     match question {
         Question::Noul(_) => match value {
-            Value::Bool(yes) => Ok(Expectation::Noul { yes: *yes }),
+            Value::Object(object) => by_turn(name, object, value, turns),
+            Value::Bool(yes) => Ok(Expectation::Noul {
+                yes: *yes,
+                by_turn: None,
+            }),
             other => Err(format!(
                 "{name} is a noul: expected true or false, got {other}."
             )),
@@ -257,6 +369,44 @@ fn expected(name: &str, question: &Question, value: &Value) -> Result<Expectatio
         // build does not know.
         _ => Err(format!(
             "{name} is a raw question: raw questions cannot be scored."
+        )),
+    }
+}
+
+/// `{"by_turn": k}`: false before turn `k` of the conversation and true from it on, or never true
+/// when `k` is null. It only means something over a conversation, and only for a turn it has.
+fn by_turn(
+    name: &str,
+    object: &serde_json::Map<String, Value>,
+    value: &Value,
+    turns: Option<usize>,
+) -> Result<Expectation, String> {
+    if object.len() != 1 || !object.contains_key("by_turn") {
+        return Err(format!(
+            "{name}: a per-turn expectation is {{\"by_turn\": n}}, the turn it becomes true, or null for never; got {}.",
+            compact(value)
+        ));
+    }
+    let Some(turns) = turns else {
+        return Err(format!(
+            "{name} gives by_turn, but the state is not a conversation of turns."
+        ));
+    };
+    let k = &object["by_turn"];
+    if k.is_null() {
+        return Ok(Expectation::Noul {
+            yes: false,
+            by_turn: Some(ByTurn::Never),
+        });
+    }
+    match k.as_f64() {
+        Some(n) if n.fract() == 0.0 && n >= 1.0 && n <= turns as f64 => Ok(Expectation::Noul {
+            yes: false,
+            by_turn: Some(ByTurn::Turn(n as usize)),
+        }),
+        _ => Err(format!(
+            "{name} by_turn must be a whole turn from 1 to {turns}, or null for never; got {}.",
+            compact(k)
         )),
     }
 }
@@ -429,6 +579,8 @@ pub enum QuestionReport {
         accuracy: f64,
         best: Best,
         sweep: Vec<SweepRow>,
+        /// When it noticed, for the conversations labelled per turn; `None` when none were.
+        latency: Option<Latency>,
     },
     Choice {
         name: String,
@@ -491,6 +643,8 @@ impl QuestionReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaseError {
     pub case: usize,
+    /// The prefix of a per-turn case that failed.
+    pub turn: Option<usize>,
     pub id: Option<String>,
     pub message: String,
 }
@@ -534,6 +688,8 @@ const CUTS: [f64; 5] = [0.0, 0.2, 0.4, 0.6, 0.8];
 struct Scored<'a> {
     line: usize,
     id: Option<&'a str>,
+    turn: Option<usize>,
+    turns: Option<usize>,
     expect: &'a [(String, Expectation)],
     answers: Vec<(String, Answer)>,
     usage: Option<Usage>,
@@ -601,6 +757,7 @@ fn scored_of<'a>(cases: &'a [Case], outcomes: &[Outcome]) -> (Vec<CaseError>, Ve
         let mut failed = |message: String| {
             errors.push(CaseError {
                 case: one.line,
+                turn: one.turn,
                 id: one.id.clone(),
                 message,
             });
@@ -627,6 +784,8 @@ fn scored_of<'a>(cases: &'a [Case], outcomes: &[Outcome]) -> (Vec<CaseError>, Ve
         scored.push(Scored {
             line: one.line,
             id: one.id.as_deref(),
+            turn: one.turn,
+            turns: one.turns,
             expect: &one.expect,
             answers,
             usage: usage.clone(),
@@ -672,7 +831,7 @@ fn noul_report(name: &str, rows: &[&Scored<'_>], threshold: f64) -> QuestionRepo
                 Some(Answer::Noul(a)) => a.noul,
                 _ => 0.0,
             };
-            let yes = matches!(row.expects(name), Some(Expectation::Noul { yes: true }));
+            let yes = matches!(row.expects(name), Some(Expectation::Noul { yes: true, .. }));
             (p, yes)
         })
         .collect();
@@ -717,7 +876,119 @@ fn noul_report(name: &str, rows: &[&Scored<'_>], threshold: f64) -> QuestionRepo
         accuracy,
         best,
         sweep,
+        latency: latency_of(name, rows, threshold),
     }
+}
+
+/// One conversation labelled per turn: the turn it should have said yes, and the turn it did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadLatency {
+    pub case: usize,
+    pub id: Option<String>,
+    /// `by_turn`; `None` when it should never have said yes.
+    pub expected: Option<usize>,
+    /// The first turn at or above the threshold; `None` when there was none.
+    pub detected: Option<usize>,
+    /// `detected − expected`, negative when early; `None` unless both are known.
+    pub latency: Option<i64>,
+}
+
+/// How early or late a noul notices, over the conversations labelled per turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Latency {
+    pub threads: usize,
+    pub on_time: usize,
+    pub early: usize,
+    pub late: usize,
+    pub missed: usize,
+    pub false_alarms: usize,
+    /// Mean latency over the threads that expected a yes and got one; `None` when none did.
+    pub mean: Option<f64>,
+    pub cases: Vec<ThreadLatency>,
+}
+
+/// Detection latency: for each conversation labelled per turn, the first turn the noul said yes,
+/// against the turn it should have. A thread with a prefix that errored is left out, because its
+/// first yes might be the one that is missing.
+fn latency_of(name: &str, rows: &[&Scored<'_>], threshold: f64) -> Option<Latency> {
+    let mut threads: Vec<(usize, Vec<&Scored<'_>>)> = Vec::new();
+    for row in rows {
+        let per_turn = matches!(
+            row.expects(name),
+            Some(Expectation::Noul {
+                by_turn: Some(_),
+                ..
+            })
+        );
+        if !per_turn || row.turn.is_none() {
+            continue;
+        }
+        match threads.iter_mut().find(|(line, _)| *line == row.line) {
+            Some((_, thread)) => thread.push(row),
+            None => threads.push((row.line, vec![row])),
+        }
+    }
+    if threads.is_empty() {
+        return None;
+    }
+    let mut cases = Vec::new();
+    let (mut on_time, mut early, mut late, mut missed, mut false_alarms) = (0, 0, 0, 0, 0);
+    let mut lags: Vec<f64> = Vec::new();
+    for (line, mut thread) in threads {
+        let first = thread[0];
+        if Some(thread.len()) != first.turns {
+            continue;
+        }
+        thread.sort_by_key(|row| row.turn);
+        let expected = match first.expects(name) {
+            Some(Expectation::Noul {
+                by_turn: Some(by_turn),
+                ..
+            }) => by_turn.turn(),
+            _ => None,
+        };
+        let detected = thread
+            .iter()
+            .find(|row| matches!(row.answer(name), Some(Answer::Noul(a)) if a.noul >= threshold))
+            .and_then(|row| row.turn);
+        let lag = match (expected, detected) {
+            (Some(k), Some(d)) => Some(d as i64 - k as i64),
+            _ => None,
+        };
+        match (expected, lag) {
+            (None, _) => {
+                if detected.is_some() {
+                    false_alarms += 1;
+                }
+            }
+            (Some(_), None) => missed += 1,
+            (Some(_), Some(lag)) => {
+                lags.push(lag as f64);
+                match lag.cmp(&0) {
+                    std::cmp::Ordering::Equal => on_time += 1,
+                    std::cmp::Ordering::Less => early += 1,
+                    std::cmp::Ordering::Greater => late += 1,
+                }
+            }
+        }
+        cases.push(ThreadLatency {
+            case: line,
+            id: first.id.map(str::to_owned),
+            expected,
+            detected,
+            latency: lag,
+        });
+    }
+    Some(Latency {
+        threads: cases.len(),
+        on_time,
+        early,
+        late,
+        missed,
+        false_alarms,
+        mean: (!lags.is_empty()).then(|| mean(lags.iter().copied())),
+        cases,
+    })
 }
 
 fn sweep_row(points: &[(f64, bool)], threshold: f64) -> SweepRow {
@@ -1037,9 +1308,13 @@ pub fn report_lines(report: &Report) -> Vec<Line<'static>> {
                 sweep,
                 best,
                 threshold,
+                latency,
                 ..
             } => {
                 out.extend(sweep_lines(sweep, *best, *threshold));
+                if let Some(latency) = latency {
+                    out.push(latency_line(latency));
+                }
             }
             QuestionReport::Choice {
                 gate,
@@ -1141,6 +1416,35 @@ fn sweep_lines(sweep: &[SweepRow], best: Best, threshold: f64) -> Vec<Line<'stat
     out
 }
 
+/// The one line that says when a noul noticed, over the conversations labelled per turn.
+fn latency_line(latency: &Latency) -> Line<'static> {
+    let counted = |n: usize, word: &str| format!("{n} {word}{}", plural(n));
+    let mean = match latency.mean {
+        None => "·".to_owned(),
+        Some(m) => format!(
+            "{} turn{}",
+            signed(m),
+            if m.abs() == 1.0 { "" } else { "s" }
+        ),
+    };
+    Line::from(vec![
+        Span::raw("    "),
+        dim("by turn  "),
+        Span::raw(
+            [
+                counted(latency.threads, "thread"),
+                format!("{} on time", latency.on_time),
+                format!("{} early", latency.early),
+                format!("{} late", latency.late),
+                format!("{} missed", latency.missed),
+                counted(latency.false_alarms, "false alarm"),
+                format!("mean latency {mean}"),
+            ]
+            .join(" · "),
+        ),
+    ])
+}
+
 fn gate_lines(gate: &[GateRow], accuracy: &str) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(vec![
         Span::raw("    "),
@@ -1213,7 +1517,10 @@ fn confusion_lines(labels: &[String], confusion: &[Vec<usize>]) -> Vec<Line<'sta
 }
 
 fn error_case_lines(failed: &CaseError, prefix: &str) -> Vec<Line<'static>> {
-    let name = format!("{prefix}{}", case_name(failed.case, failed.id.as_deref()));
+    let name = format!(
+        "{prefix}{}",
+        case_name(failed.case, failed.id.as_deref(), failed.turn)
+    );
     let mut parts = failed.message.split('\n');
     let first = parts.next().unwrap_or("").trim().to_owned();
     let mut out = vec![Line::from(vec![
@@ -1269,6 +1576,9 @@ pub fn report_json(report: &Report) -> Value {
         .map(|failed| {
             let mut out = serde_json::Map::new();
             out.insert("case".to_owned(), json!(failed.case));
+            if let Some(turn) = failed.turn {
+                out.insert("turn".to_owned(), json!(turn));
+            }
             if let Some(id) = &failed.id {
                 out.insert("id".to_owned(), json!(id));
             }
@@ -1296,8 +1606,10 @@ fn question_json(question: &QuestionReport) -> Value {
             accuracy,
             best,
             sweep,
+            latency,
             ..
-        } => json!({
+        } => {
+            let mut out = json!({
             "kind": question.kind(),
             "cases": cases,
             "brier": number(*brier),
@@ -1315,7 +1627,12 @@ fn question_json(question: &QuestionReport) -> Value {
                 "recall": maybe(row.recall),
                 "f1": number(row.f1),
             })).collect::<Vec<_>>(),
-        }),
+            });
+            if let (Some(latency), Value::Object(object)) = (latency, &mut out) {
+                object.insert("latency".to_owned(), latency_json(latency));
+            }
+            out
+        }
         QuestionReport::Choice {
             cases,
             accuracy,
@@ -1347,6 +1664,34 @@ fn question_json(question: &QuestionReport) -> Value {
             "gate": gate.iter().map(gate_json).collect::<Vec<_>>(),
         }),
     }
+}
+
+fn latency_json(latency: &Latency) -> Value {
+    let cases: Vec<Value> = latency
+        .cases
+        .iter()
+        .map(|one| {
+            let mut out = serde_json::Map::new();
+            out.insert("case".to_owned(), json!(one.case));
+            if let Some(id) = &one.id {
+                out.insert("id".to_owned(), json!(id));
+            }
+            out.insert("expected".to_owned(), json!(one.expected));
+            out.insert("detected".to_owned(), json!(one.detected));
+            out.insert("latency".to_owned(), json!(one.latency));
+            Value::Object(out)
+        })
+        .collect();
+    json!({
+        "threads": latency.threads,
+        "onTime": latency.on_time,
+        "early": latency.early,
+        "late": latency.late,
+        "missed": latency.missed,
+        "falseAlarms": latency.false_alarms,
+        "mean": maybe(latency.mean),
+        "cases": cases,
+    })
 }
 
 fn gate_json(row: &GateRow) -> Value {
@@ -1455,6 +1800,7 @@ pub struct McNemar {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Flip {
     pub case: usize,
+    pub turn: Option<usize>,
     pub id: Option<String>,
     /// What the case expects, and what each page predicted, in the question's own terms.
     pub expected: Value,
@@ -1691,12 +2037,12 @@ pub fn compare(a: Side<'_>, b: Side<'_>, options: CompareOptions) -> Comparison 
 
 /// Which case a scored row came from, so the same case can be found on the other page.
 fn key_of(one: &Scored<'_>) -> (usize, Option<usize>) {
-    (one.line, None)
+    (one.line, one.turn)
 }
 
 /// The same key, for a case that has not been scored.
 fn case_key(one: &Case) -> (usize, Option<usize>) {
-    (one.line, None)
+    (one.line, one.turn)
 }
 
 fn sum_usage(a: &ReportUsage, b: &ReportUsage, rates: Option<Rates>) -> ReportUsage {
@@ -1732,7 +2078,7 @@ fn shared(
         _ => 0.0,
     };
     let yes_of =
-        |row: &Scored<'_>| matches!(row.expects(name), Some(Expectation::Noul { yes: true }));
+        |row: &Scored<'_>| matches!(row.expects(name), Some(Expectation::Noul { yes: true, .. }));
     let choice_of = |row: &Scored<'_>| match row.answer(name) {
         Some(Answer::Choice(answer)) => answer.choice.clone(),
         _ => String::new(),
@@ -1867,6 +2213,7 @@ fn shared(
         };
         flips.push(Flip {
             case: pair.one.line,
+            turn: pair.one.turn,
             id: pair.one.id.map(str::to_owned),
             expected: pair.expected,
             a: pair.a,
@@ -2066,7 +2413,7 @@ fn shared_lines(question: &Shared, width: usize) -> Vec<Line<'static>> {
     let shown = &question.flips[..question.flips.len().min(FLIPS_SHOWN)];
     let names: Vec<String> = shown
         .iter()
-        .map(|flip| case_name(flip.case, flip.id.as_deref()))
+        .map(|flip| case_name(flip.case, flip.id.as_deref(), flip.turn))
         .collect();
     let moves: Vec<String> = shown
         .iter()
@@ -2139,12 +2486,12 @@ fn reading(kind: &str, value: &Value) -> String {
     }
 }
 
-/// `case 7 (t-007)`: the line in the cases file, and the id when the case has one.
-fn case_name(line: usize, id: Option<&str>) -> String {
-    match id {
-        Some(id) => format!("case {line} ({id})"),
-        None => format!("case {line}"),
-    }
+/// `case 7 turn 2 (t-007)`: the line in the cases file, the prefix of a case labelled per turn, and
+/// the id when the case has one.
+fn case_name(line: usize, id: Option<&str>, turn: Option<usize>) -> String {
+    let turn = turn.map(|t| format!(" turn {t}")).unwrap_or_default();
+    let id = id.map(|id| format!(" ({id})")).unwrap_or_default();
+    format!("case {line}{turn}{id}")
 }
 
 /// A change, signed either way, so a regression reads as one; `-0.00` is no change, so `+0.00`.
@@ -2188,6 +2535,9 @@ pub fn compare_json(comparison: &Comparison) -> Value {
             .map(|flip| {
                 let mut out = serde_json::Map::new();
                 out.insert("case".to_owned(), json!(flip.case));
+                if let Some(turn) = flip.turn {
+                    out.insert("turn".to_owned(), json!(turn));
+                }
                 if let Some(id) = &flip.id {
                     out.insert("id".to_owned(), json!(id));
                 }
