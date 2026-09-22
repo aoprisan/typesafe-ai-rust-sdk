@@ -541,9 +541,195 @@ fn lists_eval_and_its_flags_in_help() {
         "--min-accuracy",
         "--compare",
         "--fail-on-regression",
+        "--calibrate",
+        "--target-accuracy",
     ] {
         assert!(help.contains(flag), "{help}");
     }
+}
+
+#[test]
+fn writes_the_bars_the_run_supports_into_the_page_and_says_what_changed() {
+    with_files("calibrate", EVAL_CASES, |page, cases| {
+        let before = std::fs::read_to_string(page).expect("the page");
+        let args = ["eval", page, "--cases", cases, "--mock", "--calibrate"];
+        let first = jev(&args, "", &[]);
+        assert_eq!(first.status, 0, "{}", first.stderr);
+        assert!(
+            first.stdout.contains("calibration  target accuracy 0.90"),
+            "{}",
+            first.stdout
+        );
+        // The simulator is deterministic, so what these three cases support is fixed.
+        assert!(
+            first
+                .stdout
+                .contains("is_urgent    left alone         no threshold gives an F1 above 0"),
+            "{}",
+            first.stdout
+        );
+        assert!(
+            has_row(
+                &first.stdout,
+                &[
+                    "frustration",
+                    "@confidence 0.25",
+                    "was none",
+                    "accuracy 1.00"
+                ]
+            ),
+            "{}",
+            first.stdout
+        );
+        assert!(
+            first.stdout.contains(&format!("wrote 1 bar to {page}")),
+            "{}",
+            first.stdout
+        );
+        let after = std::fs::read_to_string(page).expect("the page");
+        assert!(
+            after.contains("  Calm < Frustrated but civil < Very angry\n  @confidence 0.25\n"),
+            "{after}"
+        );
+        // Only bar lines were added: take them out and the page is what it was.
+        let stripped: Vec<&str> = after
+            .split('\n')
+            .filter(|line| !line.trim_start().starts_with("@confidence"))
+            .collect();
+        assert_eq!(stripped.join("\n"), before);
+
+        let again = jev(&args, "", &[]);
+        assert!(
+            again.stdout.contains("nothing to write:"),
+            "{}",
+            again.stdout
+        );
+        assert_eq!(std::fs::read_to_string(page).expect("the page"), after);
+        assert!(
+            jev(&["check", page], "", &[])
+                .stdout
+                .contains("frustration (score, @confidence 0.25)")
+        );
+    });
+}
+
+#[test]
+fn adds_the_calibration_to_the_json_report() {
+    with_files("calibrate-json", EVAL_CASES, |page, cases| {
+        let out = jev(
+            &[
+                "eval",
+                page,
+                "--cases",
+                cases,
+                "--mock",
+                "--calibrate",
+                "--json",
+                "--target-accuracy",
+                "0.5",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        let report: Value = serde_json::from_str(&out.stdout).expect("a JSON report");
+        assert_eq!(report["calibration"]["page"], page);
+        assert_eq!(report["calibration"]["target"], 0.5);
+        let names: Vec<&String> = report["calibration"]["questions"]
+            .as_object()
+            .expect("questions")
+            .keys()
+            .collect();
+        assert_eq!(names, vec!["is_urgent", "department", "frustration"]);
+    });
+}
+
+#[test]
+fn reads_the_pages_own_threshold_everywhere_a_threshold_is_read() {
+    with_files("page-threshold", EVAL_CASES, |page, cases| {
+        std::fs::write(
+            page,
+            EVAL_PAGE.replace("urgency\n", "urgency\n  @threshold 0.35\n"),
+        )
+        .expect("the page");
+        let run = jev(
+            &["run", page, "--state", "A payout failed", "--mock"],
+            "",
+            &[],
+        );
+        assert!(run.stdout.contains("at threshold 0.35"), "{}", run.stdout);
+        let scored = jev(&["eval", page, "--cases", cases, "--mock"], "", &[]);
+        assert!(scored.stdout.contains("0.35 *"), "{}", scored.stdout);
+        let code = jev(&["rust", page], "", &[]);
+        assert!(
+            code.stdout.contains("is_urgent.is_yes(0.35)"),
+            "{}",
+            code.stdout
+        );
+    });
+}
+
+#[test]
+fn refuses_what_it_cannot_write_back() {
+    with_files("calibrate-usage", EVAL_CASES, |page, cases| {
+        let usage = |args: &[&str], input: &str, message: &str| {
+            let out = jev(args, input, &[]);
+            assert_eq!(out.status, 2, "{args:?}: {}", out.stderr);
+            assert!(out.stderr.contains(message), "{}", out.stderr);
+        };
+        usage(
+            &[
+                "eval",
+                page,
+                "--compare",
+                page,
+                "--cases",
+                cases,
+                "--calibrate",
+            ],
+            "",
+            "--calibrate and --compare do not mix: calibrate one page at a time.",
+        );
+        usage(
+            &["eval", "--cases", cases, "--calibrate"],
+            EVAL_PAGE,
+            "--calibrate writes the page back, so the page has to be a file, not stdin.",
+        );
+        usage(
+            &["eval", page, "--cases", cases, "--target-accuracy", "0.8"],
+            "",
+            "--target-accuracy only applies with --calibrate.",
+        );
+        usage(
+            &[
+                "eval",
+                page,
+                "--cases",
+                cases,
+                "--calibrate",
+                "--target-accuracy",
+                "2",
+            ],
+            "",
+            "--target-accuracy takes a number from 0 to 1.",
+        );
+        let body = jev(&["json", page], "", &[]).stdout;
+        std::fs::write(page, &body).expect("the body");
+        let refused = jev(
+            &["eval", page, "--cases", cases, "--mock", "--calibrate"],
+            "",
+            &[],
+        );
+        assert_eq!(refused.status, 1);
+        assert!(
+            refused.stderr.contains(
+                "jev eval: --calibrate needs a .jev page: a request body has nowhere to keep a bar."
+            ),
+            "{}",
+            refused.stderr
+        );
+        assert_eq!(std::fs::read_to_string(page).expect("the page"), body);
+    });
 }
 
 /// The candidate page: is_urgent asked another way, frustration dropped, sarcasm added.
@@ -1061,6 +1247,45 @@ async fn compares_two_pages_over_one_pool_one_preflight_and_one_cache() {
         refused.stderr
     );
     assert_eq!(asked(&server).await, 8);
+}
+
+#[tokio::test]
+async fn does_not_calibrate_over_a_run_with_errors() {
+    let server = answering_from_the_state().await;
+    let dir = scratch("live-calibrate");
+    let page = dir.join("page.jev");
+    std::fs::write(&page, PAGE_ONE).expect("the page");
+    let cases = live_cases(
+        "live-calibrate-cases",
+        &format!(
+            "{EVAL_LIVE_CASES}\n{}",
+            r#"{"id": "bad", "state": "refuse this one", "expect": {"is_urgent": true}}"#
+        ),
+    );
+    let out = tokio::process::Command::new(JEV)
+        .args([
+            "eval",
+            page.to_str().expect("a path"),
+            "--cases",
+            cases.to_str().expect("a path"),
+            "--calibrate",
+        ])
+        .env("TYPESAFE_API_KEY", "sk-test")
+        .env("TYPESAFE_BASE_URL", server.uri())
+        .env("JEV_PRICE", "")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("jev finishes");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "jev eval: not calibrating: 1 case came back with errors, so the numbers are incomplete."
+        ),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&page).expect("the page"), PAGE_ONE);
 }
 
 #[tokio::test]

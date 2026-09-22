@@ -27,7 +27,7 @@ use jev_repl::evaluate::{self, Outcome};
 use jev_repl::headless::Answered;
 use jev_repl::mcp::{self, Host, Sent};
 use jev_repl::session::Session;
-use jev_repl::{cost, headless, installer, serve, ui};
+use jev_repl::{cost, headless, installer, serve, sketch, ui};
 use typesafe::{Client, Usage};
 
 /// 0 when it worked, 1 when the call or the file did not, 2 when the command line did not parse.
@@ -112,7 +112,9 @@ fn help() -> String {
          \x20 --max-cost <dollars>   refuse to send when the estimate is above this\n\
          \x20 --min-accuracy <0-1>   exit 1 when a scored question falls below this\n\
          \x20 --compare <page>       run a second page over the same cases and report the difference\n\
-         \x20 --fail-on-regression   with --compare, exit 1 when the second page is significantly worse\n\n\
+         \x20 --fail-on-regression   with --compare, exit 1 when the second page is significantly worse\n\
+         \x20 --calibrate            write the thresholds and confidence bars the run supports into the page\n\
+         \x20 --target-accuracy <0-1>  the accuracy a confidence bar has to reach (default 0.9)\n\n\
          Exit status is 0 when it worked, 1 when the call or the file did not, 2 when the\n\
          command line did not parse.\n"
     )
@@ -140,6 +142,9 @@ struct Options {
     /// `jev eval --compare`: the second page, and whether a regression fails the run.
     compare: Option<String>,
     fail_on_regression: bool,
+    /// `jev eval --calibrate`: write the bars back into the page, aiming at this accuracy.
+    calibrate: bool,
+    target_accuracy: Option<f64>,
 }
 
 /// Read the flags after a subcommand. `--flag value` and `--flag=value` both work, and the first
@@ -229,6 +234,14 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             }
             "--compare" => options.compare = Some(value()?),
             "--fail-on-regression" => options.fail_on_regression = true,
+            "--calibrate" => options.calibrate = true,
+            "--target-accuracy" => {
+                let target: f64 = value()?.parse().unwrap_or(f64::NAN);
+                if !(0.0..=1.0).contains(&target) {
+                    return Err("--target-accuracy takes a number from 0 to 1.".to_owned());
+                }
+                options.target_accuracy = Some(target);
+            }
             "--mock" => options.mock = true,
             "--json" => options.json = true,
             other => {
@@ -279,6 +292,19 @@ fn check_eval_options(options: &Options) -> Result<(), String> {
         return Err(
             "--fail-on-regression needs --compare: there is nothing to regress from.".to_owned(),
         );
+    }
+    if options.calibrate && options.compare.is_some() {
+        return Err(
+            "--calibrate and --compare do not mix: calibrate one page at a time.".to_owned(),
+        );
+    }
+    if options.calibrate && options.file == "-" {
+        return Err(
+            "--calibrate writes the page back, so the page has to be a file, not stdin.".to_owned(),
+        );
+    }
+    if options.target_accuracy.is_some() && !options.calibrate {
+        return Err("--target-accuracy only applies with --calibrate.".to_owned());
     }
     Ok(())
 }
@@ -366,7 +392,13 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
         .unwrap_or_else(|| "jev-latest".to_owned());
 
     if command == "eval" {
-        return run_eval(session, &options, &model, client).await;
+        if options.calibrate && text.trim_start().starts_with('{') {
+            eprintln!(
+                "jev eval: --calibrate needs a .jev page: a request body has nowhere to keep a bar."
+            );
+            return FAILED;
+        }
+        return run_eval(session, &text, &options, &model, client).await;
     }
 
     match command {
@@ -398,7 +430,10 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
         if options.json {
             print!("{}", headless::answers_json(&answers, &model, None));
         } else {
-            print!("{}", headless::answers_text(&answers, options.threshold));
+            print!(
+                "{}",
+                headless::session_answers_text(&answers, options.threshold, &session)
+            );
             print!(
                 "{}",
                 headless::usage_text(&session, &model, options.rates, None)
@@ -425,7 +460,10 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
                     headless::answers_json(&answers, &model, Some(&response.raw))
                 );
             } else {
-                print!("{}", headless::answers_text(&answers, options.threshold));
+                print!(
+                    "{}",
+                    headless::session_answers_text(&answers, options.threshold, &session)
+                );
                 print!(
                     "{}",
                     headless::usage_text(&session, &model, options.rates, Some(&response.usage))
@@ -851,7 +889,13 @@ async fn run_eval_compare(
 ///
 /// The order matters. Nothing is sent until the cases have parsed and the estimate has been shown,
 /// because a cases file is the one input that turns a typo into a bill.
-async fn run_eval(session: Session, options: &Options, model: &str, client: Option<Client>) -> u8 {
+async fn run_eval(
+    session: Session,
+    page: &str,
+    options: &Options,
+    model: &str,
+    client: Option<Client>,
+) -> u8 {
     let text = match read_input(options.cases.as_deref().unwrap_or("-")) {
         Ok(text) => text,
         Err(e) => {
@@ -898,21 +942,59 @@ async fn run_eval(session: Session, options: &Options, model: &str, client: Opti
             rates: options.rates,
         },
     );
+    let mut code = if report.errors.is_empty() { OK } else { FAILED };
+
+    // Calibration writes before it prints, so the report never claims a file it failed to write.
+    let calibration = (options.calibrate && report.errors.is_empty()).then(|| {
+        evaluate::calibrate(
+            &session,
+            &cases,
+            &outcomes,
+            &report,
+            options.target_accuracy.unwrap_or(evaluate::DEFAULT_TARGET),
+        )
+    });
+    let mut written = true;
+    if let Some(calibration) = &calibration
+        && !calibration.changed.is_empty()
+        && let Err(e) = std::fs::write(&options.file, sketch::set_bars(page, &calibration.changed))
+    {
+        eprintln!("jev eval: could not write {}: {e}", options.file);
+        written = false;
+        code = FAILED;
+    }
+    let shown = calibration.filter(|_| written);
+
     if options.json {
+        let mut json = evaluate::report_json(&report);
+        if let (Some(shown), Value::Object(object)) = (&shown, &mut json) {
+            object.insert(
+                "calibration".to_owned(),
+                Value::Object(evaluate::calibration_json(shown, &options.file)),
+            );
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&evaluate::report_json(&report)).unwrap_or_default()
+            serde_json::to_string_pretty(&json).unwrap_or_default()
         );
     } else {
         print!("{}", evaluate::report_text(&report));
+        if let Some(shown) = &shown {
+            print!("\n{}", evaluate::calibration_text(shown, &options.file));
+        }
     }
     if !live {
         eprintln!(
             "Simulated answers: deterministic noise, not judgement. Set TYPESAFE_API_KEY for real ones."
         );
     }
+    if options.calibrate && !report.errors.is_empty() {
+        eprintln!(
+            "jev eval: {}",
+            evaluate::not_calibrating(report.errors.len())
+        );
+    }
 
-    let mut code = if report.errors.is_empty() { OK } else { FAILED };
     if let Some(bar) = options.min_accuracy {
         for (name, accuracy) in evaluate::below_bar(&report, bar) {
             eprintln!(

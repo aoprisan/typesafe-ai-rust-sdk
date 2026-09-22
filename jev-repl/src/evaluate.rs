@@ -267,6 +267,7 @@ pub fn with_state(session: &Session, state: Value) -> Session {
         state,
         questions: session.questions.clone(),
         model: session.model.clone(),
+        bars: session.bars.clone(),
     }
 }
 
@@ -422,7 +423,9 @@ pub enum QuestionReport {
         cases: usize,
         /// Mean squared error of the probability itself, threshold or no threshold.
         brier: f64,
-        /// Accuracy at the threshold this run was asked to use.
+        /// What it was read at: the page's `@threshold`, or the run's threshold when it has none.
+        threshold: f64,
+        /// Accuracy at that threshold.
         accuracy: f64,
         best: Best,
         sweep: Vec<SweepRow>,
@@ -567,7 +570,11 @@ pub fn report(
             continue;
         }
         match question {
-            Question::Noul(_) => questions.push(noul_report(name, &rows, options.threshold)),
+            Question::Noul(_) => questions.push(noul_report(
+                name,
+                &rows,
+                session.threshold_of(name, options.threshold),
+            )),
             Question::Choice(q) => questions.push(choice_report(name, q, &rows)),
             Question::Score(_) => questions.push(score_report(name, &rows)),
             _ => {}
@@ -706,6 +713,7 @@ fn noul_report(name: &str, rows: &[&Scored<'_>], threshold: f64) -> QuestionRepo
         name: name.to_owned(),
         cases: points.len(),
         brier,
+        threshold,
         accuracy,
         best,
         sweep,
@@ -836,8 +844,13 @@ fn score_report(name: &str, rows: &[&Scored<'_>]) -> QuestionReport {
 
 /// Coverage and accuracy at each cut: what you buy by only acting on confident answers.
 fn gate(points: impl Iterator<Item = (f64, bool)>) -> Vec<GateRow> {
+    gate_at(points, &CUTS)
+}
+
+/// The gate at any set of cuts: the report reads five, calibration twenty.
+fn gate_at(points: impl Iterator<Item = (f64, bool)>, cuts: &[f64]) -> Vec<GateRow> {
     let points: Vec<(f64, bool)> = points.collect();
-    CUTS.iter()
+    cuts.iter()
         .map(|confidence| {
             let kept: Vec<bool> = points
                 .iter()
@@ -1020,8 +1033,13 @@ pub fn report_lines(report: &Report) -> Vec<Line<'static>> {
         }
         out.push(header_line(question, width));
         match question {
-            QuestionReport::Noul { sweep, best, .. } => {
-                out.extend(sweep_lines(sweep, *best, report.threshold));
+            QuestionReport::Noul {
+                sweep,
+                best,
+                threshold,
+                ..
+            } => {
+                out.extend(sweep_lines(sweep, *best, *threshold));
             }
             QuestionReport::Choice {
                 gate,
@@ -1274,6 +1292,7 @@ fn question_json(question: &QuestionReport) -> Value {
         QuestionReport::Noul {
             cases,
             brier,
+            threshold,
             accuracy,
             best,
             sweep,
@@ -1282,6 +1301,7 @@ fn question_json(question: &QuestionReport) -> Value {
             "kind": question.kind(),
             "cases": cases,
             "brier": number(*brier),
+            "threshold": number(*threshold),
             "accuracy": number(*accuracy),
             "best": {"threshold": number(best.threshold), "f1": number(best.f1)},
             "sweep": sweep.iter().map(|row| json!({
@@ -1626,8 +1646,8 @@ pub fn compare(a: Side<'_>, b: Side<'_>, options: CompareOptions) -> Comparison 
             name,
             kind,
             &pairs,
-            options.threshold,
-            options.threshold,
+            a.session.threshold_of(name, options.threshold),
+            b.session.threshold_of(name, options.threshold),
         ));
     }
 
@@ -2231,4 +2251,248 @@ pub fn compare_json(comparison: &Comparison) -> Value {
 /// The comparison as the plain text a pipe wants.
 pub fn compare_text(comparison: &Comparison) -> String {
     lines_text(compare_lines(comparison))
+}
+
+// ---- writing the bars back --------------------------------------------------------------------
+
+/// The accuracy a choice's or score's bar has to reach when `--target-accuracy` is not given.
+pub const DEFAULT_TARGET: f64 = 0.9;
+
+/// The confidence bars calibration tries, `k / 20` for `k` from 0 to 19: finer than the report's
+/// gate, and computed by division so each prints as the short decimal it is.
+pub fn calibration_cuts() -> Vec<f64> {
+    (0..20).map(|k| f64::from(k) / 20.0).collect()
+}
+
+/// What calibration made of one question: the bar it found, or why it left the question alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalibratedQuestion {
+    pub name: String,
+    pub kind: &'static str,
+    /// The new bar; `None` when the question is left alone.
+    pub bar: Option<f64>,
+    /// The bar the page had before.
+    pub was: Option<f64>,
+    /// For a noul: the F1 at the new threshold.
+    pub f1: Option<f64>,
+    /// For a choice or a score: the accuracy over the cases that clear the new bar, and how many
+    /// do.
+    pub accuracy: Option<f64>,
+    pub coverage: Option<f64>,
+    /// Why the question was left alone.
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Calibration {
+    pub target: f64,
+    pub questions: Vec<CalibratedQuestion>,
+    /// Only the bars that changed: what `sketch::set_bars` has to write.
+    pub changed: Vec<(String, f64)>,
+}
+
+/// The bars a run supports, one per scored question.
+///
+/// A noul gets the threshold with the best F1, which the report has already found. A choice or a
+/// score gets the lowest confidence bar at which the answers it lets through are right at least
+/// `target` of the time: the lowest, because every step up sends more of the work to a person.
+pub fn calibrate(
+    session: &Session,
+    cases: &[Case],
+    outcomes: &[Outcome],
+    scored_report: &Report,
+    target: f64,
+) -> Calibration {
+    let (_, scored) = scored_of(cases, outcomes);
+    let mut questions = Vec::new();
+    let mut changed = Vec::new();
+    for question in &scored_report.questions {
+        let name = question.name();
+        let mut found = CalibratedQuestion {
+            name: name.to_owned(),
+            kind: question.kind(),
+            bar: None,
+            was: session.bar(name),
+            f1: None,
+            accuracy: None,
+            coverage: None,
+            reason: None,
+        };
+        if let QuestionReport::Noul { best, .. } = question {
+            if best.f1 > 0.0 {
+                found.bar = Some(best.threshold);
+                found.f1 = Some(best.f1);
+            } else {
+                found.reason = Some("no threshold gives an F1 above 0".to_owned());
+            }
+        } else {
+            let points = scored.iter().filter_map(|one| {
+                let expectation = one.expects(name)?;
+                match (one.answer(name)?, expectation) {
+                    (Answer::Choice(answer), Expectation::Choice { label }) => {
+                        Some((answer.confidence, answer.choice == *label))
+                    }
+                    (Answer::Score(answer), Expectation::Score { level }) => {
+                        Some((answer.confidence, answer.rounded_level() as usize == *level))
+                    }
+                    _ => None,
+                }
+            });
+            let rows = gate_at(points, &calibration_cuts());
+            let reached = rows
+                .iter()
+                .find(|row| row.accuracy.is_some_and(|accuracy| accuracy >= target));
+            match reached {
+                Some(row) => {
+                    found.bar = Some(row.confidence);
+                    found.accuracy = row.accuracy;
+                    found.coverage = Some(row.coverage);
+                }
+                None => {
+                    let mut best: Option<&GateRow> = None;
+                    for row in &rows {
+                        if let Some(accuracy) = row.accuracy
+                            && best.is_none_or(|b| accuracy > b.accuracy.unwrap_or(0.0))
+                        {
+                            best = Some(row);
+                        }
+                    }
+                    found.reason = Some(match best {
+                        None => format!("no confidence bar reaches accuracy {}", two(target)),
+                        Some(row) => format!(
+                            "no confidence bar reaches accuracy {} (best {} at {})",
+                            two(target),
+                            two(row.accuracy.unwrap_or(0.0)),
+                            two(row.confidence)
+                        ),
+                    });
+                }
+            }
+        }
+        if let Some(bar) = found.bar
+            && found.was != Some(bar)
+        {
+            changed.push((found.name.clone(), bar));
+        }
+        questions.push(found);
+    }
+    Calibration {
+        target,
+        questions,
+        changed,
+    }
+}
+
+/// Why a run with errors writes nothing back: the bars would be fitted to the cases that worked.
+pub fn not_calibrating(errors: usize) -> String {
+    format!(
+        "not calibrating: {errors} case{} back with errors, so the numbers are incomplete.",
+        if errors == 1 { " came" } else { "s came" }
+    )
+}
+
+/// The directive a question's bar is written with.
+fn directive_of(kind: &str) -> &'static str {
+    if kind == "noul" {
+        "@threshold"
+    } else {
+        "@confidence"
+    }
+}
+
+/// What calibration changed, as lines for under the report: one per question, the new directive as
+/// it now reads on the page, what it replaced, and the evidence for it.
+pub fn calibration_lines(calibration: &Calibration, page: &str) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(vec![
+        Span::raw("  "),
+        bold("calibration"),
+        dim(format!("  target accuracy {}", two(calibration.target))),
+    ])];
+    let width = calibration
+        .questions
+        .iter()
+        .map(|q| q.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for question in &calibration.questions {
+        let mut spans = vec![
+            Span::raw("    "),
+            bold(pad_end(&question.name, width)),
+            Span::raw("  "),
+        ];
+        match question.bar {
+            None => {
+                spans.push(dim(pad_end("left alone", 19)));
+                spans.push(dim(question.reason.clone().unwrap_or_default()));
+            }
+            Some(bar) => {
+                let was = match question.was {
+                    Some(was) if was == bar => "unchanged".to_owned(),
+                    Some(was) => format!("was {was}"),
+                    None => "was none".to_owned(),
+                };
+                let evidence = if question.kind == "noul" {
+                    format!("f1 {}", two(question.f1.unwrap_or(0.0)))
+                } else {
+                    format!(
+                        "accuracy {} over {} of cases",
+                        two(question.accuracy.unwrap_or(0.0)),
+                        two(question.coverage.unwrap_or(0.0))
+                    )
+                };
+                spans.push(Span::styled(
+                    pad_end(&format!("{} {bar}", directive_of(question.kind)), 19),
+                    Style::new().fg(color_for(question.kind)),
+                ));
+                spans.push(dim(pad_end(&was, 11)));
+                spans.push(Span::raw(evidence));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+    let n = calibration.changed.len();
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        if n == 0 {
+            dim(format!("nothing to write: {page} already holds these bars"))
+        } else {
+            Span::raw(format!("wrote {n} bar{} to {page}", plural(n)))
+        },
+    ]));
+    out
+}
+
+/// The calibration as plain text, for under the report.
+pub fn calibration_text(calibration: &Calibration, page: &str) -> String {
+    lines_text(calibration_lines(calibration, page))
+}
+
+/// The calibration as JSON, for the report's `calibration` key.
+pub fn calibration_json(calibration: &Calibration, page: &str) -> serde_json::Map<String, Value> {
+    let mut questions = serde_json::Map::new();
+    for question in &calibration.questions {
+        let mut out = serde_json::Map::new();
+        out.insert("kind".to_owned(), json!(question.kind));
+        out.insert("bar".to_owned(), maybe(question.bar));
+        out.insert("was".to_owned(), maybe(question.was));
+        if let Some(f1) = question.f1 {
+            out.insert("f1".to_owned(), number(f1));
+        }
+        if let Some(accuracy) = question.accuracy {
+            out.insert("accuracy".to_owned(), number(accuracy));
+        }
+        if let Some(coverage) = question.coverage {
+            out.insert("coverage".to_owned(), number(coverage));
+        }
+        if let Some(reason) = &question.reason {
+            out.insert("reason".to_owned(), json!(reason));
+        }
+        questions.insert(question.name.clone(), Value::Object(out));
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("page".to_owned(), json!(page));
+    out.insert("target".to_owned(), number(calibration.target));
+    out.insert("written".to_owned(), json!(!calibration.changed.is_empty()));
+    out.insert("questions".to_owned(), Value::Object(questions));
+    out
 }

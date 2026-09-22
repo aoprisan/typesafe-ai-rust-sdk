@@ -230,6 +230,20 @@ pub fn tools() -> Value {
                              difference: deltas per question, the cases whose answer flipped, and \
                              an exact McNemar test.",
                     },
+                    "calibrate": {
+                        "type": "boolean",
+                        "description":
+                            "Also return the page with the bars this run supports written in: \
+                             each noul's best-F1 @threshold, and the lowest @confidence at which a \
+                             choice or score reaches targetAccuracy. Nothing else on the page \
+                             changes.",
+                    },
+                    "targetAccuracy": {
+                        "type": "number",
+                        "description": "The accuracy a confidence bar has to reach. Defaults to 0.9.",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
                     "json": {
                         "type": "boolean",
                         "description": "Return the report as JSON instead of a table.",
@@ -366,7 +380,7 @@ async fn ask(args: &Value, host: &Host) -> Result<ToolResult, String> {
             sent.raw.as_ref(),
         )));
     }
-    let mut text = headless::answers_text(&answers, threshold);
+    let mut text = headless::session_answers_text(&answers, threshold, &session);
     text.push_str(&headless::usage_text(
         &session,
         &model,
@@ -400,6 +414,21 @@ async fn score(args: &Value, host: &Host) -> Result<ToolResult, String> {
     if cases.is_empty() {
         return Err("cases is empty: nothing to score.".to_owned());
     }
+    let calibrating = bool_arg(args, "calibrate")?;
+    let target = match args.get("targetAccuracy") {
+        None | Some(Value::Null) => evaluate::DEFAULT_TARGET,
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
+        Some(_) => return Err("targetAccuracy must be a number.".to_owned()),
+    };
+    if !(0.0..=1.0).contains(&target) {
+        return Err("targetAccuracy must be from 0 to 1.".to_owned());
+    }
+    let page = string_arg(args, "page")?;
+    if calibrating && page.trim_start().starts_with('{') {
+        return Err(
+            "calibrate needs a .jev page: a request body has nowhere to keep a bar.".to_owned(),
+        );
+    }
     let json_wanted = bool_arg(args, "json")?;
 
     let outcomes = evaluate::run(&session, &cases, asker(host), concurrency).await;
@@ -413,12 +442,38 @@ async fn score(args: &Value, host: &Host) -> Result<ToolResult, String> {
             rates,
         },
     );
+    let calibration = (calibrating && report.errors.is_empty())
+        .then(|| evaluate::calibrate(&session, &cases, &outcomes, &report, target));
+    let calibrated = calibration
+        .as_ref()
+        .map(|c| sketch::set_bars(&page, &c.changed));
+    let refused = calibrating && calibration.is_none();
+    let why = evaluate::not_calibrating(report.errors.len());
+
     if json_wanted {
-        let body = serde_json::to_string_pretty(&evaluate::report_json(&report))
-            .map_err(|e| e.to_string())?;
+        let mut json = evaluate::report_json(&report);
+        if let Value::Object(object) = &mut json {
+            if let (Some(calibration), Some(text)) = (&calibration, &calibrated) {
+                let mut value = evaluate::calibration_json(calibration, "page");
+                value.insert("text".to_owned(), Value::String(text.clone()));
+                object.insert("calibration".to_owned(), Value::Object(value));
+            }
+            if refused {
+                object.insert("calibration".to_owned(), json!({ "refused": why }));
+            }
+        }
+        let body = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
         return Ok(ToolResult::ok(format!("{body}\n")));
     }
     let mut text = evaluate::report_text(&report);
+    if let (Some(calibration), Some(page)) = (&calibration, &calibrated) {
+        text.push('\n');
+        text.push_str(&evaluate::calibration_text(calibration, "the page"));
+        text.push_str(&format!("\n# the page, calibrated\n\n{page}"));
+    }
+    if refused {
+        text.push_str(&format!("\n{why}\n"));
+    }
     if !host.live {
         text.push_str(SIMULATED);
     }

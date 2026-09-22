@@ -625,7 +625,11 @@ fn sketch(frame: &mut Frame, area: Rect, app: &mut App) {
                 for (name, q) in &session.questions {
                     let json = serde_json::to_value(q).unwrap_or_default();
                     match mock::answer(&session.state, name, &json) {
-                        Some(a) => preview.extend(answer_lines(name, &a, threshold)),
+                        Some(a) => preview.extend(answer_lines(
+                            name,
+                            &a,
+                            session.threshold_of(name, threshold),
+                        )),
                         None => preview.push(Line::from(dim(format!(
                             "  {name}: no simulation for this question shape"
                         )))),
@@ -699,6 +703,9 @@ fn hint_for(tag: Tag, below_rule: bool) -> &'static str {
         Tag::Level => "a level — write them lowest to highest, joined with <",
         Tag::Raw => "raw — a JSON object sent as it is; it needs a `type`",
         Tag::Json => "continues the raw JSON above",
+        Tag::Bar => {
+            "a bar — @threshold is where a noul reads as yes; @confidence is how sure a choice or score must be to act on"
+        }
         Tag::Stray => "this line could not be placed",
     }
 }

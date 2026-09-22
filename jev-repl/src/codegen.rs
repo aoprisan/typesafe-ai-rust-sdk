@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 
+use crate::evaluate;
 use crate::session::Session;
 
 pub fn rust(session: &Session, model: &str, threshold: f64) -> String {
@@ -32,7 +33,7 @@ pub fn rust(session: &Session, model: &str, threshold: f64) -> String {
         out.push_str("    // add questions in the REPL and run :rust again\n");
     }
     for (name, q) in &questions {
-        out.push_str(&reader(name, q, threshold));
+        out.push_str(&reader(name, q, session.bar(name), threshold));
     }
     out.push_str("\n    Ok(())\n}\n");
 
@@ -105,24 +106,70 @@ fn builder(q: &Value, indent: usize) -> String {
     }
 }
 
-fn reader(name: &str, q: &Value, threshold: f64) -> String {
+/// What a choice is gated at when the page names no bar: the README's rule of thumb.
+const CHOICE_GATE: f64 = 0.6;
+
+/// A threshold as code: two decimals, the way it has always been printed, unless that would change
+/// it — a bar someone wrote as `0.625` is `0.625` in the program too.
+fn threshold_literal(t: f64) -> String {
+    let fixed = evaluate::two(t);
+    if fixed.parse::<f64>().ok() == Some(t) {
+        fixed
+    } else {
+        format!("{t}")
+    }
+}
+
+/// A float literal Rust reads as an `f64`: `0.7` stays `0.7`, but `1` has to be `1.0`.
+fn float_literal(n: f64) -> String {
+    let text = format!("{n}");
+    if text.contains(['.', 'e']) {
+        text
+    } else {
+        format!("{text}.0")
+    }
+}
+
+/// How one answer is read back: a noul at its threshold, a choice (and a score with a bar) gated
+/// on confidence. `bar` is the page's `@threshold` or `@confidence` for this question.
+fn reader(name: &str, q: &Value, bar: Option<f64>, threshold: f64) -> String {
     match kind(q) {
-        "noul" => format!(
-            "    let {name} = res.noul({name:?}).expect(\"asked\");\n\
-             \x20   println!(\"{name}: {{:.2}} → {{}}\", {name}.noul, {name}.is_yes({threshold:.2}));\n"
-        ),
-        "choice" => format!(
-            "    let {name} = res.choice({name:?}).expect(\"asked\");\n\
-             \x20   if {name}.confidence >= 0.6 {{\n\
-             \x20       println!(\"{name}: {{}}\", {name}.choice);\n\
-             \x20   }} else {{\n\
-             \x20       println!(\"{name}: unsure ({{:.2}}), send to a human\", {name}.confidence);\n\
-             \x20   }}\n"
-        ),
-        "score" => format!(
-            "    let {name} = res.score({name:?}).expect(\"asked\");\n\
-             \x20   println!(\"{name}: {{:.2}} of {{}} (confidence {{:.2}})\", {name}.score, {name}.legend.len() - 1, {name}.confidence);\n"
-        ),
+        "noul" => {
+            let cut = threshold_literal(bar.unwrap_or(threshold));
+            format!(
+                "    let {name} = res.noul({name:?}).expect(\"asked\");\n\
+                 \x20   println!(\"{name}: {{:.2}} → {{}}\", {name}.noul, {name}.is_yes({cut}));\n"
+            )
+        }
+        "choice" => {
+            let gate = float_literal(bar.unwrap_or(CHOICE_GATE));
+            format!(
+                "    let {name} = res.choice({name:?}).expect(\"asked\");\n\
+                 \x20   if {name}.confidence >= {gate} {{\n\
+                 \x20       println!(\"{name}: {{}}\", {name}.choice);\n\
+                 \x20   }} else {{\n\
+                 \x20       println!(\"{name}: unsure ({{:.2}}), send to a human\", {name}.confidence);\n\
+                 \x20   }}\n"
+            )
+        }
+        // A score with a bar is gated like a choice: act above it, hand the rest to a person.
+        "score" => match bar {
+            Some(bar) => {
+                let gate = float_literal(bar);
+                format!(
+                    "    let {name} = res.score({name:?}).expect(\"asked\");\n\
+                     \x20   if {name}.confidence >= {gate} {{\n\
+                     \x20       println!(\"{name}: {{:.2}} of {{}} (confidence {{:.2}})\", {name}.score, {name}.legend.len() - 1, {name}.confidence);\n\
+                     \x20   }} else {{\n\
+                     \x20       println!(\"{name}: unsure ({{:.2}}), send to a human\", {name}.confidence);\n\
+                     \x20   }}\n"
+                )
+            }
+            None => format!(
+                "    let {name} = res.score({name:?}).expect(\"asked\");\n\
+                 \x20   println!(\"{name}: {{:.2}} of {{}} (confidence {{:.2}})\", {name}.score, {name}.legend.len() - 1, {name}.confidence);\n"
+            ),
+        },
         _ => format!("    // {name}: a raw question — read it from res.raw\n"),
     }
 }

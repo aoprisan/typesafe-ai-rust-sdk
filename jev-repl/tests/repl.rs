@@ -180,6 +180,39 @@ fn generated_rust_reflects_the_session() {
 }
 
 #[test]
+fn gates_on_the_pages_own_bars_instead_of_the_hard_coded_ones() {
+    let mut app = app();
+    app.exec(":preset triage");
+    let plain = codegen::rust(&app.session, "jev-2", 0.5);
+    assert!(
+        plain.contains("if department.confidence >= 0.6 {"),
+        "{plain}"
+    );
+    assert!(!plain.contains("frustration.confidence >= "), "{plain}");
+    app.session.set_bar("is_urgent", 0.625);
+    app.session.set_bar("department", 0.75);
+    app.session.set_bar("frustration", 1.0);
+    let rust = codegen::rust(&app.session, "jev-2", 0.5);
+    assert!(rust.contains("is_yes(0.625)"), "{rust}");
+    assert!(
+        rust.contains("if department.confidence >= 0.75 {"),
+        "{rust}"
+    );
+    assert!(
+        rust.contains("if frustration.confidence >= 1.0 {"),
+        "{rust}"
+    );
+    assert!(
+        rust.contains(
+            "println!(\"frustration: unsure ({:.2}), send to a human\", frustration.confidence);"
+        ),
+        "{rust}"
+    );
+    app.session.set_bar("is_urgent", 0.7);
+    assert!(codegen::rust(&app.session, "jev-2", 0.5).contains("is_yes(0.70)"));
+}
+
+#[test]
 fn saved_sessions_round_trip() {
     let mut app = app();
     app.exec(":preset moderation");

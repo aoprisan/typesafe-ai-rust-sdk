@@ -936,10 +936,18 @@ impl App {
 
     /// Replace the session with a parsed page and say what changed.
     fn apply_sketch(&mut self, parsed: &sketch::Parsed, text: &str) {
-        let before = self.session.request_json(&self.model_name());
+        // The bars are on the page but not on the wire, so they count as a change of their own.
+        let snapshot = |app: &Self| {
+            format!(
+                "{}{:?}",
+                app.session.request_json(&app.model_name()),
+                app.session.bars
+            )
+        };
+        let before = snapshot(self);
         // The page is the whole request: no `@model` line means the client default.
         self.session = parsed.to_session();
-        let after = self.session.request_json(&self.model_name());
+        let after = snapshot(self);
         self.blank();
         self.push(Line::from(vec![
             Span::styled("› ", Style::new().fg(ACCENT)),
@@ -1278,8 +1286,8 @@ impl App {
             ),
             dim(format!("simulated · {}", self.model_name())),
         ]));
-        let threshold = self.threshold;
         for (name, answer) in &answers {
+            let threshold = self.session.threshold_of(name, self.threshold);
             match answer {
                 Some(a) => self.extend(answer_lines(name, a, threshold)),
                 None => self.warn(format!(
@@ -1330,13 +1338,13 @@ impl App {
                 }
             )),
         ]));
-        let threshold = self.threshold;
         let answers: Vec<(String, Answer)> = res
             .answers
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         for (name, answer) in &answers {
+            let threshold = self.session.threshold_of(name, self.threshold);
             self.extend(answer_lines(name, answer, threshold));
         }
         if let Some(id) = res.request_id() {

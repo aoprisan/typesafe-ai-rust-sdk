@@ -1352,3 +1352,282 @@ fn writes_decimals_the_way_to_fixed_does_even_off_a_tie() {
     assert_eq!(evaluate::signed(0.05), "+0.05");
     assert_eq!(evaluate::signed(-0.5), "-0.50");
 }
+
+// ---- the page's own bars, and writing them back -----------------------------------------------
+
+fn barred() -> Session {
+    let mut s = session();
+    s.set_bar("is_urgent", 0.8);
+    s
+}
+
+#[test]
+fn stars_and_scores_the_pages_threshold_not_the_runs() {
+    let s = barred();
+    let report = evaluate::report(
+        &s,
+        &cases(&URGENT.join("\n"), &s),
+        &[0.9, 0.7, 0.3, 0.1]
+            .iter()
+            .map(|p| answered(&[("is_urgent", noul(*p))], None))
+            .collect::<Vec<_>>(),
+        ReportOptions {
+            model: "jev-latest",
+            threshold: 0.5,
+            rates: None,
+        },
+    );
+    let QuestionReport::Noul {
+        threshold,
+        accuracy,
+        ..
+    } = question(&report, "is_urgent")
+    else {
+        panic!("is_urgent is a noul")
+    };
+    assert_eq!((*threshold, *accuracy), (0.8, 0.5));
+    let text = evaluate::report_text(&report);
+    assert!(
+        text.lines()
+            .any(|l| l.trim_start().starts_with("0.80 *") && l.contains("0.50")),
+        "{text}"
+    );
+    assert!(!text.contains("0.50 *"), "{text}");
+    let json = evaluate::report_json(&report);
+    assert_eq!(json["threshold"], 0.5);
+    let keys: Vec<&String> = json["questions"]["is_urgent"]
+        .as_object()
+        .expect("an object")
+        .keys()
+        .take(5)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["kind", "cases", "brier", "threshold", "accuracy"]
+    );
+}
+
+#[test]
+fn compares_each_page_at_its_own_threshold() {
+    let (a, b) = (session(), barred());
+    let (left, right) =
+        evaluate::parse_compare_cases(&URGENT.join("\n"), &a, &b, LABELS).expect("they parse");
+    let outcomes: Vec<Outcome> = [0.9, 0.7, 0.3, 0.1]
+        .iter()
+        .map(|p| answered(&[("is_urgent", noul(*p))], None))
+        .collect();
+    let comparison = evaluate::compare(
+        evaluate::Side {
+            label: "a",
+            session: &a,
+            cases: &left,
+            outcomes: &outcomes,
+            model: "m",
+        },
+        evaluate::Side {
+            label: "b",
+            session: &b,
+            cases: &right,
+            outcomes: &outcomes,
+            model: "m",
+        },
+        evaluate::CompareOptions {
+            threshold: 0.5,
+            rates: None,
+        },
+    );
+    let urgent = &comparison.questions[0];
+    assert_eq!(
+        (
+            urgent.metrics[0].key,
+            urgent.metrics[0].a,
+            urgent.metrics[0].b
+        ),
+        ("threshold", 0.5, 0.8)
+    );
+    // 0.7 is a yes at 0.5 and a no at 0.8, and the case expects a yes.
+    assert_eq!(
+        urgent.flips,
+        vec![evaluate::Flip {
+            case: 2,
+            id: None,
+            expected: json!(true),
+            a: json!(true),
+            b: json!(false),
+            status: "broke",
+        }]
+    );
+}
+
+const CALIBRATED: [&str; 4] = [
+    r#"{"state": "a", "expect": {"is_urgent": true, "department": "billing", "frustration": 0}}"#,
+    r#"{"state": "b", "expect": {"is_urgent": true, "department": "billing", "frustration": 1}}"#,
+    r#"{"state": "c", "expect": {"is_urgent": false, "department": "technical", "frustration": 2}}"#,
+    r#"{"state": "d", "expect": {"is_urgent": false, "department": "sales", "frustration": 2}}"#,
+];
+
+fn calibrated(target: f64, s: &Session) -> evaluate::Calibration {
+    let outcomes = vec![
+        answered(
+            &[
+                ("is_urgent", noul(0.9)),
+                ("department", choice("billing", 0.9)),
+                ("frustration", score(1.0, 0.3)),
+            ],
+            None,
+        ),
+        answered(
+            &[
+                ("is_urgent", noul(0.65)),
+                ("department", choice("billing", 0.72)),
+                ("frustration", score(1.0, 0.3)),
+            ],
+            None,
+        ),
+        answered(
+            &[
+                ("is_urgent", noul(0.55)),
+                ("department", choice("technical", 0.66)),
+                ("frustration", score(2.0, 0.3)),
+            ],
+            None,
+        ),
+        answered(
+            &[
+                ("is_urgent", noul(0.2)),
+                ("department", choice("billing", 0.4)),
+                ("frustration", score(0.0, 0.3)),
+            ],
+            None,
+        ),
+    ];
+    let parsed = cases(&CALIBRATED.join("\n"), s);
+    let report = evaluate::report(
+        s,
+        &parsed,
+        &outcomes,
+        ReportOptions {
+            model: "jev-latest",
+            threshold: 0.5,
+            rates: None,
+        },
+    );
+    evaluate::calibrate(s, &parsed, &outcomes, &report, target)
+}
+
+#[test]
+fn takes_a_nouls_best_f1_threshold_and_the_lowest_confidence_bar_that_reaches_the_target() {
+    let c = calibrated(0.9, &session());
+    let (urgent, department, frustration) = (&c.questions[0], &c.questions[1], &c.questions[2]);
+    assert_eq!(urgent.name, "is_urgent");
+    assert_eq!(
+        (urgent.bar, urgent.was, urgent.f1),
+        (Some(0.6), None, Some(1.0))
+    );
+    // At 0.45 the 0.4 billing miss is gone and the three that are left are right.
+    assert_eq!(
+        (department.bar, department.accuracy, department.coverage),
+        (Some(0.45), Some(1.0), Some(0.75))
+    );
+    assert_eq!(frustration.bar, None);
+    assert_eq!(
+        frustration.reason.as_deref(),
+        Some("no confidence bar reaches accuracy 0.90 (best 0.50 at 0.00)")
+    );
+    assert_eq!(
+        c.changed,
+        vec![
+            ("is_urgent".to_owned(), 0.6),
+            ("department".to_owned(), 0.45)
+        ]
+    );
+}
+
+#[test]
+fn prints_the_cuts_as_the_short_decimals_they_are() {
+    let cuts: Vec<String> = evaluate::calibration_cuts()
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    assert_eq!(cuts[..4], ["0", "0.05", "0.1", "0.15"]);
+    assert_eq!(cuts.len(), 20);
+    assert_eq!(cuts[13], "0.65");
+}
+
+#[test]
+fn leaves_a_bar_that_is_already_right_alone_and_says_so() {
+    let mut s = session();
+    s.set_bar("is_urgent", 0.6);
+    let c = calibrated(0.5, &s);
+    assert_eq!(
+        (c.questions[0].bar, c.questions[0].was),
+        (Some(0.6), Some(0.6))
+    );
+    assert!(!c.changed.iter().any(|(name, _)| name == "is_urgent"));
+    let text = evaluate::calibration_text(&c, "triage.jev");
+    assert!(
+        has_row(
+            &text,
+            &["is_urgent", "@threshold 0.6", "unchanged", "f1 1.00"]
+        ),
+        "{text}"
+    );
+    // At a target of 0.5 every answer is good enough, so the bar is 0: act on all of them.
+    assert!(
+        has_row(
+            &text,
+            &[
+                "department",
+                "@confidence 0",
+                "was none",
+                "accuracy 0.75 over 1.00 of cases"
+            ]
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn says_what_it_wrote_and_what_it_left_alone() {
+    let c = calibrated(0.9, &session());
+    let text = evaluate::calibration_text(&c, "triage.jev");
+    assert!(text.contains("calibration  target accuracy 0.90"), "{text}");
+    assert!(
+        has_row(
+            &text,
+            &[
+                "frustration",
+                "left alone",
+                "no confidence bar reaches accuracy 0.90"
+            ]
+        ),
+        "{text}"
+    );
+    assert!(text.contains("wrote 2 bars to triage.jev"), "{text}");
+    assert_eq!(
+        serde_json::Value::Object(evaluate::calibration_json(&c, "triage.jev")),
+        json!({
+            "page": "triage.jev",
+            "target": 0.9,
+            "written": true,
+            "questions": {
+                "is_urgent": {"kind": "noul", "bar": 0.6, "was": null, "f1": 1},
+                "department": {"kind": "choice", "bar": 0.45, "was": null, "accuracy": 1, "coverage": 0.75},
+                "frustration": {
+                    "kind": "score",
+                    "bar": null,
+                    "was": null,
+                    "reason": "no confidence bar reaches accuracy 0.90 (best 0.50 at 0.00)",
+                },
+            },
+        })
+    );
+    assert_eq!(
+        evaluate::not_calibrating(1),
+        "not calibrating: 1 case came back with errors, so the numbers are incomplete."
+    );
+    assert_eq!(
+        evaluate::not_calibrating(2),
+        "not calibrating: 2 cases came back with errors, so the numbers are incomplete."
+    );
+}

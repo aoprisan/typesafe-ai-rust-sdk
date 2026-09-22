@@ -348,6 +348,39 @@ async fn compares_two_pages_over_the_same_cases() {
 }
 
 #[tokio::test]
+async fn hands_back_the_page_with_its_bars_written_in_when_asked_to_calibrate() {
+    let cases = "{\"state\": \"My card was declined\", \"expect\": {\"department\": \"billing\"}}\n\
+                 {\"state\": \"The webhook returns 500\", \"expect\": {\"department\": \"technical\"}}";
+    let args = json!({ "page": PAGE, "cases": cases, "calibrate": true, "targetAccuracy": 0 });
+    let (table, is_error) = call_tool("jev_eval", args.clone(), &offline()).await;
+    assert!(!is_error, "{table}");
+    assert!(
+        table.contains("calibration  target accuracy 0.00"),
+        "{table}"
+    );
+    assert!(table.contains("# the page, calibrated"), "{table}");
+    assert!(table.contains("  @confidence 0\n"), "{table}");
+    let mut with_json = args.clone();
+    with_json["json"] = json!(true);
+    let (text, _) = call_tool("jev_eval", with_json, &offline()).await;
+    let report: Value = serde_json::from_str(&text).expect("a report");
+    assert_eq!(report["calibration"]["written"], true);
+    assert!(
+        report["calibration"]["text"]
+            .as_str()
+            .expect("the page")
+            .contains("technical = Bugs or integration problems\n  @confidence 0"),
+        "{text}"
+    );
+    let body = headless::request_text(&headless::load(PAGE).expect("the page"), "m");
+    let mut refused = args;
+    refused["page"] = json!(body);
+    let (text, is_error) = call_tool("jev_eval", refused, &offline()).await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("calibrate needs a .jev page"), "{text}");
+}
+
+#[tokio::test]
 async fn writes_the_page_out_as_a_program() {
     let (text, is_error) = call_tool("jev_code", json!({ "page": PAGE }), &offline()).await;
     assert!(!is_error, "{text}");

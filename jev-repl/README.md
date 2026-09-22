@@ -42,6 +42,10 @@ jev            # with TYPESAFE_API_KEY for live answers; without it, answers are
     Calm < Frustrated but civil < Very angry
   ```
 
+  `@threshold 0.6` under a noul, or `@confidence 0.7` under a choice or a score, keeps the bar
+  its answer is acted on at with the question; the gutter calls it `bar`, and it never goes on the
+  wire.
+
 - `:turn` grows the state into a conversation, so a rubric can be re-read after every reply
   instead of sampled once. The questions stay exactly as they are and only the state gets longer:
 
@@ -199,6 +203,51 @@ above it (rates required), and `--min-accuracy <0-1>` exits 1 when a question sc
 live run prints its estimate on stderr before sending anything. `--state` does not apply: the cases
 carry the states. Exit status is 0 when every case answered and every bar was met, 1 when a case
 errored or a bar was missed, 2 when the command line did not parse.
+
+### Keeping the threshold with the question
+
+Once the table has told you where the threshold goes, the page is where to keep it. A bar is
+written under its question, and it is the one thing on a page that never goes on the wire — it is
+what you do with the answer, not part of the question:
+
+```text
+is_urgent? The message conveys urgency
+  yes: A deadline, or money being lost now
+  @threshold 0.6
+
+department: Which team should handle this
+  billing = Payment or subscription issues
+  technical = Bugs or integration problems
+  @confidence 0.65
+```
+
+`@threshold` is where a noul starts reading as yes; `@confidence` is how sure a choice or a score
+has to be before it is acted on, with everything below it sent to a person. A question's own bar
+wins over `--threshold` and `:threshold`, which stay the default for nouls without one — in the
+answer page, in the eval report's starred row, and in `jev rust` and `:rust`, which gate on the
+page's numbers instead of the 0.5 and 0.6 they otherwise write. `:save` and `:open` keep bars in a
+`.jev` page; a request body has nowhere to put one.
+
+`--calibrate` writes them for you:
+
+```sh
+jev eval triage.jev --cases cases.jsonl --calibrate
+```
+
+```text
+  calibration  target accuracy 0.90
+    is_urgent    @threshold 0.6     was none   f1 0.87
+    department   @confidence 0.65   was none   accuracy 0.92 over 0.55 of cases
+    frustration  left alone         no confidence bar reaches accuracy 0.90 (best 0.84 at 0.75)
+  wrote 2 bars to triage.jev
+```
+
+A noul gets the threshold with the best F1. A choice or a score gets the lowest confidence bar at
+which the answers it lets through are right `--target-accuracy` of the time (0.9 unless you say
+otherwise) — the lowest, because every step up hands more of the work to a person. Only the bar
+lines change: comments, blank lines and the order you wrote things in stay as they were. A run in
+which any case errored writes nothing, since the bars would be fitted to the cases that happened to
+work.
 
 ### Comparing two pages
 

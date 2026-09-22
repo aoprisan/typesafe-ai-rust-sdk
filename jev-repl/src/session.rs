@@ -82,6 +82,10 @@ pub struct Session {
     pub questions: Vec<Entry>,
     /// Per-session model override; `None` means the client default.
     pub model: Option<String>,
+    /// Each question's decision bar, by name: a noul's threshold, or the confidence a choice or a
+    /// score has to reach before it is acted on. It lives on the page and never goes on the wire —
+    /// it is what the caller does with the answer, not part of the question.
+    pub bars: Vec<(String, f64)>,
 }
 
 impl Session {
@@ -90,6 +94,42 @@ impl Session {
             state: Value::String(String::new()),
             questions: Vec::new(),
             model: None,
+            bars: Vec::new(),
+        }
+    }
+
+    /// The bar written for a question, if the page gives it one.
+    pub fn bar(&self, name: &str) -> Option<f64> {
+        self.bars
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, bar)| *bar)
+    }
+
+    /// Write down a question's bar, replacing the one it had.
+    pub fn set_bar(&mut self, name: &str, bar: f64) {
+        match self.bars.iter_mut().find(|(n, _)| n == name) {
+            Some(slot) => slot.1 = bar,
+            None => self.bars.push((name.to_owned(), bar)),
+        }
+    }
+
+    /// Forget a question's bar.
+    pub fn clear_bar(&mut self, name: &str) {
+        self.bars.retain(|(n, _)| n != name);
+    }
+
+    /// The threshold a noul is read at: its own `@threshold` when the page has one, `fallback` — the
+    /// session-wide `:threshold` or `--threshold` — when it does not. The question's own bar wins
+    /// because it is the more specific of the two: someone wrote it down for this question.
+    pub fn threshold_of(&self, name: &str, fallback: f64) -> f64 {
+        let is_noul = self
+            .questions
+            .iter()
+            .any(|(n, q)| n == name && matches!(q, Question::Noul(_)));
+        match self.bar(name) {
+            Some(bar) if is_noul => bar,
+            _ => fallback,
         }
     }
 
@@ -163,6 +203,10 @@ impl Session {
     /// Add a question, or replace one of the same name in place.
     pub fn insert(&mut self, name: String, question: Question) -> bool {
         if let Some(slot) = self.questions.iter_mut().find(|(n, _)| *n == name) {
+            // A threshold means nothing to a choice, nor a confidence bar to a noul.
+            if std::mem::discriminant(&slot.1) != std::mem::discriminant(&question) {
+                self.bars.retain(|(n, _)| *n != name);
+            }
             slot.1 = question;
             true
         } else {
@@ -174,6 +218,7 @@ impl Session {
     pub fn remove(&mut self, name: &str) -> bool {
         let before = self.questions.len();
         self.questions.retain(|(n, _)| n != name);
+        self.clear_bar(name);
         self.questions.len() != before
     }
 
@@ -382,6 +427,8 @@ pub fn from_body(text: &str) -> Result<Session, String> {
             .iter()
             .map(|(name, q)| (name.clone(), question_from_json(q)))
             .collect(),
+        // A request body has nowhere to hold a bar.
+        bars: Vec::new(),
     })
 }
 
