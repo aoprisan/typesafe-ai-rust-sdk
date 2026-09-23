@@ -37,11 +37,13 @@ The payout failed again, third time this month. I'm done waiting.
 is_urgent? The message conveys urgency or time-sensitivity
   yes: A deadline, a threat to leave, or "ASAP"
   no: Routine, no time pressure
+  @threshold 0.6
 
 department: Which team should handle this
   billing = Payment or subscription issues
   technical = Bugs or integration problems
   sales
+  @confidence 0.7
 
 frustration: How frustrated the customer appears
   Calm < Frustrated but civil < Very angry
@@ -59,6 +61,9 @@ Rules worth remembering:
 - Parts of a question can also go on its first line, separated by `|`:
   `is_urgent? Conveys urgency | yes: A deadline | no: No time pressure`
 - `@model <name>` pins the model, `#` starts a comment, indentation is decoration.
+- `@threshold <0-1>` under a noul, or `@confidence <0-1>` under a choice or a score, is
+  the bar its answer is acted on at. It is never sent; it wins over `--threshold`, and
+  `jev rust` gates on it.
 
 Question names are the keys of the answer object, so name them the way you want to
 read them back: `is_urgent`, `department`, `severity`.
@@ -120,6 +125,7 @@ jev run   page.jev --state "..." --threshold 0.7
 jev run   page.jev --turn "customer: ..." --turn "agent: ..."   # append turns
 jev run   page.jev --json           # the raw response body, for jq
 jev eval  page.jev --cases cases.jsonl --min-accuracy 0.9
+jev eval  page.jev --compare v2.jev --cases cases.jsonl --fail-on-regression
 jev rust  page.jev                  # the session as a Rust program
 ```
 
@@ -136,6 +142,19 @@ A cases file for `jev eval` is JSON Lines, one labelled state per line:
 
 `expect` names questions from the page: `true`/`false` for a noul, a label for a
 choice, a level (name or index) for a score. Questions you leave out are not scored.
+When the state is a conversation, a noul can be labelled per turn: `{"by_turn": 3}` is
+false before turn 3 and true from it on (`null` for never). The case is sent once per
+turn and the report says how early or late the noul noticed.
+
+`--calibrate` writes the bars a run supports back into the page — each noul's best-F1
+`@threshold`, and the lowest `@confidence` at which a choice or score reaches
+`--target-accuracy` (default 0.9) — changing nothing else. Calibrate on live answers
+only: a bar fitted to simulated noise means nothing.
+
+To tell whether a rewrite of a page is better, run both over the same cases with
+`--compare`: it prints the change per question, the cases whose answer flipped, and an
+exact McNemar test. Report "b is significantly better" only when it says so — with fewer
+than six discordant cases it says "too few", and that means the cases cannot tell.
 
 ## MCP tools
 
@@ -147,7 +166,9 @@ them over shelling out, and pass the page as text rather than writing a temp fil
 - `jev_request` — the exact request body a page would POST.
 - `jev_cost` — estimated tokens, priced when rates are given.
 - `jev_ask` — send the page (or answer it offline when no key is set) and return the answers.
-- `jev_eval` — run a page over labelled cases and score the answers.
+- `jev_eval` — run a page over labelled cases and score the answers; `compare` takes a
+  second page and reports the difference, `calibrate` hands the page back with its bars
+  written in.
 - `jev_code` — the page as a Rust program against `typesafe-ai-sdk`.
 - `jev_presets` — ready-made pages to start from: triage, moderation, lead, reply.
 

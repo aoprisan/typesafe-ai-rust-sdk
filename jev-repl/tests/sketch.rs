@@ -534,3 +534,211 @@ fn the_page_renders_with_its_gutter_and_preview() {
     let mut tiny = Terminal::new(TestBackend::new(30, 6)).unwrap();
     tiny.draw(|f| ui::render(f, &mut app)).unwrap();
 }
+
+// ---- a question's bar -------------------------------------------------------------------------
+
+const BARRED: &str = "A payout failed.
+---
+# thresholds were calibrated on 40 tickets
+is_urgent? The message conveys urgency
+  yes: A deadline
+  @threshold 0.62
+
+department: Which team should handle this
+  @confidence 0.7
+  billing = Payment or subscription issues
+  technical = Bugs or integration problems
+
+frustration: How frustrated the customer appears
+  Calm < Annoyed < Furious
+";
+
+fn bars(pairs: &[(&str, f64)]) -> Vec<(String, f64)> {
+    pairs.iter().map(|(n, b)| ((*n).to_owned(), *b)).collect()
+}
+
+#[test]
+fn reads_threshold_under_a_noul_and_confidence_under_a_choice_wherever_in_the_block() {
+    let parsed = sketch::parse(BARRED);
+    assert_eq!(parsed.problems, vec![]);
+    assert_eq!(
+        parsed.bars,
+        bars(&[("is_urgent", 0.62), ("department", 0.7)])
+    );
+    assert_eq!(parsed.tags[5], Tag::Bar);
+    assert_eq!(parsed.tags[8], Tag::Bar);
+    assert_eq!(Tag::Bar.label(), "bar");
+    assert_eq!(Tag::Bar.color(), ratatui::style::Color::LightBlue);
+    let span = |head, last, bar| sketch::BlockSpan { head, last, bar };
+    assert_eq!(parsed.block("is_urgent"), Some(span(3, 5, Some(5))));
+    assert_eq!(parsed.block("department"), Some(span(7, 10, Some(8))));
+    assert_eq!(parsed.block("frustration"), Some(span(12, 13, None)));
+}
+
+#[test]
+fn keeps_the_bar_off_the_wire_and_on_the_page() {
+    let session = sketch::parse(BARRED).to_session();
+    assert!(!session.request_json("x").contains("0.62"));
+    let page = sketch::render(&session);
+    assert!(
+        page.contains("  yes: A deadline\n  @threshold 0.62\n"),
+        "{page}"
+    );
+    assert!(
+        page.contains("  technical = Bugs or integration problems\n  @confidence 0.7\n"),
+        "{page}"
+    );
+    let again = sketch::parse(&page);
+    assert_eq!(again.bars, session.bars);
+    assert_eq!(sketch::render(&again.to_session()), page);
+}
+
+#[test]
+fn says_what_is_wrong_with_a_bar_on_its_line() {
+    let problem = |text: &str| {
+        sketch::parse(text)
+            .problems
+            .first()
+            .map(|p| p.message.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        problem("s\n---\nq? x\n  @threshold 1.5\n"),
+        "`@threshold` takes a number from 0 to 1, e.g. `@threshold 0.6`"
+    );
+    assert!(problem("s\n---\nq? x\n  @threshold 1e-1\n").contains("takes a number from 0 to 1"));
+    assert_eq!(
+        problem("s\n---\nq: x\n  a = 1\n  b = 2\n  @confidence\n"),
+        "`@confidence` takes a number from 0 to 1, e.g. `@confidence 0.6`"
+    );
+    assert_eq!(
+        problem("s\n---\n@threshold 0.5\nq? x\n"),
+        "`@threshold` belongs under a question — put it below the `name?` line it sets"
+    );
+    assert_eq!(
+        problem("s\n---\n@confidence 0.5\nq? x\n"),
+        "`@confidence` belongs under a question — put it below the choice or score it gates"
+    );
+    assert_eq!(
+        problem("s\n---\nq? x\n  @confidence 0.5\n"),
+        "a yes/no question takes `@threshold`, not `@confidence`"
+    );
+    assert_eq!(
+        problem("s\n---\nq: x\n  a < b\n  @threshold 0.5\n"),
+        "a choice or a score takes `@confidence`, not `@threshold`"
+    );
+    assert_eq!(
+        problem("s\n---\nq! {\"type\": \"noul\"}\n@threshold 0.5\n"),
+        "a raw question takes no bar — jev cannot read its answer"
+    );
+    assert_eq!(
+        problem("s\n---\nq? x\n  @threshold 0.5\n  @threshold 0.6\n"),
+        "`q` already has a bar on line 4"
+    );
+    assert_eq!(
+        problem("s\n---\n@speed fast\n"),
+        "unknown directive `@speed`; there is `@model`, and `@threshold` or `@confidence` under a question"
+    );
+    let broken = sketch::parse("s\n---\nq:\n  @confidence 0.5\n");
+    assert_eq!(broken.tags[3], Tag::Bar);
+    assert_eq!(
+        broken.problems.iter().map(|p| p.line).collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+#[test]
+fn reads_a_bar_only_as_a_plain_decimal() {
+    for good in ["0", "1", "0.5", ".5", "1.", "0.625", "1.0"] {
+        assert!(sketch::parse_bar(good).is_some(), "{good}");
+    }
+    for bad in [
+        "", "1e-1", "0x1", "+0.5", ".5.", "-0", "1.5", ".", " 0.5", "0,5", "inf",
+    ] {
+        assert_eq!(sketch::parse_bar(bad), None, "{bad}");
+    }
+    assert_eq!(sketch::parse_bar(".25"), Some(0.25));
+}
+
+#[test]
+fn writes_bars_back_without_touching_anything_else_on_the_page() {
+    let written = sketch::set_bars(
+        BARRED,
+        &bars(&[("is_urgent", 0.6), ("frustration", 0.55), ("nobody", 0.5)]),
+    );
+    assert_eq!(
+        written,
+        BARRED.replace("@threshold 0.62", "@threshold 0.6").replace(
+            "  Calm < Annoyed < Furious\n",
+            "  Calm < Annoyed < Furious\n  @confidence 0.55\n",
+        )
+    );
+    let inline = sketch::set_bars(
+        "s\n---\nq? x | yes: y\nr: z\n    a = 1\n    b = 2",
+        &bars(&[("q", 0.3), ("r", 0.8)]),
+    );
+    assert_eq!(
+        inline,
+        "s\n---\nq? x | yes: y\n  @threshold 0.3\nr: z\n    a = 1\n    b = 2\n    @confidence 0.8"
+    );
+    let crlf = sketch::set_bars("s\r\n---\r\nq? x\r\n", &bars(&[("q", 0.4)]));
+    assert_eq!(crlf, "s\r\n---\r\nq? x\r\n  @threshold 0.4\r\n");
+}
+
+#[test]
+fn moves_with_its_question_and_goes_when_the_question_does() {
+    let mut session = sketch::parse(BARRED).to_session();
+    assert_eq!(session.threshold_of("is_urgent", 0.5), 0.62);
+    assert_eq!(session.threshold_of("department", 0.5), 0.5);
+    assert_eq!(session.threshold_of("frustration", 0.5), 0.5);
+    let mut copy = session.clone();
+    copy.remove("is_urgent");
+    assert_eq!(copy.bar("is_urgent"), None);
+    assert_eq!(session.bar("is_urgent"), Some(0.62));
+    let department = session.questions[1].1.clone();
+    session.insert("department".to_owned(), department);
+    assert_eq!(session.bar("department"), Some(0.7));
+    let urgent = session.questions[0].1.clone();
+    session.insert("department".to_owned(), urgent);
+    assert_eq!(session.bar("department"), None);
+}
+
+#[test]
+fn survives_save_and_open_and_the_answers_are_read_at_it() {
+    let dir = std::env::temp_dir().join(format!("jev-bar-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("triage.jev");
+    let path = path.to_str().unwrap().to_owned();
+    std::fs::write(&path, BARRED).unwrap();
+    let mut app = app();
+    app.exec(&format!(":open {path}"));
+    assert_eq!(app.session.bar("is_urgent"), Some(0.62));
+    app.exec(&format!(":save {path}"));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("@threshold 0.62")
+    );
+    app.exec(":ask");
+    let text = transcript(&app);
+    assert!(text.contains("at threshold 0.62"), "{text}");
+    assert!(!text.contains("at threshold 0.50"), "{text}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn counts_a_changed_bar_as_a_change_when_a_page_is_applied() {
+    let mut app = app();
+    app.exec(":preset triage");
+    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    let ed = app.sketch.as_mut().expect("sketch open");
+    let at = ed
+        .lines
+        .iter()
+        .position(|l| l.starts_with("is_urgent?"))
+        .expect("the noul");
+    ed.lines.insert(at + 1, "  @threshold 0.8".to_owned());
+    key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert_eq!(app.session.bar("is_urgent"), Some(0.8));
+    assert!(!transcript(&app).contains("nothing changed."));
+}

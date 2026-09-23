@@ -48,6 +48,17 @@ pub enum Error {
     /// The server returned a successful status but the body is missing required data.
     #[error(transparent)]
     ResponseValidation(Box<ResponseValidationError>),
+
+    /// The client is replaying and this request was never recorded. Nothing was sent: a replaying
+    /// client does not fall back to the network. Record it first (`TYPESAFE_RECORD=<dir>`); see
+    /// [`crate::cassette`].
+    #[error("No recording for this request: {} does not exist (replaying, so nothing was sent).", path.display())]
+    ReplayMiss {
+        /// The request's cassette key.
+        key: String,
+        /// The file that would have held the response.
+        path: std::path::PathBuf,
+    },
 }
 
 impl Error {

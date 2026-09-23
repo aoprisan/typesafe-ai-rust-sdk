@@ -7,6 +7,7 @@
 //! and friends read a page (or stdin) and print one answer, so a session shaped in the REPL can be
 //! saved with `:save` and then run from a script, a Makefile or CI.
 
+use std::future::Future;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -18,7 +19,6 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::{execute, terminal};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use jev_repl::app::{App, Msg};
@@ -27,7 +27,7 @@ use jev_repl::evaluate::{self, Outcome};
 use jev_repl::headless::Answered;
 use jev_repl::mcp::{self, Host, Sent};
 use jev_repl::session::Session;
-use jev_repl::{cost, headless, installer, serve, ui};
+use jev_repl::{cost, headless, installer, serve, sketch, ui};
 use typesafe::{Client, Usage};
 
 /// 0 when it worked, 1 when the call or the file did not, 2 when the command line did not parse.
@@ -110,7 +110,11 @@ fn help() -> String {
          \x20 --concurrency <n>      how many cases are in the air at once (default 4)\n\
          \x20 --cache <dir>          keep the responses here, so running it again sends nothing\n\
          \x20 --max-cost <dollars>   refuse to send when the estimate is above this\n\
-         \x20 --min-accuracy <0-1>   exit 1 when a scored question falls below this\n\n\
+         \x20 --min-accuracy <0-1>   exit 1 when a scored question falls below this\n\
+         \x20 --compare <page>       run a second page over the same cases and report the difference\n\
+         \x20 --fail-on-regression   with --compare, exit 1 when the second page is significantly worse\n\
+         \x20 --calibrate            write the thresholds and confidence bars the run supports into the page\n\
+         \x20 --target-accuracy <0-1>  the accuracy a confidence bar has to reach (default 0.9)\n\n\
          Exit status is 0 when it worked, 1 when the call or the file did not, 2 when the\n\
          command line did not parse.\n"
     )
@@ -135,6 +139,12 @@ struct Options {
     cache: Option<String>,
     max_cost: Option<f64>,
     min_accuracy: Option<f64>,
+    /// `jev eval --compare`: the second page, and whether a regression fails the run.
+    compare: Option<String>,
+    fail_on_regression: bool,
+    /// `jev eval --calibrate`: write the bars back into the page, aiming at this accuracy.
+    calibrate: bool,
+    target_accuracy: Option<f64>,
 }
 
 /// Read the flags after a subcommand. `--flag value` and `--flag=value` both work, and the first
@@ -222,6 +232,16 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 }
                 options.min_accuracy = Some(bar);
             }
+            "--compare" => options.compare = Some(value()?),
+            "--fail-on-regression" => options.fail_on_regression = true,
+            "--calibrate" => options.calibrate = true,
+            "--target-accuracy" => {
+                let target: f64 = value()?.parse().unwrap_or(f64::NAN);
+                if !(0.0..=1.0).contains(&target) {
+                    return Err("--target-accuracy takes a number from 0 to 1.".to_owned());
+                }
+                options.target_accuracy = Some(target);
+            }
             "--mock" => options.mock = true,
             "--json" => options.json = true,
             other => {
@@ -264,6 +284,27 @@ fn check_eval_options(options: &Options) -> Result<(), String> {
     }
     if options.max_cost.is_some() && options.rates.is_none() {
         return Err("--max-cost needs rates: pass --price <in>/<out> or set JEV_PRICE.".to_owned());
+    }
+    if options.compare.as_deref() == Some("-") && (options.file == "-" || cases == "-") {
+        return Err("only one of the page, --compare and --cases can come from stdin.".to_owned());
+    }
+    if options.fail_on_regression && options.compare.is_none() {
+        return Err(
+            "--fail-on-regression needs --compare: there is nothing to regress from.".to_owned(),
+        );
+    }
+    if options.calibrate && options.compare.is_some() {
+        return Err(
+            "--calibrate and --compare do not mix: calibrate one page at a time.".to_owned(),
+        );
+    }
+    if options.calibrate && options.file == "-" {
+        return Err(
+            "--calibrate writes the page back, so the page has to be a file, not stdin.".to_owned(),
+        );
+    }
+    if options.target_accuracy.is_some() && !options.calibrate {
+        return Err("--target-accuracy only applies with --calibrate.".to_owned());
     }
     Ok(())
 }
@@ -351,7 +392,13 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
         .unwrap_or_else(|| "jev-latest".to_owned());
 
     if command == "eval" {
-        return run_eval(session, &options, &model, client).await;
+        if options.calibrate && text.trim_start().starts_with('{') {
+            eprintln!(
+                "jev eval: --calibrate needs a .jev page: a request body has nowhere to keep a bar."
+            );
+            return FAILED;
+        }
+        return run_eval(session, &text, &options, &model, client).await;
     }
 
     match command {
@@ -383,7 +430,10 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
         if options.json {
             print!("{}", headless::answers_json(&answers, &model, None));
         } else {
-            print!("{}", headless::answers_text(&answers, options.threshold));
+            print!(
+                "{}",
+                headless::session_answers_text(&answers, options.threshold, &session)
+            );
             print!(
                 "{}",
                 headless::usage_text(&session, &model, options.rates, None)
@@ -410,7 +460,10 @@ async fn one_shot(command: &str, args: &[String]) -> u8 {
                     headless::answers_json(&answers, &model, Some(&response.raw))
                 );
             } else {
-                print!("{}", headless::answers_text(&answers, options.threshold));
+                print!(
+                    "{}",
+                    headless::session_answers_text(&answers, options.threshold, &session)
+                );
                 print!(
                     "{}",
                     headless::usage_text(&session, &model, options.rates, Some(&response.usage))
@@ -538,11 +591,10 @@ async fn mock_ask(session: Session) -> Outcome {
     }
 }
 
-/// The cache key: the request body this case would POST, hashed.
+/// The cache key: the request body this case would POST, hashed. It is the SDK's cassette key,
+/// so a cache directory can be replayed with `TYPESAFE_REPLAY` and a recording used as a cache.
 fn cache_key(session: &Session, model: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(session.request_json_compact(model));
-    format!("{:x}", hasher.finalize())
+    typesafe::cassette::key(&session.state, model, &session.to_questions())
 }
 
 /// A cached response, or `None` when there is none this run can use.
@@ -605,11 +657,245 @@ fn error_text(err: &typesafe::Error) -> String {
         .to_owned()
 }
 
+/// A worker's `ask` for a live run: one page's model, through the cache when there is one.
+fn live_asker(
+    client: Client,
+    model: &str,
+    options: &Options,
+) -> impl Fn(Session) -> std::pin::Pin<Box<dyn Future<Output = Outcome> + Send>>
++ Send
++ Sync
++ Clone
++ 'static {
+    let model = model.to_owned();
+    let timeout = options.timeout;
+    let cache = options.cache.clone();
+    move |one: Session| {
+        let (client, model, cache) = (client.clone(), model.clone(), cache.clone());
+        Box::pin(async move { live_ask(&client, &model, timeout, cache.as_deref(), one).await })
+    }
+}
+
+/// The live preflight: say what the run is about to cost, refuse it above `--max-cost`, and make
+/// the cache directory. `Err` carries the exit status to stop with.
+fn before_sending(
+    what: &str,
+    estimates: &[evaluate::Preflight],
+    options: &Options,
+) -> Result<(), u8> {
+    let input_tokens: usize = estimates.iter().map(|one| one.input_tokens).sum();
+    let output_tokens: usize = estimates.iter().map(|one| one.output_tokens).sum();
+    let total = options
+        .rates
+        .map(|rates| cost::price(input_tokens as u64, output_tokens as u64, rates).total);
+    let money = match (total, options.rates) {
+        (Some(total), Some(rates)) => {
+            format!(", ≈ {} at {}", cost::usd(total), cost::format_rates(rates))
+        }
+        _ => String::new(),
+    };
+    eprintln!("jev eval: {what}, ≈ {input_tokens} in / {output_tokens} out tokens{money}");
+    if let (Some(max), Some(total)) = (options.max_cost, total)
+        && total > max
+    {
+        eprintln!(
+            "jev eval: refusing to send: ≈ {} is above --max-cost {}.",
+            cost::usd(total),
+            cost::usd(max)
+        );
+        return Err(FAILED);
+    }
+    if let Some(dir) = &options.cache
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!("jev eval: could not use {dir}: {e}");
+        return Err(FAILED);
+    }
+    Ok(())
+}
+
+/// What a page is called in a comparison: the path it came from, or stdin.
+fn label_of(path: &str) -> String {
+    if path == "-" {
+        "stdin".to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+/// `jev eval --compare`: two pages over the same cases, and whether the difference is real.
+///
+/// Everything that costs money is shared — one preflight over both pages, one pool of workers, one
+/// cache — so comparing two pages costs what running them both costs and nothing more.
+async fn run_eval_compare(
+    a: Session,
+    text: &str,
+    options: &Options,
+    model_a: &str,
+    client: Option<Client>,
+) -> u8 {
+    let second = options.compare.as_deref().unwrap_or("-");
+    let (label_a, label_b) = (label_of(&options.file), label_of(second));
+    let page = match read_input(second) {
+        Ok(page) => page,
+        Err(e) => {
+            eprintln!("jev eval: {e}");
+            return FAILED;
+        }
+    };
+    let mut b = match headless::load(&page) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("jev eval: {label_b}: {e}");
+            return FAILED;
+        }
+    };
+    if let Some(model) = &options.model {
+        b.model = Some(model.clone());
+    }
+    let model_b = b
+        .model
+        .clone()
+        .or_else(|| client.as_ref().map(|c| c.default_model().to_owned()))
+        .unwrap_or_else(|| "jev-latest".to_owned());
+
+    let labels = evaluate::Labels {
+        a: &label_a,
+        b: &label_b,
+    };
+    let (cases_a, cases_b) = match evaluate::parse_compare_cases(text, &a, &b, labels) {
+        Ok(both) => both,
+        Err(e) => {
+            eprintln!("jev eval: {e}");
+            return FAILED;
+        }
+    };
+
+    let live = client.is_some();
+    if live {
+        let estimates = [
+            evaluate::preflight(&a, &cases_a, model_a, None),
+            evaluate::preflight(&b, &cases_b, &model_b, None),
+        ];
+        let what = format!("{} + {} cases over two pages", cases_a.len(), cases_b.len());
+        if let Err(code) = before_sending(&what, &estimates, options) {
+            return code;
+        }
+    }
+
+    let (outcomes_a, outcomes_b) = match client {
+        None => {
+            evaluate::run_compare(
+                evaluate::Leg {
+                    session: &a,
+                    cases: &cases_a,
+                    ask: mock_ask,
+                },
+                evaluate::Leg {
+                    session: &b,
+                    cases: &cases_b,
+                    ask: mock_ask,
+                },
+                options.concurrency,
+            )
+            .await
+        }
+        Some(client) => {
+            let ask_a = live_asker(client.clone(), model_a, options);
+            let ask_b = live_asker(client, &model_b, options);
+            evaluate::run_compare(
+                evaluate::Leg {
+                    session: &a,
+                    cases: &cases_a,
+                    ask: ask_a,
+                },
+                evaluate::Leg {
+                    session: &b,
+                    cases: &cases_b,
+                    ask: ask_b,
+                },
+                options.concurrency,
+            )
+            .await
+        }
+    };
+    let comparison = evaluate::compare(
+        evaluate::Side {
+            label: &label_a,
+            session: &a,
+            cases: &cases_a,
+            outcomes: &outcomes_a,
+            model: model_a,
+        },
+        evaluate::Side {
+            label: &label_b,
+            session: &b,
+            cases: &cases_b,
+            outcomes: &outcomes_b,
+            model: &model_b,
+        },
+        evaluate::CompareOptions {
+            threshold: options.threshold,
+            rates: options.rates,
+        },
+    );
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&evaluate::compare_json(&comparison)).unwrap_or_default()
+        );
+    } else {
+        print!("{}", evaluate::compare_text(&comparison));
+    }
+    if !live {
+        eprintln!(
+            "Simulated answers: deterministic noise, not judgement. Set TYPESAFE_API_KEY for real ones."
+        );
+    }
+
+    let sides = [&comparison.a, &comparison.b];
+    let mut code = if sides.iter().any(|side| !side.report.errors.is_empty()) {
+        FAILED
+    } else {
+        OK
+    };
+    if let Some(bar) = options.min_accuracy {
+        for side in sides {
+            for (name, accuracy) in evaluate::below_bar(&side.report, bar) {
+                eprintln!(
+                    "jev eval: {}: {name} accuracy {} is below {}.",
+                    side.label,
+                    evaluate::two(accuracy),
+                    evaluate::two(bar)
+                );
+                code = FAILED;
+            }
+        }
+    }
+    if options.fail_on_regression {
+        for question in evaluate::regressions(&comparison) {
+            eprintln!(
+                "jev eval: {} is significantly worse in {label_b} (McNemar p {}).",
+                question.name,
+                evaluate::three(question.mcnemar.p)
+            );
+            code = FAILED;
+        }
+    }
+    code
+}
+
 /// `jev eval`: the page over a file of labelled states, scored.
 ///
 /// The order matters. Nothing is sent until the cases have parsed and the estimate has been shown,
 /// because a cases file is the one input that turns a typo into a bill.
-async fn run_eval(session: Session, options: &Options, model: &str, client: Option<Client>) -> u8 {
+async fn run_eval(
+    session: Session,
+    page: &str,
+    options: &Options,
+    model: &str,
+    client: Option<Client>,
+) -> u8 {
     let text = match read_input(options.cases.as_deref().unwrap_or("-")) {
         Ok(text) => text,
         Err(e) => {
@@ -617,6 +903,9 @@ async fn run_eval(session: Session, options: &Options, model: &str, client: Opti
             return FAILED;
         }
     };
+    if options.compare.is_some() {
+        return run_eval_compare(session, &text, options, model, client).await;
+    }
     let cases = match evaluate::parse_cases(&text, &session) {
         Ok(cases) => cases,
         Err(e) => {
@@ -627,48 +916,18 @@ async fn run_eval(session: Session, options: &Options, model: &str, client: Opti
 
     let live = client.is_some();
     if live {
-        let estimate = evaluate::preflight(&session, &cases, model, options.rates);
-        let money = match (estimate.cost, options.rates) {
-            (Some(cost), Some(rates)) => format!(
-                ", ≈ {} at {}",
-                cost::usd(cost.total),
-                cost::format_rates(rates)
-            ),
-            _ => String::new(),
-        };
-        let plural = if estimate.cases == 1 { "" } else { "s" };
-        eprintln!(
-            "jev eval: {} case{plural}, ≈ {} in / {} out tokens{money}",
-            estimate.cases, estimate.input_tokens, estimate.output_tokens
-        );
-        if let (Some(max), Some(cost)) = (options.max_cost, estimate.cost)
-            && cost.total > max
-        {
-            eprintln!(
-                "jev eval: refusing to send: ≈ {} is above --max-cost {}.",
-                cost::usd(cost.total),
-                cost::usd(max)
-            );
-            return FAILED;
-        }
-        if let Some(dir) = &options.cache
-            && let Err(e) = std::fs::create_dir_all(dir)
-        {
-            eprintln!("jev eval: could not use {dir}: {e}");
-            return FAILED;
+        let estimate = evaluate::preflight(&session, &cases, model, None);
+        let n = estimate.cases;
+        let what = format!("{n} case{}", if n == 1 { "" } else { "s" });
+        if let Err(code) = before_sending(&what, &[estimate], options) {
+            return code;
         }
     }
 
     let outcomes = match client {
         None => evaluate::run(&session, &cases, mock_ask, options.concurrency).await,
         Some(client) => {
-            let model = model.to_owned();
-            let timeout = options.timeout;
-            let cache = options.cache.clone();
-            let ask = move |one: Session| {
-                let (client, model, cache) = (client.clone(), model.clone(), cache.clone());
-                async move { live_ask(&client, &model, timeout, cache.as_deref(), one).await }
-            };
+            let ask = live_asker(client, model, options);
             evaluate::run(&session, &cases, ask, options.concurrency).await
         }
     };
@@ -683,21 +942,59 @@ async fn run_eval(session: Session, options: &Options, model: &str, client: Opti
             rates: options.rates,
         },
     );
+    let mut code = if report.errors.is_empty() { OK } else { FAILED };
+
+    // Calibration writes before it prints, so the report never claims a file it failed to write.
+    let calibration = (options.calibrate && report.errors.is_empty()).then(|| {
+        evaluate::calibrate(
+            &session,
+            &cases,
+            &outcomes,
+            &report,
+            options.target_accuracy.unwrap_or(evaluate::DEFAULT_TARGET),
+        )
+    });
+    let mut written = true;
+    if let Some(calibration) = &calibration
+        && !calibration.changed.is_empty()
+        && let Err(e) = std::fs::write(&options.file, sketch::set_bars(page, &calibration.changed))
+    {
+        eprintln!("jev eval: could not write {}: {e}", options.file);
+        written = false;
+        code = FAILED;
+    }
+    let shown = calibration.filter(|_| written);
+
     if options.json {
+        let mut json = evaluate::report_json(&report);
+        if let (Some(shown), Value::Object(object)) = (&shown, &mut json) {
+            object.insert(
+                "calibration".to_owned(),
+                Value::Object(evaluate::calibration_json(shown, &options.file)),
+            );
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&evaluate::report_json(&report)).unwrap_or_default()
+            serde_json::to_string_pretty(&json).unwrap_or_default()
         );
     } else {
         print!("{}", evaluate::report_text(&report));
+        if let Some(shown) = &shown {
+            print!("\n{}", evaluate::calibration_text(shown, &options.file));
+        }
     }
     if !live {
         eprintln!(
             "Simulated answers: deterministic noise, not judgement. Set TYPESAFE_API_KEY for real ones."
         );
     }
+    if options.calibrate && !report.errors.is_empty() {
+        eprintln!(
+            "jev eval: {}",
+            evaluate::not_calibrating(report.errors.len())
+        );
+    }
 
-    let mut code = if report.errors.is_empty() { OK } else { FAILED };
     if let Some(bar) = options.min_accuracy {
         for (name, accuracy) in evaluate::below_bar(&report, bar) {
             eprintln!(

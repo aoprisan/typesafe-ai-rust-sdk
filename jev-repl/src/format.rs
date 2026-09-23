@@ -416,6 +416,10 @@ pub fn error_lines(err: &Error) -> Vec<Line<'static>> {
             "ResponseValidation",
             "A 2xx body was missing required data; field_path points at it.",
         ),
+        Error::ReplayMiss { .. } => (
+            "ReplayMiss",
+            "TYPESAFE_REPLAY is set and this request was never recorded; nothing was sent.",
+        ),
         _ => ("Error", "Unhandled variant."),
     };
 

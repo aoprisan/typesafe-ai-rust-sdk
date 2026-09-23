@@ -530,6 +530,68 @@ fn exits_1_and_names_the_question_when_a_bar_is_not_met() {
 }
 
 #[test]
+fn scores_a_conversation_labelled_per_turn_and_says_when_the_noul_noticed() {
+    let thread = json!([
+        {"who": "customer", "said": "Hi there"},
+        {"who": "agent", "said": "How can I help?"},
+        {"who": "customer", "said": "Checkout has been down for an hour, we are losing orders"},
+    ]);
+    let cases = format!(
+        r#"{{"id": "th-1", "state": {thread}, "expect": {{"is_urgent": {{"by_turn": 3}}, "department": "technical"}}}}"#
+    );
+    with_files("by-turn", &cases, |page, path| {
+        let out = jev(&["eval", page, "--cases", path, "--mock"], "", &[]);
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        assert!(
+            has_row(&out.stdout, &["is_urgent", "noul", "3 cases"]),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            has_row(&out.stdout, &["department", "choice", "1 case", "·"]),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("    by turn  1 thread · "),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("3 cases · 3 answered · 0 errors"),
+            "{}",
+            out.stdout
+        );
+        let json = jev(
+            &["eval", page, "--cases", path, "--mock", "--json"],
+            "",
+            &[],
+        );
+        let report: Value = serde_json::from_str(&json.stdout).expect("a JSON report");
+        assert_eq!(report["questions"]["is_urgent"]["latency"]["threads"], 1);
+        assert_eq!(
+            report["questions"]["is_urgent"]["latency"]["cases"][0]["expected"],
+            3
+        );
+    });
+    with_files(
+        "by-turn-plain",
+        r#"{"state": "plain text", "expect": {"is_urgent": {"by_turn": 2}}}"#,
+        |page, path| {
+            let out = jev(&["eval", page, "--cases", path, "--mock"], "", &[]);
+            assert_eq!(out.status, 1);
+            assert!(
+                out.stderr.contains(
+                    "cases line 1: is_urgent gives by_turn, but the state is not a conversation of turns."
+                ),
+                "{}",
+                out.stderr
+            );
+        },
+    );
+}
+
+#[test]
 fn lists_eval_and_its_flags_in_help() {
     let help = jev(&["--help"], "", &[]).stdout;
     assert!(help.contains("eval"), "{help}");
@@ -539,9 +601,452 @@ fn lists_eval_and_its_flags_in_help() {
         "--cache",
         "--max-cost",
         "--min-accuracy",
+        "--compare",
+        "--fail-on-regression",
+        "--calibrate",
+        "--target-accuracy",
     ] {
         assert!(help.contains(flag), "{help}");
     }
+}
+
+#[test]
+fn writes_the_bars_the_run_supports_into_the_page_and_says_what_changed() {
+    with_files("calibrate", EVAL_CASES, |page, cases| {
+        let before = std::fs::read_to_string(page).expect("the page");
+        let args = ["eval", page, "--cases", cases, "--mock", "--calibrate"];
+        let first = jev(&args, "", &[]);
+        assert_eq!(first.status, 0, "{}", first.stderr);
+        assert!(
+            first.stdout.contains("calibration  target accuracy 0.90"),
+            "{}",
+            first.stdout
+        );
+        // The simulator is deterministic, so what these three cases support is fixed.
+        assert!(
+            first
+                .stdout
+                .contains("is_urgent    left alone         no threshold gives an F1 above 0"),
+            "{}",
+            first.stdout
+        );
+        assert!(
+            has_row(
+                &first.stdout,
+                &[
+                    "frustration",
+                    "@confidence 0.25",
+                    "was none",
+                    "accuracy 1.00"
+                ]
+            ),
+            "{}",
+            first.stdout
+        );
+        assert!(
+            first.stdout.contains(&format!("wrote 1 bar to {page}")),
+            "{}",
+            first.stdout
+        );
+        let after = std::fs::read_to_string(page).expect("the page");
+        assert!(
+            after.contains("  Calm < Frustrated but civil < Very angry\n  @confidence 0.25\n"),
+            "{after}"
+        );
+        // Only bar lines were added: take them out and the page is what it was.
+        let stripped: Vec<&str> = after
+            .split('\n')
+            .filter(|line| !line.trim_start().starts_with("@confidence"))
+            .collect();
+        assert_eq!(stripped.join("\n"), before);
+
+        let again = jev(&args, "", &[]);
+        assert!(
+            again.stdout.contains("nothing to write:"),
+            "{}",
+            again.stdout
+        );
+        assert_eq!(std::fs::read_to_string(page).expect("the page"), after);
+        assert!(
+            jev(&["check", page], "", &[])
+                .stdout
+                .contains("frustration (score, @confidence 0.25)")
+        );
+    });
+}
+
+#[test]
+fn adds_the_calibration_to_the_json_report() {
+    with_files("calibrate-json", EVAL_CASES, |page, cases| {
+        let out = jev(
+            &[
+                "eval",
+                page,
+                "--cases",
+                cases,
+                "--mock",
+                "--calibrate",
+                "--json",
+                "--target-accuracy",
+                "0.5",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        let report: Value = serde_json::from_str(&out.stdout).expect("a JSON report");
+        assert_eq!(report["calibration"]["page"], page);
+        assert_eq!(report["calibration"]["target"], 0.5);
+        let names: Vec<&String> = report["calibration"]["questions"]
+            .as_object()
+            .expect("questions")
+            .keys()
+            .collect();
+        assert_eq!(names, vec!["is_urgent", "department", "frustration"]);
+    });
+}
+
+#[test]
+fn reads_the_pages_own_threshold_everywhere_a_threshold_is_read() {
+    with_files("page-threshold", EVAL_CASES, |page, cases| {
+        std::fs::write(
+            page,
+            EVAL_PAGE.replace("urgency\n", "urgency\n  @threshold 0.35\n"),
+        )
+        .expect("the page");
+        let run = jev(
+            &["run", page, "--state", "A payout failed", "--mock"],
+            "",
+            &[],
+        );
+        assert!(run.stdout.contains("at threshold 0.35"), "{}", run.stdout);
+        let scored = jev(&["eval", page, "--cases", cases, "--mock"], "", &[]);
+        assert!(scored.stdout.contains("0.35 *"), "{}", scored.stdout);
+        let code = jev(&["rust", page], "", &[]);
+        assert!(
+            code.stdout.contains("is_urgent.is_yes(0.35)"),
+            "{}",
+            code.stdout
+        );
+    });
+}
+
+#[test]
+fn refuses_what_it_cannot_write_back() {
+    with_files("calibrate-usage", EVAL_CASES, |page, cases| {
+        let usage = |args: &[&str], input: &str, message: &str| {
+            let out = jev(args, input, &[]);
+            assert_eq!(out.status, 2, "{args:?}: {}", out.stderr);
+            assert!(out.stderr.contains(message), "{}", out.stderr);
+        };
+        usage(
+            &[
+                "eval",
+                page,
+                "--compare",
+                page,
+                "--cases",
+                cases,
+                "--calibrate",
+            ],
+            "",
+            "--calibrate and --compare do not mix: calibrate one page at a time.",
+        );
+        usage(
+            &["eval", "--cases", cases, "--calibrate"],
+            EVAL_PAGE,
+            "--calibrate writes the page back, so the page has to be a file, not stdin.",
+        );
+        usage(
+            &["eval", page, "--cases", cases, "--target-accuracy", "0.8"],
+            "",
+            "--target-accuracy only applies with --calibrate.",
+        );
+        usage(
+            &[
+                "eval",
+                page,
+                "--cases",
+                cases,
+                "--calibrate",
+                "--target-accuracy",
+                "2",
+            ],
+            "",
+            "--target-accuracy takes a number from 0 to 1.",
+        );
+        let body = jev(&["json", page], "", &[]).stdout;
+        std::fs::write(page, &body).expect("the body");
+        let refused = jev(
+            &["eval", page, "--cases", cases, "--mock", "--calibrate"],
+            "",
+            &[],
+        );
+        assert_eq!(refused.status, 1);
+        assert!(
+            refused.stderr.contains(
+                "jev eval: --calibrate needs a .jev page: a request body has nowhere to keep a bar."
+            ),
+            "{}",
+            refused.stderr
+        );
+        assert_eq!(std::fs::read_to_string(page).expect("the page"), body);
+    });
+}
+
+/// The candidate page: is_urgent asked another way, frustration dropped, sarcasm added.
+const EVAL_PAGE_B: &str = "placeholder
+---
+is_urgent? The message conveys urgency or time pressure
+department: Which team should handle this
+  billing = Payment or subscription issues
+  technical = Bugs or integration problems
+  sales = Pricing and plans
+sarcasm? The customer is being sarcastic
+";
+
+/// A directory holding two pages and a cases file, for the duration of one test.
+fn with_pages(name: &str, cases: &str, run: impl FnOnce(&str, &str, &str)) {
+    let dir = scratch(name);
+    let (a, b, path) = (
+        dir.join("a.jev"),
+        dir.join("b.jev"),
+        dir.join("cases.jsonl"),
+    );
+    std::fs::write(&a, EVAL_PAGE).expect("page a is written");
+    std::fs::write(&b, EVAL_PAGE_B).expect("page b is written");
+    std::fs::write(&path, cases).expect("the cases are written");
+    run(
+        a.to_str().expect("a path"),
+        b.to_str().expect("a path"),
+        path.to_str().expect("a path"),
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Whether some line of `text` holds `parts` in order with only spaces between them.
+fn has_row(text: &str, parts: &[&str]) -> bool {
+    let wanted: Vec<&str> = parts.iter().flat_map(|p| p.split_whitespace()).collect();
+    text.lines().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        words.windows(wanted.len()).any(|w| w == wanted.as_slice())
+    })
+}
+
+#[test]
+fn reports_the_difference_per_shared_question_and_what_only_one_page_asks() {
+    with_pages("compare", EVAL_CASES, |a, b, cases| {
+        let out = jev(
+            &["eval", a, "--compare", b, "--cases", cases, "--mock"],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        assert!(
+            has_row(&out.stdout, &["is_urgent", "noul", "2 paired cases"]),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            has_row(&out.stdout, &["department", "choice", "3 paired cases"]),
+            "{}",
+            out.stdout
+        );
+        for wanted in [
+            "McNemar",
+            "only in a: frustration",
+            "only in b: sarcasm",
+            "3 cases · a 3 answered, 0 errors · b 3 answered, 0 errors",
+        ] {
+            assert!(out.stdout.contains(wanted), "{wanted:?} in\n{}", out.stdout);
+        }
+        assert!(out.stderr.contains("Simulated answers"), "{}", out.stderr);
+    });
+}
+
+#[test]
+fn prints_both_reports_and_the_comparison_as_json() {
+    with_pages("compare-json", EVAL_CASES, |a, b, cases| {
+        let out = jev(
+            &[
+                "eval",
+                a,
+                "--compare",
+                b,
+                "--cases",
+                cases,
+                "--mock",
+                "--json",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        let report: Value = serde_json::from_str(&out.stdout).expect("a JSON report");
+        assert_eq!(report["a"]["page"], a);
+        assert_eq!(report["b"]["page"], b);
+        let names: Vec<&String> = report["questions"]
+            .as_object()
+            .expect("questions")
+            .keys()
+            .collect();
+        assert_eq!(names, vec!["is_urgent", "department"]);
+        assert_eq!(report["onlyB"], json!(["sarcasm"]));
+        assert_eq!(report["regressions"], json!([]));
+    });
+}
+
+#[test]
+fn names_the_page_a_label_does_not_fit() {
+    let cases = r#"{"state": "x", "expect": {"frustration": 2, "sarcasm": 1}}"#;
+    with_pages("compare-misfit", cases, |a, b, cases| {
+        let out = jev(
+            &["eval", a, "--compare", b, "--cases", cases, "--mock"],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 1);
+        assert!(
+            out.stderr
+                .contains(&format!("cases line 1: {b}: sarcasm is a noul")),
+            "{}",
+            out.stderr
+        );
+    });
+}
+
+#[test]
+fn exits_2_when_the_pages_cannot_be_told_apart_on_the_command_line() {
+    with_pages("compare-usage", EVAL_CASES, |a, b, cases| {
+        let both = jev(
+            &["eval", "--compare", "-", "--cases", cases, "--mock"],
+            "x",
+            &[],
+        );
+        assert_eq!(both.status, 2);
+        assert!(
+            both.stderr
+                .contains("only one of the page, --compare and --cases can come from stdin."),
+            "{}",
+            both.stderr
+        );
+        let lonely = jev(
+            &[
+                "eval",
+                a,
+                "--cases",
+                cases,
+                "--mock",
+                "--fail-on-regression",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(lonely.status, 2);
+        assert!(
+            lonely.stderr.contains(
+                "--fail-on-regression needs --compare: there is nothing to regress from."
+            ),
+            "{}",
+            lonely.stderr
+        );
+        assert_eq!(
+            jev(&["eval", a, "--compare", b, "--mock"], "", &[]).status,
+            2
+        );
+    });
+}
+
+/// What the simulator says about `state` for an is_urgent asked with `instructions`, at 0.5.
+fn simulated_yes(instructions: &str, state: &str) -> bool {
+    let question = json!({"type": "noul", "instructions": instructions});
+    match jev_repl::mock::answer(&json!(state), "is_urgent", &question) {
+        Some(typesafe::Answer::Noul(answer)) => answer.is_yes(0.5),
+        _ => false,
+    }
+}
+
+#[test]
+fn fails_on_a_regression_the_test_can_see_and_only_when_asked_to() {
+    // Label every state the way page a answers it, so page a is always right and every case page
+    // b answers differently is one it broke. The simulator is deterministic, so this holds.
+    let mut lines = Vec::new();
+    let mut broke = 0;
+    let mut i = 0;
+    while broke < 8 {
+        let state = format!("ticket {i}");
+        let a = simulated_yes("The message conveys urgency", &state);
+        if a != simulated_yes("The message conveys urgency or time pressure", &state) {
+            broke += 1;
+        }
+        lines.push(json!({"state": state, "expect": {"is_urgent": a}}).to_string());
+        i += 1;
+    }
+    with_pages("regression", &lines.join("\n"), |a, b, cases| {
+        let args = ["eval", a, "--compare", b, "--cases", cases, "--mock"];
+        let quiet = jev(&args, "", &[]);
+        assert_eq!(quiet.status, 0, "{}", quiet.stderr);
+        assert!(
+            quiet.stdout.contains("0 fixed · 8 broke · 0 changed"),
+            "{}",
+            quiet.stdout
+        );
+        assert!(
+            quiet.stdout.contains("b is significantly worse"),
+            "{}",
+            quiet.stdout
+        );
+        let strict = jev(&[&args[..], &["--fail-on-regression"]].concat(), "", &[]);
+        assert_eq!(strict.status, 1);
+        assert!(
+            strict.stderr.contains(&format!(
+                "jev eval: is_urgent is significantly worse in {b} (McNemar p 0.008)."
+            )),
+            "{}",
+            strict.stderr
+        );
+    });
+}
+
+#[test]
+fn holds_both_pages_to_min_accuracy_and_says_which_one_missed() {
+    // States both pages answer alike, labelled the other way: both pages score 0.
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while lines.len() < 3 {
+        let state = format!("ticket {i}");
+        let a = simulated_yes("The message conveys urgency", &state);
+        if a == simulated_yes("The message conveys urgency or time pressure", &state) {
+            lines.push(json!({"state": state, "expect": {"is_urgent": !a}}).to_string());
+        }
+        i += 1;
+    }
+    with_pages("compare-bar", &lines.join("\n"), |a, b, cases| {
+        let out = jev(
+            &[
+                "eval",
+                a,
+                "--compare",
+                b,
+                "--cases",
+                cases,
+                "--mock",
+                "--min-accuracy",
+                "0.5",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(out.status, 1);
+        for page in [a, b] {
+            let wanted = format!("jev eval: {page}: is_urgent accuracy 0.00 is below 0.50.");
+            assert!(
+                out.stderr.contains(&wanted),
+                "{wanted:?} in\n{}",
+                out.stderr
+            );
+        }
+    });
 }
 
 const PAGE_ONE: &str = "placeholder\n---\nis_urgent? The message conveys urgency\n";
@@ -678,6 +1183,49 @@ async fn answers_a_second_run_from_the_cache_without_sending_anything() {
     assert_eq!(again.stdout, first.stdout);
 }
 
+/// The eval cache is the SDK's cassette format: a client replaying the cache directory answers
+/// every request `jev eval` sent, byte for byte the same body, without a server or a key.
+#[tokio::test]
+async fn a_cache_directory_replays_through_the_sdk() {
+    let server = answering_from_the_state().await;
+    let dir = scratch("cassette");
+    let cases = live_cases("cassette-cases", EVAL_LIVE_CASES);
+    let out = live_eval(
+        &server,
+        cases.to_str().expect("a path"),
+        &["--cache", dir.to_str().expect("a path")],
+    )
+    .await;
+    assert_eq!(out.status, 0, "{}", out.stderr);
+
+    let replaying = typesafe::Client::builder()
+        .replay(&dir)
+        .build()
+        .expect("replaying needs no key");
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 4);
+    for request in requests {
+        let body: Value = serde_json::from_slice(&request.body).expect("a JSON body");
+        // Raw questions re-send the objects exactly as jev sent them.
+        let questions: typesafe::Questions = body["questions"]
+            .as_object()
+            .expect("questions")
+            .iter()
+            .map(|(name, q)| (name.clone(), q.clone()))
+            .collect();
+        let replayed = replaying
+            .system_one(body["state"].clone(), questions)
+            .model(body["model"].as_str().expect("a model"))
+            .await
+            .expect("the cache holds this request");
+        assert_eq!(replayed.meta.attempts, 0);
+        let state = body["state"].as_str().expect("a text state");
+        let urgent = replayed.noul("is_urgent").expect("answered").noul;
+        assert_eq!(urgent >= 0.5, state.starts_with("urgent"), "{state}");
+    }
+    assert_eq!(asked(&server).await, 4);
+}
+
 #[tokio::test]
 async fn refuses_to_send_when_the_estimate_is_above_max_cost() {
     let server = answering_from_the_state().await;
@@ -691,6 +1239,115 @@ async fn refuses_to_send_when_the_estimate_is_above_max_cost() {
     assert_eq!(out.status, 1);
     assert_eq!(asked(&server).await, 0);
     assert!(out.stderr.contains("refusing to send"), "{}", out.stderr);
+}
+
+#[tokio::test]
+async fn compares_two_pages_over_one_pool_one_preflight_and_one_cache() {
+    let server = answering_from_the_state().await;
+    let dir = scratch("live-compare");
+    let other = dir.join("b.jev");
+    std::fs::write(
+        &other,
+        "placeholder\n---\nis_urgent? Something needs doing now\n",
+    )
+    .expect("page b is written");
+    let cache = dir.join("cache");
+    let cases = live_cases("live-compare-cases", EVAL_LIVE_CASES);
+    let cases = cases.to_str().expect("a path");
+    let (other, cache) = (
+        other.to_str().expect("a path"),
+        cache.to_str().expect("a path"),
+    );
+    let args = ["--compare", other, "--cache", cache, "--price", "0.20/1.00"];
+    let first = live_eval(&server, cases, &args).await;
+    assert_eq!(first.status, 0, "{}", first.stderr);
+    assert_eq!(asked(&server).await, 8);
+    assert!(
+        first
+            .stderr
+            .contains("jev eval: 4 + 4 cases over two pages, ≈"),
+        "{}",
+        first.stderr
+    );
+    assert!(
+        first.stderr.contains("at $0.20/$1.00 per Mtok"),
+        "{}",
+        first.stderr
+    );
+    assert!(
+        first.stdout.contains("80 in / 40 out tokens"),
+        "{}",
+        first.stdout
+    );
+    assert!(
+        first
+            .stdout
+            .contains("McNemar: no discordant pairs, nothing to test"),
+        "{}",
+        first.stdout
+    );
+    let again = live_eval(&server, cases, &args).await;
+    assert_eq!(asked(&server).await, 8);
+    assert_eq!(again.stdout, first.stdout);
+    let refused = live_eval(
+        &server,
+        cases,
+        &[
+            "--compare",
+            other,
+            "--max-cost",
+            "0.000001",
+            "--price",
+            "0.20/1.00",
+        ],
+    )
+    .await;
+    assert_eq!(refused.status, 1);
+    assert!(
+        refused.stderr.contains("refusing to send"),
+        "{}",
+        refused.stderr
+    );
+    assert_eq!(asked(&server).await, 8);
+}
+
+#[tokio::test]
+async fn does_not_calibrate_over_a_run_with_errors() {
+    let server = answering_from_the_state().await;
+    let dir = scratch("live-calibrate");
+    let page = dir.join("page.jev");
+    std::fs::write(&page, PAGE_ONE).expect("the page");
+    let cases = live_cases(
+        "live-calibrate-cases",
+        &format!(
+            "{EVAL_LIVE_CASES}\n{}",
+            r#"{"id": "bad", "state": "refuse this one", "expect": {"is_urgent": true}}"#
+        ),
+    );
+    let out = tokio::process::Command::new(JEV)
+        .args([
+            "eval",
+            page.to_str().expect("a path"),
+            "--cases",
+            cases.to_str().expect("a path"),
+            "--calibrate",
+        ])
+        .env("TYPESAFE_API_KEY", "sk-test")
+        .env("TYPESAFE_BASE_URL", server.uri())
+        .env("JEV_PRICE", "")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("jev finishes");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "jev eval: not calibrating: 1 case came back with errors, so the numbers are incomplete."
+        ),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&page).expect("the page"), PAGE_ONE);
 }
 
 #[tokio::test]

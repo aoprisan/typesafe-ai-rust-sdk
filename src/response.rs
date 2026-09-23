@@ -143,7 +143,7 @@ pub struct ResponseMeta {
     pub status: u16,
     /// Response headers.
     pub headers: HeaderMap,
-    /// Number of attempts made, including the successful one.
+    /// Number of attempts made, including the successful one; `0` for a replayed response.
     pub attempts: u32,
 }
 

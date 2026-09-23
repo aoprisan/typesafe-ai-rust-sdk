@@ -90,6 +90,7 @@ fn will_not_send_a_request_that_asks_nothing() {
         state: Value::String("hi".to_owned()),
         questions: Vec::new(),
         model: None,
+        bars: Vec::new(),
     };
     assert!(
         headless::sendable(&session)
@@ -105,6 +106,7 @@ fn will_not_send_a_request_with_nothing_to_judge() {
         state: Value::String(String::new()),
         questions: vec![entry],
         model: None,
+        bars: Vec::new(),
     };
     assert!(
         headless::sendable(&session)

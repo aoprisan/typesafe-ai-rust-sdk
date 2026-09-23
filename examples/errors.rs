@@ -1,5 +1,5 @@
 //! cargo run --example errors  (no API key, no network needed)
-//! Every failure the SDK reports and how to tell them apart. The three it can provoke offline
+//! Every failure the SDK reports and how to tell them apart. The four it can provoke offline
 //! are provoked here; the rest are matched in `report` so the shape of each one is visible.
 use std::time::Duration;
 
@@ -37,6 +37,17 @@ async fn main() {
         .await
         .expect_err("nothing is listening on port 9");
     report("unreachable server", err);
+
+    // 4. ReplayMiss — replaying recorded responses, and this request was never recorded.
+    let replaying = Client::builder()
+        .replay(std::env::temp_dir().join("typesafe-errors-example-empty"))
+        .build()
+        .expect("replaying needs no key");
+    let err = replaying
+        .system_one("anything", Questions::from([("ok", Noul::new("Fine?"))]))
+        .await
+        .expect_err("nothing was recorded there");
+    report("not recorded", err);
 }
 
 /// One place that knows what to do with each kind of failure.
@@ -77,6 +88,9 @@ fn report(label: &str, err: Error) {
         Error::ResponseValidation(bad) => {
             println!("unusable response at {} — {}", bad.field_path, bad.detail);
         }
+
+        // A test replaying recorded responses asked something new. Record it, then replay again.
+        Error::ReplayMiss { path, .. } => println!("not recorded — no {}", path.display()),
 
         // `Error` is `#[non_exhaustive]`: later versions may add variants.
         other => println!("{other}"),

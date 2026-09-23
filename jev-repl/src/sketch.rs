@@ -25,13 +25,15 @@
 //! - `name! {json}` sends a hand-built question object, like [`Question::Raw`].
 //! - The parts of a question can also go on its first line, separated by `|`.
 //! - `@model jev-2` pins the model; `#` starts a comment. Indentation is only for reading.
+//! - `@threshold 0.6` under a noul, or `@confidence 0.7` under a choice or a score, writes down the
+//!   bar its answer is acted on at. It stays on the page and is never sent.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use typesafe::{Choice, Noul, Question, Score};
 
-use crate::format::{CHOICE, DIM, NOUL, SCORE, WARN};
+use crate::format::{ACCENT, CHOICE, DIM, NOUL, SCORE, WARN};
 use crate::session::Session;
 
 /// What one line of a sketch turned out to be; shown in the editor gutter.
@@ -51,6 +53,8 @@ pub enum Tag {
     Option,
     Level,
     Json,
+    /// `@threshold` or `@confidence`: the bar the question above is acted on at.
+    Bar,
     /// A line that could not be placed; it always carries a problem.
     Stray,
 }
@@ -71,6 +75,7 @@ impl Tag {
             Tag::Option => "option",
             Tag::Level => "level",
             Tag::Json => "json",
+            Tag::Bar => "bar",
             Tag::Stray => "?",
         }
     }
@@ -81,6 +86,7 @@ impl Tag {
             Tag::Choice | Tag::Option => CHOICE,
             Tag::Score | Tag::Level => SCORE,
             Tag::Raw | Tag::Json => WARN,
+            Tag::Bar => ACCENT,
             Tag::Stray => Color::Red,
             _ => DIM,
         }
@@ -99,6 +105,17 @@ pub struct Problem {
     pub message: String,
 }
 
+/// Where a question sits on the page, so a bar can be written back without redrawing the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSpan {
+    /// Zero-based line of the question's head.
+    pub head: usize,
+    /// Zero-based line of the last line that belongs to it: a part, a criterion, its bar.
+    pub last: usize,
+    /// Zero-based line of its `@threshold` or `@confidence`, when it has one.
+    pub bar: Option<usize>,
+}
+
 /// A parsed sketch. Questions with problems are left out of `questions` but keep their tags, so
 /// the page still reads sensibly while it is being fixed.
 #[derive(Debug, Default)]
@@ -106,6 +123,10 @@ pub struct Parsed {
     pub state: Value,
     pub model: Option<String>,
     pub questions: Vec<(String, Question)>,
+    /// Each question's bar, from its `@threshold` or `@confidence` line.
+    pub bars: Vec<(String, f64)>,
+    /// Every question that parsed, by name: where it is on the page.
+    pub blocks: Vec<(String, BlockSpan)>,
     /// One per line of the input.
     pub tags: Vec<Tag>,
     pub problems: Vec<Problem>,
@@ -121,7 +142,24 @@ impl Parsed {
             state: self.state.clone(),
             questions: self.questions.clone(),
             model: self.model.clone(),
+            bars: self.bars.clone(),
         }
+    }
+
+    /// Where a question that parsed sits on the page.
+    pub fn block(&self, name: &str) -> Option<BlockSpan> {
+        self.blocks
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, block)| *block)
+    }
+
+    /// The bar a question's line gave it.
+    pub fn bar(&self, name: &str) -> Option<f64> {
+        self.bars
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, bar)| *bar)
     }
 
     /// The first problem on or after a line — what the status line shows for the cursor.
@@ -139,6 +177,15 @@ struct Block {
     /// The head line after the marker, unsplit — raw questions need it whole.
     rest: String,
     parts: Vec<(usize, String)>,
+    /// `@threshold` / `@confidence` lines: the line, which of the two, and the number.
+    bars: Vec<(usize, Directive, f64)>,
+}
+
+/// The two directives that set a question's bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Directive {
+    Threshold,
+    Confidence,
 }
 
 pub fn parse(text: &str) -> Parsed {
@@ -186,6 +233,36 @@ pub fn parse(text: &str) -> Parsed {
                 .map(|(k, a)| (k, a.trim()))
                 .unwrap_or((directive, ""));
             match key {
+                "threshold" | "confidence" => {
+                    let directive = if key == "threshold" {
+                        Directive::Threshold
+                    } else {
+                        Directive::Confidence
+                    };
+                    match (parse_bar(arg), block.as_mut()) {
+                        (None, _) => {
+                            out.tags[i] = Tag::Stray;
+                            out.problems.push(Problem {
+                                line: i,
+                                message: format!(
+                                    "`@{key}` takes a number from 0 to 1, e.g. `@{key} 0.6`"
+                                ),
+                            });
+                        }
+                        (Some(_), None) => {
+                            out.tags[i] = Tag::Stray;
+                            out.problems.push(Problem {
+                                line: i,
+                                message: match directive {
+                                    Directive::Threshold => "`@threshold` belongs under a question — put it below the `name?` line it sets",
+                                    Directive::Confidence => "`@confidence` belongs under a question — put it below the choice or score it gates",
+                                }
+                                .into(),
+                            });
+                        }
+                        (Some(bar), Some(b)) => b.bars.push((i, directive, bar)),
+                    }
+                }
                 "model" if !arg.is_empty() => {
                     out.tags[i] = Tag::Model;
                     out.model = Some(arg.to_owned());
@@ -201,7 +278,9 @@ pub fn parse(text: &str) -> Parsed {
                     out.tags[i] = Tag::Stray;
                     out.problems.push(Problem {
                         line: i,
-                        message: format!("unknown directive `@{other}`; only `@model` exists"),
+                        message: format!(
+                            "unknown directive `@{other}`; there is `@model`, and `@threshold` or `@confidence` under a question"
+                        ),
                     });
                 }
             }
@@ -217,6 +296,7 @@ pub fn parse(text: &str) -> Parsed {
                 marker,
                 rest: rest.to_owned(),
                 parts: Vec::new(),
+                bars: Vec::new(),
             });
             continue;
         }
@@ -269,8 +349,84 @@ fn is_criterion(word: &str) -> bool {
     )
 }
 
-/// Turn a finished block into a question, or into problems.
+/// A bar as the page writes it: a plain decimal from 0 to 1. Plain, so `1e-1` and `0x1` are
+/// refused the same way in every port rather than read however a runtime happens to read them.
+pub fn parse_bar(text: &str) -> Option<f64> {
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let plain = match text.split_once('.') {
+        Some(("", fraction)) => !fraction.is_empty() && digits(fraction),
+        Some((whole, fraction)) => digits(whole) && digits(fraction),
+        None => !text.is_empty() && digits(text),
+    };
+    if !plain {
+        return None;
+    }
+    let n: f64 = text.parse().ok()?;
+    (0.0..=1.0).contains(&n).then_some(n)
+}
+
+/// The wire `type` of a question that parsed, with a hand-built object as `raw`.
+fn kind_of(question: &Question) -> &'static str {
+    match question {
+        Question::Noul(_) => "noul",
+        Question::Choice(_) => "choice",
+        Question::Score(_) => "score",
+        _ => "raw",
+    }
+}
+
+/// Turn a finished block into a question and its bar, or into problems.
 fn finish(b: Block, out: &mut Parsed) {
+    let before = out.questions.len();
+    let (line, name, parts, bars) = (b.line, b.name.clone(), b.parts.clone(), b.bars.clone());
+    finish_question(b, out);
+    let kind = if out.questions.len() > before {
+        out.questions.last().map(|(_, q)| kind_of(q))
+    } else {
+        None
+    };
+    let mut last = parts.iter().map(|(i, _)| *i).fold(line, usize::max);
+    let mut bar_at: Option<usize> = None;
+    for (i, directive, value) in bars {
+        last = last.max(i);
+        out.tags[i] = Tag::Bar;
+        // A question that did not parse has problems enough; its bar waits until it does.
+        let Some(kind) = kind else { continue };
+        let refused = if let Some(at) = bar_at {
+            Some(format!("`{name}` already has a bar on line {}", at + 1))
+        } else if kind == "raw" {
+            Some("a raw question takes no bar — jev cannot read its answer".to_owned())
+        } else if kind == "noul" && directive == Directive::Confidence {
+            Some("a yes/no question takes `@threshold`, not `@confidence`".to_owned())
+        } else if kind != "noul" && directive == Directive::Threshold {
+            Some("a choice or a score takes `@confidence`, not `@threshold`".to_owned())
+        } else {
+            None
+        };
+        match refused {
+            Some(message) => {
+                out.tags[i] = Tag::Stray;
+                out.problems.push(Problem { line: i, message });
+            }
+            None => {
+                bar_at = Some(i);
+                out.bars.push((name.clone(), value));
+            }
+        }
+    }
+    if kind.is_some() {
+        out.blocks.push((
+            name,
+            BlockSpan {
+                head: line,
+                last,
+                bar: bar_at,
+            },
+        ));
+    }
+}
+
+fn finish_question(b: Block, out: &mut Parsed) {
     let mut problem = |line: usize, message: String| {
         out.problems.push(Problem { line, message });
     };
@@ -538,8 +694,63 @@ pub fn render(session: &Session) -> String {
             out.push('\n');
         }
         out.push_str(&render_question(name, question));
+        if let (Some(bar), Some(directive)) = (session.bar(name), bar_directive(question)) {
+            out.push_str(&format!("  {directive} {bar}\n"));
+        }
     }
     out
+}
+
+/// Which directive holds a question's bar, by its kind; a raw question has none.
+fn bar_directive(question: &Question) -> Option<&'static str> {
+    match kind_of(question) {
+        "noul" => Some("@threshold"),
+        "choice" | "score" => Some("@confidence"),
+        _ => None,
+    }
+}
+
+/// Write bars into a page without redrawing it: each named question's bar line is replaced, or a
+/// new one is added at the end of its block, and every other line — comments, blank lines, the way
+/// someone chose to lay out their options — stays exactly as it was.
+///
+/// Questions the page does not have, raw ones and pages that do not parse are left alone; the
+/// caller has already parsed the page and knows which it is.
+pub fn set_bars(text: &str, bars: &[(String, f64)]) -> String {
+    let parsed = parse(text);
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    let cr = if text.contains("\r\n") { "\r" } else { "" };
+    let leading = |line: &str| -> String {
+        line.chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect()
+    };
+    let mut inserts: Vec<(usize, String)> = Vec::new();
+    for (name, value) in bars {
+        let directive = parsed
+            .questions
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, q)| bar_directive(q));
+        let (Some(block), Some(directive)) = (parsed.block(name), directive) else {
+            continue;
+        };
+        if let Some(at) = block.bar {
+            let old = &lines[at];
+            let end = if old.ends_with('\r') { "\r" } else { "" };
+            lines[at] = format!("{}{directive} {value}{end}", leading(old));
+            continue;
+        }
+        let indent = (block.head + 1..=block.last)
+            .find(|i| !matches!(parsed.tags.get(*i), None | Some(Tag::Blank | Tag::Comment)))
+            .map_or_else(|| "  ".to_owned(), |i| leading(&lines[i]));
+        inserts.push((block.last, format!("{indent}{directive} {value}{cr}")));
+    }
+    inserts.sort_by(|x, y| y.0.cmp(&x.0));
+    for (after, line) in inserts {
+        lines.insert(after + 1, line);
+    }
+    lines.join("\n")
 }
 
 fn render_question(name: &str, question: &Question) -> String {

@@ -10,6 +10,7 @@
 //! the report goes out as lines and JSON. Reading files, hashing request bodies and talking to the
 //! API belong to the caller.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ use tokio::task::JoinSet;
 use typesafe::{Answer, Choice, Question, Usage};
 
 use crate::cost::{self, Cost, Rates};
-use crate::format::{BAD, CHOICE, bold, color_for, dim, text_of};
+use crate::format::{BAD, CHOICE, DIM, SCORE, bold, color_for, dim, text_of};
 use crate::headless::Answered;
 use crate::session::{self, Session};
 
@@ -36,14 +37,43 @@ pub struct Case {
     /// session's questions. A `Vec` and not a map, because that is the shape `Session` uses for
     /// questions and it saves a dependency.
     pub expect: Vec<(String, Expectation)>,
+    /// For a case labelled per turn: which prefix of the conversation this is (1-based), and how
+    /// many turns the whole conversation has. Such a case is sent once per turn, and each is a case.
+    pub turn: Option<usize>,
+    pub turns: Option<usize>,
+}
+
+/// A per-turn label: the turn a noul becomes true from, or never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByTurn {
+    Turn(usize),
+    Never,
+}
+
+impl ByTurn {
+    /// The turn, or `None` for never — what the JSON report writes.
+    pub fn turn(self) -> Option<usize> {
+        match self {
+            ByTurn::Turn(k) => Some(k),
+            ByTurn::Never => None,
+        }
+    }
 }
 
 /// What one question is expected to answer, in the shape its kind is scored in.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expectation {
-    Noul { yes: bool },
-    Choice { label: String },
-    Score { level: usize },
+    Noul {
+        yes: bool,
+        /// Set when the label was `{"by_turn": k}`: the turn it becomes true, or never.
+        by_turn: Option<ByTurn>,
+    },
+    Choice {
+        label: String,
+    },
+    Score {
+        level: usize,
+    },
 }
 
 impl Expectation {
@@ -64,23 +94,103 @@ impl Expectation {
 /// report names a case by, so a bad row is found by the same number that reported it.
 pub fn parse_cases(text: &str, session: &Session) -> Result<Vec<Case>, String> {
     let mut cases = Vec::new();
+    read_cases(text, |one| {
+        let mut expect = Vec::with_capacity(one.wanted.len());
+        for (name, value) in one.wanted {
+            let question = question_of(session, name)
+                .ok_or_else(|| format!("no question named {name:?} on the page."))?;
+            expect.push((
+                name.clone(),
+                expected(name, question, value, turn_count(one.state))?,
+            ));
+        }
+        cases.extend(cases_of(&one, expect));
+        Ok(())
+    })?;
+    Ok(cases)
+}
+
+/// What the two pages of a comparison are called in its messages and its report.
+#[derive(Debug, Clone, Copy)]
+pub struct Labels<'a> {
+    pub a: &'a str,
+    pub b: &'a str,
+}
+
+/// Parse one cases file for two pages at once: a case per page, each holding the expectations for
+/// that page's questions.
+///
+/// A label may name a question on either page, which is what lets a page that adds a question be
+/// compared with one that does not. It is still checked against every page that has the question —
+/// a case one page cannot even express is not a paired observation, it is a typo.
+pub fn parse_compare_cases(
+    text: &str,
+    a: &Session,
+    b: &Session,
+    labels: Labels<'_>,
+) -> Result<(Vec<Case>, Vec<Case>), String> {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    read_cases(text, |one| {
+        let mut expect_a = Vec::new();
+        let mut expect_b = Vec::new();
+        for (name, value) in one.wanted {
+            let on_a = question_of(a, name);
+            let on_b = question_of(b, name);
+            if on_a.is_none() && on_b.is_none() {
+                return Err(format!("no question named {name:?} on either page."));
+            }
+            for (question, into, label) in [
+                (on_a, &mut expect_a, labels.a),
+                (on_b, &mut expect_b, labels.b),
+            ] {
+                let Some(question) = question else { continue };
+                let expectation = expected(name, question, value, turn_count(one.state))
+                    .map_err(|e| format!("{label}: {e}"))?;
+                into.push((name.clone(), expectation));
+            }
+        }
+        left.extend(cases_of(&one, expect_a));
+        right.extend(cases_of(&one, expect_b));
+        Ok(())
+    })?;
+    Ok((left, right))
+}
+
+/// A line of the cases file that is a case in shape, before its labels meet a page.
+struct RawCase<'a> {
+    line: usize,
+    id: Option<String>,
+    state: &'a Value,
+    wanted: &'a serde_json::Map<String, Value>,
+}
+
+/// Hand every non-blank line to `visit` as a case, stopping at the first line that is not one or
+/// that `visit` refuses; the message that comes back already names the line.
+fn read_cases(
+    text: &str,
+    mut visit: impl FnMut(RawCase<'_>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut seen = 0usize;
     for (i, raw) in text.split('\n').enumerate() {
         let raw = raw.trim();
         if raw.is_empty() {
             continue;
         }
         let line = i + 1;
-        let one = parse_case(raw, line, session).map_err(|e| format!("cases line {line}: {e}"))?;
-        cases.push(one);
+        let value: Value = serde_json::from_str(raw)
+            .map_err(|e| format!("cases line {line}: not valid JSON: {e}"))?;
+        let one = read_case(&value, line).map_err(|e| format!("cases line {line}: {e}"))?;
+        visit(one).map_err(|e| format!("cases line {line}: {e}"))?;
+        seen += 1;
     }
-    if cases.is_empty() {
+    if seen == 0 {
         return Err("the cases file holds no cases.".to_owned());
     }
-    Ok(cases)
+    Ok(())
 }
 
-fn parse_case(text: &str, line: usize, session: &Session) -> Result<Case, String> {
-    let value: Value = serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
+fn read_case(value: &Value, line: usize) -> Result<RawCase<'_>, String> {
     let object = value
         .as_object()
         .ok_or("expected a JSON object with `state` and `expect`.")?;
@@ -105,30 +215,120 @@ fn parse_case(text: &str, line: usize, session: &Session) -> Result<Case, String
         .as_object()
         .filter(|map| !map.is_empty())
         .ok_or("`expect` has to name at least one question.")?;
-
-    let mut expect = Vec::with_capacity(wanted.len());
-    for (name, value) in wanted {
-        let question = session
-            .questions
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, q)| q)
-            .ok_or_else(|| format!("no question named {name:?} on the page."))?;
-        expect.push((name.clone(), expected(name, question, value)?));
-    }
-    Ok(Case {
+    Ok(RawCase {
         line,
         id,
-        state: state.clone(),
-        expect,
+        state,
+        wanted,
     })
 }
 
+/// The cases one line becomes: itself, or — when a noul is labelled per turn — one case per prefix
+/// of the conversation. A per-turn noul expects `turn >= k` at every prefix; the line's other
+/// labels were written about the whole conversation, so they go on the last prefix only. A case
+/// left with nothing to score is not sent at all.
+fn cases_of(one: &RawCase<'_>, expect: Vec<(String, Expectation)>) -> Vec<Case> {
+    let named = |state: Value, expect, turn, turns| Case {
+        line: one.line,
+        id: one.id.clone(),
+        state,
+        expect,
+        turn,
+        turns,
+    };
+    if expect.is_empty() {
+        return Vec::new();
+    }
+    let per_turn = expect.iter().any(|(_, e)| {
+        matches!(
+            e,
+            Expectation::Noul {
+                by_turn: Some(_),
+                ..
+            }
+        )
+    });
+    let turns = session::turns_of(one.state);
+    let (true, Some(turns)) = (per_turn, turns) else {
+        return vec![named(one.state.clone(), expect, None, None)];
+    };
+    let n = turns.len();
+    let mut out = Vec::new();
+    for turn in 1..=n {
+        let mut at = Vec::new();
+        for (name, e) in &expect {
+            match e {
+                Expectation::Noul {
+                    by_turn: Some(by_turn),
+                    ..
+                } => {
+                    let yes = matches!(by_turn, ByTurn::Turn(k) if turn >= *k);
+                    at.push((
+                        name.clone(),
+                        Expectation::Noul {
+                            yes,
+                            by_turn: Some(*by_turn),
+                        },
+                    ));
+                }
+                _ if turn == n => at.push((name.clone(), e.clone())),
+                _ => {}
+            }
+        }
+        if at.is_empty() {
+            continue;
+        }
+        let state = session::turns_to_json(&turns[..turn]);
+        out.push(named(state, at, Some(turn), Some(n)));
+    }
+    out
+}
+
+/// How many turns a state has, when it is a conversation.
+fn turn_count(state: &Value) -> Option<usize> {
+    session::turns_of(state).map(|turns| turns.len())
+}
+
+/// A JSON value the way `JSON.stringify` writes it, whole numbers without a `.0`.
+fn compact(value: &Value) -> String {
+    match value.as_f64() {
+        Some(n) if value.is_f64() && n.fract() == 0.0 && n.abs() < 9e15 => (n as i64).to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn question_of<'a>(session: &'a Session, name: &str) -> Option<&'a Question> {
+    session
+        .questions
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, q)| q)
+}
+
 /// Check one expected value against the question it names, and store it the way it is scored.
-fn expected(name: &str, question: &Question, value: &Value) -> Result<Expectation, String> {
+fn expected(
+    name: &str,
+    question: &Question,
+    value: &Value,
+    turns: Option<usize>,
+) -> Result<Expectation, String> {
+    if let (Question::Choice(_) | Question::Score(_), Value::Object(object)) = (question, value)
+        && object.contains_key("by_turn")
+    {
+        let kind = if matches!(question, Question::Choice(_)) {
+            "choice"
+        } else {
+            "score"
+        };
+        return Err(format!("by_turn is for a noul, and {name} is a {kind}."));
+    }
     match question {
         Question::Noul(_) => match value {
-            Value::Bool(yes) => Ok(Expectation::Noul { yes: *yes }),
+            Value::Object(object) => by_turn(name, object, value, turns),
+            Value::Bool(yes) => Ok(Expectation::Noul {
+                yes: *yes,
+                by_turn: None,
+            }),
             other => Err(format!(
                 "{name} is a noul: expected true or false, got {other}."
             )),
@@ -173,12 +373,51 @@ fn expected(name: &str, question: &Question, value: &Value) -> Result<Expectatio
     }
 }
 
+/// `{"by_turn": k}`: false before turn `k` of the conversation and true from it on, or never true
+/// when `k` is null. It only means something over a conversation, and only for a turn it has.
+fn by_turn(
+    name: &str,
+    object: &serde_json::Map<String, Value>,
+    value: &Value,
+    turns: Option<usize>,
+) -> Result<Expectation, String> {
+    if object.len() != 1 || !object.contains_key("by_turn") {
+        return Err(format!(
+            "{name}: a per-turn expectation is {{\"by_turn\": n}}, the turn it becomes true, or null for never; got {}.",
+            compact(value)
+        ));
+    }
+    let Some(turns) = turns else {
+        return Err(format!(
+            "{name} gives by_turn, but the state is not a conversation of turns."
+        ));
+    };
+    let k = &object["by_turn"];
+    if k.is_null() {
+        return Ok(Expectation::Noul {
+            yes: false,
+            by_turn: Some(ByTurn::Never),
+        });
+    }
+    match k.as_f64() {
+        Some(n) if n.fract() == 0.0 && n >= 1.0 && n <= turns as f64 => Ok(Expectation::Noul {
+            yes: false,
+            by_turn: Some(ByTurn::Turn(n as usize)),
+        }),
+        _ => Err(format!(
+            "{name} by_turn must be a whole turn from 1 to {turns}, or null for never; got {}.",
+            compact(k)
+        )),
+    }
+}
+
 /// The session as one case sends it: the page's questions, the case's state.
 pub fn with_state(session: &Session, state: Value) -> Session {
     Session {
         state,
         questions: session.questions.clone(),
         model: session.model.clone(),
+        bars: session.bars.clone(),
     }
 }
 
@@ -196,9 +435,8 @@ pub enum Outcome {
 
 /// Send every case through `ask`, at most `concurrency` at a time; results are in case order.
 ///
-/// Every case is spawned at once and a semaphore decides how many are in the air, so a slow case
-/// holds up nothing but itself, and each result is written to its own slot: a file of a thousand
-/// labels keeps its order however the calls come back.
+/// A slow case holds up nothing but itself, and each result is written to its own slot: a file of
+/// a thousand labels keeps its order however the calls come back.
 pub async fn run<F, Fut>(
     session: &Session,
     cases: &[Case],
@@ -211,31 +449,88 @@ where
 {
     let permits = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut workers = JoinSet::new();
+    spawn_leg(&mut workers, &permits, 0, session, cases, ask).await;
+    let [outcomes] = collect(workers, [cases.len()]).await;
+    outcomes
+}
+
+/// One page's share of a comparison: its session, its cases, and how to ask it.
+pub struct Leg<'a, F> {
+    pub session: &'a Session,
+    pub cases: &'a [Case],
+    pub ask: F,
+}
+
+/// Both pages of a comparison through one pool of workers: page `a`'s cases first, then `b`'s.
+///
+/// One pool rather than one per page, so `--concurrency` still means what it says — that many
+/// requests in the air, whichever page they are for.
+pub async fn run_compare<FA, FutA, FB, FutB>(
+    a: Leg<'_, FA>,
+    b: Leg<'_, FB>,
+    concurrency: usize,
+) -> (Vec<Outcome>, Vec<Outcome>)
+where
+    FA: Fn(Session) -> FutA + Send + Sync + Clone + 'static,
+    FutA: Future<Output = Outcome> + Send + 'static,
+    FB: Fn(Session) -> FutB + Send + Sync + Clone + 'static,
+    FutB: Future<Output = Outcome> + Send + 'static,
+{
+    let permits = Arc::new(Semaphore::new(concurrency.max(1)));
+    let mut workers = JoinSet::new();
+    let sizes = [a.cases.len(), b.cases.len()];
+    spawn_leg(&mut workers, &permits, 0, a.session, a.cases, a.ask).await;
+    spawn_leg(&mut workers, &permits, 1, b.session, b.cases, b.ask).await;
+    let [left, right] = collect(workers, sizes).await;
+    (left, right)
+}
+
+/// Queue one leg's cases on the pool, in order: a case is spawned once a permit is free, so the
+/// cases go out in file order and never more than the pool allows are in the air.
+async fn spawn_leg<F, Fut>(
+    workers: &mut JoinSet<(usize, usize, Outcome)>,
+    permits: &Arc<Semaphore>,
+    leg: usize,
+    session: &Session,
+    cases: &[Case],
+    ask: F,
+) where
+    F: Fn(Session) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Outcome> + Send + 'static,
+{
     for (at, one) in cases.iter().enumerate() {
         let session = with_state(session, one.state.clone());
         let ask = ask.clone();
-        let permits = Arc::clone(&permits);
+        let permit = Arc::clone(permits).acquire_owned().await;
         workers.spawn(async move {
-            let _permit = permits.acquire_owned().await;
-            (at, ask(session).await)
+            let _permit = permit;
+            (leg, at, ask(session).await)
         });
     }
+}
 
-    let mut outcomes: Vec<Option<Outcome>> = vec![None; cases.len()];
+/// Wait for every worker and put each outcome in its leg's slot for its case.
+async fn collect<const N: usize>(
+    mut workers: JoinSet<(usize, usize, Outcome)>,
+    sizes: [usize; N],
+) -> [Vec<Outcome>; N] {
+    let mut slots: [Vec<Option<Outcome>>; N] = sizes.map(|n| vec![None; n]);
     while let Some(joined) = workers.join_next().await {
         // A worker that panicked leaves its slot empty; the run is not lost to one case.
-        if let Ok((at, outcome)) = joined {
-            outcomes[at] = Some(outcome);
+        if let Ok((leg, at, outcome)) = joined {
+            slots[leg][at] = Some(outcome);
         }
     }
-    outcomes
-        .into_iter()
-        .map(|outcome| {
-            outcome.unwrap_or_else(|| Outcome::Failed {
-                error: "nothing was sent for this case.".to_owned(),
+    slots.map(|outcomes| {
+        outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.unwrap_or_else(|| Outcome::Failed {
+                    error: "nothing was sent for this case.".to_owned(),
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
 }
 
 /// One row of a noul's threshold sweep: the confusion counts, and what they come to.
@@ -278,10 +573,14 @@ pub enum QuestionReport {
         cases: usize,
         /// Mean squared error of the probability itself, threshold or no threshold.
         brier: f64,
-        /// Accuracy at the threshold this run was asked to use.
+        /// What it was read at: the page's `@threshold`, or the run's threshold when it has none.
+        threshold: f64,
+        /// Accuracy at that threshold.
         accuracy: f64,
         best: Best,
         sweep: Vec<SweepRow>,
+        /// When it noticed, for the conversations labelled per turn; `None` when none were.
+        latency: Option<Latency>,
     },
     Choice {
         name: String,
@@ -344,6 +643,8 @@ impl QuestionReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaseError {
     pub case: usize,
+    /// The prefix of a per-turn case that failed.
+    pub turn: Option<usize>,
     pub id: Option<String>,
     pub message: String,
 }
@@ -385,6 +686,10 @@ const CUTS: [f64; 5] = [0.0, 0.2, 0.4, 0.6, 0.8];
 
 /// One case that answered everything it was labelled for.
 struct Scored<'a> {
+    line: usize,
+    id: Option<&'a str>,
+    turn: Option<usize>,
+    turns: Option<usize>,
     expect: &'a [(String, Expectation)],
     answers: Vec<(String, Answer)>,
     usage: Option<Usage>,
@@ -410,12 +715,49 @@ pub fn report(
     outcomes: &[Outcome],
     options: ReportOptions<'_>,
 ) -> Report {
+    let (errors, scored) = scored_of(cases, outcomes);
+    let mut questions = Vec::new();
+    for (name, question) in &session.questions {
+        let rows: Vec<&Scored<'_>> = scored
+            .iter()
+            .filter(|one| one.expects(name).is_some())
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        match question {
+            Question::Noul(_) => questions.push(noul_report(
+                name,
+                &rows,
+                session.threshold_of(name, options.threshold),
+            )),
+            Question::Choice(q) => questions.push(choice_report(name, q, &rows)),
+            Question::Score(_) => questions.push(score_report(name, &rows)),
+            _ => {}
+        }
+    }
+
+    let usage = usage_of(session, cases, &scored, options.model, options.rates);
+    Report {
+        model: options.model.to_owned(),
+        threshold: options.threshold,
+        cases: cases.len(),
+        answered: scored.len(),
+        errors,
+        questions,
+        usage,
+    }
+}
+
+/// Split the outcomes into the cases that can be scored and the ones that are errors.
+fn scored_of<'a>(cases: &'a [Case], outcomes: &[Outcome]) -> (Vec<CaseError>, Vec<Scored<'a>>) {
     let mut errors: Vec<CaseError> = Vec::new();
-    let mut scored: Vec<Scored<'_>> = Vec::new();
+    let mut scored: Vec<Scored<'a>> = Vec::new();
     for (at, one) in cases.iter().enumerate() {
         let mut failed = |message: String| {
             errors.push(CaseError {
                 case: one.line,
+                turn: one.turn,
                 id: one.id.clone(),
                 message,
             });
@@ -440,39 +782,16 @@ pub fn report(
             continue;
         }
         scored.push(Scored {
+            line: one.line,
+            id: one.id.as_deref(),
+            turn: one.turn,
+            turns: one.turns,
             expect: &one.expect,
             answers,
             usage: usage.clone(),
         });
     }
-
-    let mut questions = Vec::new();
-    for (name, question) in &session.questions {
-        let rows: Vec<&Scored<'_>> = scored
-            .iter()
-            .filter(|one| one.expects(name).is_some())
-            .collect();
-        if rows.is_empty() {
-            continue;
-        }
-        match question {
-            Question::Noul(_) => questions.push(noul_report(name, &rows, options.threshold)),
-            Question::Choice(q) => questions.push(choice_report(name, q, &rows)),
-            Question::Score(_) => questions.push(score_report(name, &rows)),
-            _ => {}
-        }
-    }
-
-    let usage = usage_of(session, cases, &scored, options.model, options.rates);
-    Report {
-        model: options.model.to_owned(),
-        threshold: options.threshold,
-        cases: cases.len(),
-        answered: scored.len(),
-        errors,
-        questions,
-        usage,
-    }
+    (errors, scored)
 }
 
 /// Why this case cannot be scored, if it cannot: the first label that got no answer, or one whose
@@ -512,7 +831,7 @@ fn noul_report(name: &str, rows: &[&Scored<'_>], threshold: f64) -> QuestionRepo
                 Some(Answer::Noul(a)) => a.noul,
                 _ => 0.0,
             };
-            let yes = matches!(row.expects(name), Some(Expectation::Noul { yes: true }));
+            let yes = matches!(row.expects(name), Some(Expectation::Noul { yes: true, .. }));
             (p, yes)
         })
         .collect();
@@ -553,10 +872,123 @@ fn noul_report(name: &str, rows: &[&Scored<'_>], threshold: f64) -> QuestionRepo
         name: name.to_owned(),
         cases: points.len(),
         brier,
+        threshold,
         accuracy,
         best,
         sweep,
+        latency: latency_of(name, rows, threshold),
     }
+}
+
+/// One conversation labelled per turn: the turn it should have said yes, and the turn it did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadLatency {
+    pub case: usize,
+    pub id: Option<String>,
+    /// `by_turn`; `None` when it should never have said yes.
+    pub expected: Option<usize>,
+    /// The first turn at or above the threshold; `None` when there was none.
+    pub detected: Option<usize>,
+    /// `detected − expected`, negative when early; `None` unless both are known.
+    pub latency: Option<i64>,
+}
+
+/// How early or late a noul notices, over the conversations labelled per turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Latency {
+    pub threads: usize,
+    pub on_time: usize,
+    pub early: usize,
+    pub late: usize,
+    pub missed: usize,
+    pub false_alarms: usize,
+    /// Mean latency over the threads that expected a yes and got one; `None` when none did.
+    pub mean: Option<f64>,
+    pub cases: Vec<ThreadLatency>,
+}
+
+/// Detection latency: for each conversation labelled per turn, the first turn the noul said yes,
+/// against the turn it should have. A thread with a prefix that errored is left out, because its
+/// first yes might be the one that is missing.
+fn latency_of(name: &str, rows: &[&Scored<'_>], threshold: f64) -> Option<Latency> {
+    let mut threads: Vec<(usize, Vec<&Scored<'_>>)> = Vec::new();
+    for row in rows {
+        let per_turn = matches!(
+            row.expects(name),
+            Some(Expectation::Noul {
+                by_turn: Some(_),
+                ..
+            })
+        );
+        if !per_turn || row.turn.is_none() {
+            continue;
+        }
+        match threads.iter_mut().find(|(line, _)| *line == row.line) {
+            Some((_, thread)) => thread.push(row),
+            None => threads.push((row.line, vec![row])),
+        }
+    }
+    if threads.is_empty() {
+        return None;
+    }
+    let mut cases = Vec::new();
+    let (mut on_time, mut early, mut late, mut missed, mut false_alarms) = (0, 0, 0, 0, 0);
+    let mut lags: Vec<f64> = Vec::new();
+    for (line, mut thread) in threads {
+        let first = thread[0];
+        if Some(thread.len()) != first.turns {
+            continue;
+        }
+        thread.sort_by_key(|row| row.turn);
+        let expected = match first.expects(name) {
+            Some(Expectation::Noul {
+                by_turn: Some(by_turn),
+                ..
+            }) => by_turn.turn(),
+            _ => None,
+        };
+        let detected = thread
+            .iter()
+            .find(|row| matches!(row.answer(name), Some(Answer::Noul(a)) if a.noul >= threshold))
+            .and_then(|row| row.turn);
+        let lag = match (expected, detected) {
+            (Some(k), Some(d)) => Some(d as i64 - k as i64),
+            _ => None,
+        };
+        match (expected, lag) {
+            (None, _) => {
+                if detected.is_some() {
+                    false_alarms += 1;
+                }
+            }
+            (Some(_), None) => missed += 1,
+            (Some(_), Some(lag)) => {
+                lags.push(lag as f64);
+                match lag.cmp(&0) {
+                    std::cmp::Ordering::Equal => on_time += 1,
+                    std::cmp::Ordering::Less => early += 1,
+                    std::cmp::Ordering::Greater => late += 1,
+                }
+            }
+        }
+        cases.push(ThreadLatency {
+            case: line,
+            id: first.id.map(str::to_owned),
+            expected,
+            detected,
+            latency: lag,
+        });
+    }
+    Some(Latency {
+        threads: cases.len(),
+        on_time,
+        early,
+        late,
+        missed,
+        false_alarms,
+        mean: (!lags.is_empty()).then(|| mean(lags.iter().copied())),
+        cases,
+    })
 }
 
 fn sweep_row(points: &[(f64, bool)], threshold: f64) -> SweepRow {
@@ -683,8 +1115,13 @@ fn score_report(name: &str, rows: &[&Scored<'_>]) -> QuestionReport {
 
 /// Coverage and accuracy at each cut: what you buy by only acting on confident answers.
 fn gate(points: impl Iterator<Item = (f64, bool)>) -> Vec<GateRow> {
+    gate_at(points, &CUTS)
+}
+
+/// The gate at any set of cuts: the report reads five, calibration twenty.
+fn gate_at(points: impl Iterator<Item = (f64, bool)>, cuts: &[f64]) -> Vec<GateRow> {
     let points: Vec<(f64, bool)> = points.collect();
-    CUTS.iter()
+    cuts.iter()
         .map(|confidence| {
             let kept: Vec<bool> = points
                 .iter()
@@ -786,13 +1223,67 @@ fn mean(values: impl Iterator<Item = f64>) -> f64 {
     if count == 0 { 0.0 } else { sum / count as f64 }
 }
 
-/// Two decimals, rounding a tie away from zero the way the TypeScript port's `toFixed(2)` does.
+/// Two decimals, the way the TypeScript port's `toFixed(2)` writes them.
 ///
-/// Rust rounds a tie to even, so `0.125` would print `0.12` here and `0.13` there; every rate and
-/// probability in a report goes through this so the two ports' reports can be compared byte for
-/// byte.
+/// Rust rounds an exact tie to even, so `0.125` would print `0.12` here and `0.13` there; every
+/// rate and probability in a report goes through this so the two ports' reports can be compared
+/// byte for byte.
 pub fn two(x: f64) -> String {
-    format!("{:.2}", (x * 100.0).round() / 100.0)
+    to_fixed(x, 2)
+}
+
+/// Three decimals, the way `toFixed(3)` writes them; see [`two`].
+pub fn three(x: f64) -> String {
+    to_fixed(x, 3)
+}
+
+/// `Number.prototype.toFixed`: the double's exact decimal value, rounded to `digits` places with an
+/// exact tie going away from zero.
+///
+/// Scaling by a power of ten and rounding is not the same thing — `0.475 * 100` lands on `47.5`
+/// although `0.475` is a hair below it, so it would print `0.48` where `toFixed` prints `0.47`.
+/// Rust's `{:.N}` is already exact and differs only on a true tie, which is the one case handled
+/// by hand.
+fn to_fixed(x: f64, digits: usize) -> String {
+    if !x.is_finite() {
+        return format!("{x}");
+    }
+    // Wide enough to hold every digit of any double's exact expansion.
+    let exact = format!("{:.1100}", x.abs());
+    let point = exact.find('.').unwrap_or(exact.len());
+    let tail = exact.get(point + 1 + digits..).unwrap_or("");
+    let tie = tail.starts_with('5') && tail[1..].bytes().all(|b| b == b'0');
+    let magnitude = if tie {
+        let mut kept: Vec<u8> = exact[..point + 1 + digits].bytes().collect();
+        let mut at = kept.len();
+        loop {
+            if at == 0 {
+                kept.insert(0, b'1');
+                break;
+            }
+            at -= 1;
+            match kept[at] {
+                b'.' => continue,
+                b'9' => kept[at] = b'0',
+                digit => {
+                    kept[at] = digit + 1;
+                    break;
+                }
+            }
+        }
+        let mut text = String::from_utf8(kept).unwrap_or_default();
+        if digits == 0 {
+            text.pop();
+        }
+        text
+    } else {
+        format!("{:.digits$}", x.abs())
+    };
+    if x < 0.0 {
+        format!("-{magnitude}")
+    } else {
+        magnitude
+    }
 }
 
 /// The text report, as lines the terminal draws.
@@ -813,8 +1304,17 @@ pub fn report_lines(report: &Report) -> Vec<Line<'static>> {
         }
         out.push(header_line(question, width));
         match question {
-            QuestionReport::Noul { sweep, best, .. } => {
-                out.extend(sweep_lines(sweep, *best, report.threshold));
+            QuestionReport::Noul {
+                sweep,
+                best,
+                threshold,
+                latency,
+                ..
+            } => {
+                out.extend(sweep_lines(sweep, *best, *threshold));
+                if let Some(latency) = latency {
+                    out.push(latency_line(latency));
+                }
             }
             QuestionReport::Choice {
                 gate,
@@ -834,7 +1334,7 @@ pub fn report_lines(report: &Report) -> Vec<Line<'static>> {
             out.push(Line::default());
         }
         for failed in &report.errors {
-            out.extend(error_case_lines(failed));
+            out.extend(error_case_lines(failed, ""));
         }
     }
 
@@ -916,6 +1416,35 @@ fn sweep_lines(sweep: &[SweepRow], best: Best, threshold: f64) -> Vec<Line<'stat
     out
 }
 
+/// The one line that says when a noul noticed, over the conversations labelled per turn.
+fn latency_line(latency: &Latency) -> Line<'static> {
+    let counted = |n: usize, word: &str| format!("{n} {word}{}", plural(n));
+    let mean = match latency.mean {
+        None => "·".to_owned(),
+        Some(m) => format!(
+            "{} turn{}",
+            signed(m),
+            if m.abs() == 1.0 { "" } else { "s" }
+        ),
+    };
+    Line::from(vec![
+        Span::raw("    "),
+        dim("by turn  "),
+        Span::raw(
+            [
+                counted(latency.threads, "thread"),
+                format!("{} on time", latency.on_time),
+                format!("{} early", latency.early),
+                format!("{} late", latency.late),
+                format!("{} missed", latency.missed),
+                counted(latency.false_alarms, "false alarm"),
+                format!("mean latency {mean}"),
+            ]
+            .join(" · "),
+        ),
+    ])
+}
+
 fn gate_lines(gate: &[GateRow], accuracy: &str) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(vec![
         Span::raw("    "),
@@ -987,11 +1516,11 @@ fn confusion_lines(labels: &[String], confusion: &[Vec<usize>]) -> Vec<Line<'sta
     out
 }
 
-fn error_case_lines(failed: &CaseError) -> Vec<Line<'static>> {
-    let name = match &failed.id {
-        Some(id) => format!("case {} ({id})", failed.case),
-        None => format!("case {}", failed.case),
-    };
+fn error_case_lines(failed: &CaseError, prefix: &str) -> Vec<Line<'static>> {
+    let name = format!(
+        "{prefix}{}",
+        case_name(failed.case, failed.id.as_deref(), failed.turn)
+    );
     let mut parts = failed.message.split('\n');
     let first = parts.next().unwrap_or("").trim().to_owned();
     let mut out = vec![Line::from(vec![
@@ -1047,6 +1576,9 @@ pub fn report_json(report: &Report) -> Value {
         .map(|failed| {
             let mut out = serde_json::Map::new();
             out.insert("case".to_owned(), json!(failed.case));
+            if let Some(turn) = failed.turn {
+                out.insert("turn".to_owned(), json!(turn));
+            }
             if let Some(id) = &failed.id {
                 out.insert("id".to_owned(), json!(id));
             }
@@ -1070,14 +1602,18 @@ fn question_json(question: &QuestionReport) -> Value {
         QuestionReport::Noul {
             cases,
             brier,
+            threshold,
             accuracy,
             best,
             sweep,
+            latency,
             ..
-        } => json!({
+        } => {
+            let mut out = json!({
             "kind": question.kind(),
             "cases": cases,
             "brier": number(*brier),
+            "threshold": number(*threshold),
             "accuracy": number(*accuracy),
             "best": {"threshold": number(best.threshold), "f1": number(best.f1)},
             "sweep": sweep.iter().map(|row| json!({
@@ -1091,7 +1627,12 @@ fn question_json(question: &QuestionReport) -> Value {
                 "recall": maybe(row.recall),
                 "f1": number(row.f1),
             })).collect::<Vec<_>>(),
-        }),
+            });
+            if let (Some(latency), Value::Object(object)) = (latency, &mut out) {
+                object.insert("latency".to_owned(), latency_json(latency));
+            }
+            out
+        }
         QuestionReport::Choice {
             cases,
             accuracy,
@@ -1123,6 +1664,34 @@ fn question_json(question: &QuestionReport) -> Value {
             "gate": gate.iter().map(gate_json).collect::<Vec<_>>(),
         }),
     }
+}
+
+fn latency_json(latency: &Latency) -> Value {
+    let cases: Vec<Value> = latency
+        .cases
+        .iter()
+        .map(|one| {
+            let mut out = serde_json::Map::new();
+            out.insert("case".to_owned(), json!(one.case));
+            if let Some(id) = &one.id {
+                out.insert("id".to_owned(), json!(id));
+            }
+            out.insert("expected".to_owned(), json!(one.expected));
+            out.insert("detected".to_owned(), json!(one.detected));
+            out.insert("latency".to_owned(), json!(one.latency));
+            Value::Object(out)
+        })
+        .collect();
+    json!({
+        "threads": latency.threads,
+        "onTime": latency.on_time,
+        "early": latency.early,
+        "late": latency.late,
+        "missed": latency.missed,
+        "falseAlarms": latency.false_alarms,
+        "mean": maybe(latency.mean),
+        "cases": cases,
+    })
 }
 
 fn gate_json(row: &GateRow) -> Value {
@@ -1170,12 +1739,1110 @@ fn pad_end(text: &str, width: usize) -> String {
 
 /// Styled lines as the plain text a pipe wants.
 pub fn report_text(report: &Report) -> String {
+    lines_text(report_lines(report))
+}
+
+fn lines_text(lines: Vec<Line<'static>>) -> String {
     let mut out = String::new();
-    for line in report_lines(report) {
+    for line in lines {
         for span in &line.spans {
             out.push_str(span.content.as_ref());
         }
         out.push('\n');
     }
+    out
+}
+
+// ---- two pages over the same cases ------------------------------------------------------------
+
+/// One page's run, as a comparison needs it.
+#[derive(Debug, Clone, Copy)]
+pub struct Side<'a> {
+    /// What the page is called: the path it was read from.
+    pub label: &'a str,
+    pub session: &'a Session,
+    pub cases: &'a [Case],
+    pub outcomes: &'a [Outcome],
+    pub model: &'a str,
+}
+
+/// What the exact McNemar test made of the discordant pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    TooFew,
+    Better,
+    Worse,
+    Same,
+}
+
+impl Verdict {
+    /// The word the report and the JSON use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::TooFew => "too few",
+            Verdict::Better => "better",
+            Verdict::Worse => "worse",
+            Verdict::Same => "same",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct McNemar {
+    /// Cases one page got right and the other wrong: `fixed + broke`.
+    pub discordant: usize,
+    /// Two-sided exact p-value; 1 when there is nothing to test.
+    pub p: f64,
+    pub verdict: Verdict,
+}
+
+/// A case the two pages answered differently.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Flip {
+    pub case: usize,
+    pub turn: Option<usize>,
+    pub id: Option<String>,
+    /// What the case expects, and what each page predicted, in the question's own terms.
+    pub expected: Value,
+    pub a: Value,
+    pub b: Value,
+    /// `fixed`: `b` put right what `a` got wrong. `broke`: the reverse. `changed`: both wrong.
+    pub status: &'static str,
+}
+
+/// One metric on both sides, and what moved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Metric {
+    /// The JSON key.
+    pub key: &'static str,
+    /// The row name in the text report.
+    pub label: &'static str,
+    pub a: f64,
+    pub b: f64,
+    /// Whether a delta means anything: a threshold is a setting, not a result.
+    pub delta: bool,
+}
+
+/// A question both pages ask the same way, measured on the cases both pages scored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shared {
+    pub name: String,
+    pub kind: &'static str,
+    pub paired: usize,
+    pub metrics: Vec<Metric>,
+    pub fixed: usize,
+    pub broke: usize,
+    pub changed: usize,
+    pub mcnemar: McNemar,
+    pub flips: Vec<Flip>,
+}
+
+/// A name both pages use for questions of different kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mismatch {
+    pub name: String,
+    pub a: &'static str,
+    pub b: &'static str,
+}
+
+/// One page's report, with the name it goes by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Labelled {
+    pub label: String,
+    pub report: Report,
+}
+
+/// Everything a comparison found, with the numbers unrounded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comparison {
+    pub a: Labelled,
+    pub b: Labelled,
+    pub questions: Vec<Shared>,
+    pub only_a: Vec<String>,
+    pub only_b: Vec<String>,
+    pub mismatched: Vec<Mismatch>,
+    pub unpaired: Vec<String>,
+    /// Distinct cases across both pages.
+    pub cases: usize,
+    pub usage: ReportUsage,
+}
+
+/// What a comparison is read at, which both reports repeat back.
+#[derive(Debug, Clone, Copy)]
+pub struct CompareOptions {
+    pub threshold: f64,
+    pub rates: Option<Rates>,
+}
+
+/// The level McNemar's test is read at. Not a flag: a comparison should mean the same everywhere.
+pub const ALPHA: f64 = 0.05;
+
+/// Below this many discordant pairs no two-sided exact p can reach [`ALPHA`]: 2 / 2^5 > 0.05.
+pub const MIN_DISCORDANT: usize = 6;
+
+/// The exact McNemar test on the discordant pairs of a paired comparison.
+///
+/// Under "no difference" each discordant pair is a fair coin, so the p-value is a binomial tail.
+/// It is summed in log space because `2^n` stops being a number long before a cases file stops
+/// being a reasonable size.
+pub fn mcnemar(fixed: usize, broke: usize) -> McNemar {
+    let n = fixed + broke;
+    let mut p = 1.0;
+    if n > 0 {
+        let low = fixed.min(broke);
+        let ln2n = n as f64 * std::f64::consts::LN_2;
+        let mut ln_choose = 0.0;
+        let mut tail = (-ln2n).exp();
+        for k in 1..=low {
+            ln_choose += ((n - k + 1) as f64).ln() - (k as f64).ln();
+            tail += (ln_choose - ln2n).exp();
+        }
+        p = (2.0 * tail).min(1.0);
+    }
+    let verdict = if n < MIN_DISCORDANT {
+        Verdict::TooFew
+    } else if p < ALPHA && fixed > broke {
+        Verdict::Better
+    } else if p < ALPHA && broke > fixed {
+        Verdict::Worse
+    } else {
+        Verdict::Same
+    };
+    McNemar {
+        discordant: n,
+        p,
+        verdict,
+    }
+}
+
+/// The wire `type` of a question, with anything that is not a noul, a choice or a score as `raw`.
+fn kind_of(question: &Question) -> &'static str {
+    match question {
+        Question::Noul(_) => "noul",
+        Question::Choice(_) => "choice",
+        Question::Score(_) => "score",
+        _ => "raw",
+    }
+}
+
+/// Put two runs of the same cases side by side.
+///
+/// Only the cases both pages scored count, so each delta is measured on the same states: a page
+/// that errored on the hard cases must not look better for it. The full reports, over everything
+/// each page scored, travel along for the JSON.
+pub fn compare(a: Side<'_>, b: Side<'_>, options: CompareOptions) -> Comparison {
+    let report_of = |side: &Side<'_>| {
+        report(
+            side.session,
+            side.cases,
+            side.outcomes,
+            ReportOptions {
+                model: side.model,
+                threshold: options.threshold,
+                rates: options.rates,
+            },
+        )
+    };
+    let (_, left) = scored_of(a.cases, a.outcomes);
+    let (_, right) = scored_of(b.cases, b.outcomes);
+    let right: HashMap<(usize, Option<usize>), &Scored<'_>> =
+        right.iter().map(|one| (key_of(one), one)).collect();
+    let twin_of = |one: &Scored<'_>| right.get(&key_of(one)).copied();
+
+    let kind_in_b = |name: &str| question_of(b.session, name).map(kind_of);
+    let mut questions = Vec::new();
+    let mut mismatched = Vec::new();
+    let mut unpaired = Vec::new();
+    for (name, question) in &a.session.questions {
+        let Some(other) = kind_in_b(name) else {
+            continue;
+        };
+        let kind = kind_of(question);
+        if other != kind || kind == "raw" {
+            if other != kind {
+                mismatched.push(Mismatch {
+                    name: name.clone(),
+                    a: kind,
+                    b: other,
+                });
+            }
+            continue;
+        }
+        let pairs: Vec<(&Scored<'_>, &Scored<'_>)> = left
+            .iter()
+            .filter_map(|one| {
+                let twin = twin_of(one)?;
+                (one.expects(name).is_some() && twin.expects(name).is_some()).then_some((one, twin))
+            })
+            .collect();
+        if pairs.is_empty() {
+            // A question nobody labelled is left out, as eval leaves it out; one that was labelled
+            // and still has no pair is worth saying so about.
+            let labelled = a
+                .cases
+                .iter()
+                .chain(b.cases)
+                .any(|one| one.expect.iter().any(|(n, _)| n == name));
+            if labelled {
+                unpaired.push(name.clone());
+            }
+            continue;
+        }
+        questions.push(shared(
+            name,
+            kind,
+            &pairs,
+            a.session.threshold_of(name, options.threshold),
+            b.session.threshold_of(name, options.threshold),
+        ));
+    }
+
+    let mut keys: Vec<(usize, Option<usize>)> =
+        a.cases.iter().chain(b.cases).map(case_key).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let report_a = report_of(&a);
+    let report_b = report_of(&b);
+    let usage = sum_usage(&report_a.usage, &report_b.usage, options.rates);
+    Comparison {
+        a: Labelled {
+            label: a.label.to_owned(),
+            report: report_a,
+        },
+        b: Labelled {
+            label: b.label.to_owned(),
+            report: report_b,
+        },
+        questions,
+        only_a: a
+            .session
+            .questions
+            .iter()
+            .filter(|(name, _)| question_of(b.session, name).is_none())
+            .map(|(name, _)| name.clone())
+            .collect(),
+        only_b: b
+            .session
+            .questions
+            .iter()
+            .filter(|(name, _)| question_of(a.session, name).is_none())
+            .map(|(name, _)| name.clone())
+            .collect(),
+        mismatched,
+        unpaired,
+        cases: keys.len(),
+        usage,
+    }
+}
+
+/// Which case a scored row came from, so the same case can be found on the other page.
+fn key_of(one: &Scored<'_>) -> (usize, Option<usize>) {
+    (one.line, one.turn)
+}
+
+/// The same key, for a case that has not been scored.
+fn case_key(one: &Case) -> (usize, Option<usize>) {
+    (one.line, one.turn)
+}
+
+fn sum_usage(a: &ReportUsage, b: &ReportUsage, rates: Option<Rates>) -> ReportUsage {
+    let input_tokens = a.input_tokens + b.input_tokens;
+    let output_tokens = a.output_tokens + b.output_tokens;
+    ReportUsage {
+        input_tokens,
+        output_tokens,
+        estimated: a.estimated || b.estimated,
+        cost: rates.map(|rates| cost::price(input_tokens, output_tokens, rates)),
+    }
+}
+
+/// One paired observation: what each side predicted, and whether it was right.
+struct Pair<'a> {
+    one: &'a Scored<'a>,
+    expected: Value,
+    a: Value,
+    b: Value,
+    right_a: bool,
+    right_b: bool,
+}
+
+fn shared(
+    name: &str,
+    kind: &'static str,
+    pairs: &[(&Scored<'_>, &Scored<'_>)],
+    threshold_a: f64,
+    threshold_b: f64,
+) -> Shared {
+    let noul_of = |row: &Scored<'_>| match row.answer(name) {
+        Some(Answer::Noul(answer)) => answer.noul,
+        _ => 0.0,
+    };
+    let yes_of =
+        |row: &Scored<'_>| matches!(row.expects(name), Some(Expectation::Noul { yes: true, .. }));
+    let choice_of = |row: &Scored<'_>| match row.answer(name) {
+        Some(Answer::Choice(answer)) => answer.choice.clone(),
+        _ => String::new(),
+    };
+    let level_of = |row: &Scored<'_>| match row.answer(name) {
+        Some(Answer::Score(answer)) => answer.rounded_level() as usize,
+        _ => 0,
+    };
+    let (metrics, observed): (Vec<Metric>, Vec<Pair<'_>>) = match kind {
+        "noul" => {
+            let left: Vec<(f64, bool)> = pairs
+                .iter()
+                .map(|(one, _)| (noul_of(one), yes_of(one)))
+                .collect();
+            let right: Vec<(f64, bool)> = pairs
+                .iter()
+                .map(|(_, twin)| (noul_of(twin), yes_of(twin)))
+                .collect();
+            let brier = |list: &[(f64, bool)]| {
+                mean(
+                    list.iter()
+                        .map(|(p, yes)| (p - if *yes { 1.0 } else { 0.0 }).powi(2)),
+                )
+            };
+            let row_a = sweep_row(&left, threshold_a);
+            let row_b = sweep_row(&right, threshold_b);
+            let metrics = vec![
+                metric("threshold", "threshold", threshold_a, threshold_b, false),
+                metric("brier", "brier", brier(&left), brier(&right), true),
+                metric("accuracy", "accuracy", row_a.accuracy, row_b.accuracy, true),
+                metric("f1", "f1", row_a.f1, row_b.f1, true),
+            ];
+            let observed = pairs
+                .iter()
+                .zip(left.iter().zip(&right))
+                .map(|((one, _), ((pa, yes), (pb, _)))| {
+                    let (pred_a, pred_b) = (*pa >= threshold_a, *pb >= threshold_b);
+                    Pair {
+                        one,
+                        expected: Value::Bool(*yes),
+                        a: Value::Bool(pred_a),
+                        b: Value::Bool(pred_b),
+                        right_a: pred_a == *yes,
+                        right_b: pred_b == *yes,
+                    }
+                })
+                .collect();
+            (metrics, observed)
+        }
+        "choice" => {
+            let observed: Vec<Pair<'_>> = pairs
+                .iter()
+                .map(|(one, twin)| {
+                    let expected = match one.expects(name) {
+                        Some(Expectation::Choice { label }) => label.clone(),
+                        _ => String::new(),
+                    };
+                    let (a, b) = (choice_of(one), choice_of(twin));
+                    Pair {
+                        one,
+                        right_a: a == expected,
+                        right_b: b == expected,
+                        expected: Value::String(expected),
+                        a: Value::String(a),
+                        b: Value::String(b),
+                    }
+                })
+                .collect();
+            let metrics = vec![metric(
+                "accuracy",
+                "accuracy",
+                mean(observed.iter().map(|pair| f64::from(pair.right_a))),
+                mean(observed.iter().map(|pair| f64::from(pair.right_b))),
+                true,
+            )];
+            (metrics, observed)
+        }
+        _ => {
+            let mut offs: Vec<(usize, usize)> = Vec::new();
+            let observed: Vec<Pair<'_>> = pairs
+                .iter()
+                .map(|(one, twin)| {
+                    let expected = match one.expects(name) {
+                        Some(Expectation::Score { level }) => *level,
+                        _ => 0,
+                    };
+                    let (a, b) = (level_of(one), level_of(twin));
+                    offs.push((a.abs_diff(expected), b.abs_diff(expected)));
+                    Pair {
+                        one,
+                        expected: json!(expected),
+                        a: json!(a),
+                        b: json!(b),
+                        right_a: a == expected,
+                        right_b: b == expected,
+                    }
+                })
+                .collect();
+            let both = |f: &dyn Fn(usize) -> f64| {
+                (
+                    mean(offs.iter().map(|(a, _)| f(*a))),
+                    mean(offs.iter().map(|(_, b)| f(*b))),
+                )
+            };
+            let (exact_a, exact_b) = both(&|off| f64::from(off == 0));
+            let (within_a, within_b) = both(&|off| f64::from(off <= 1));
+            let (mae_a, mae_b) = both(&|off| off as f64);
+            let metrics = vec![
+                metric("exact", "exact", exact_a, exact_b, true),
+                metric("withinOne", "within one", within_a, within_b, true),
+                metric("mae", "mae", mae_a, mae_b, true),
+            ];
+            (metrics, observed)
+        }
+    };
+
+    let mut flips = Vec::new();
+    let (mut fixed, mut broke, mut changed) = (0, 0, 0);
+    for pair in observed {
+        if pair.a == pair.b {
+            continue;
+        }
+        let status = if !pair.right_a && pair.right_b {
+            fixed += 1;
+            "fixed"
+        } else if pair.right_a {
+            broke += 1;
+            "broke"
+        } else {
+            changed += 1;
+            "changed"
+        };
+        flips.push(Flip {
+            case: pair.one.line,
+            turn: pair.one.turn,
+            id: pair.one.id.map(str::to_owned),
+            expected: pair.expected,
+            a: pair.a,
+            b: pair.b,
+            status,
+        });
+    }
+    Shared {
+        name: name.to_owned(),
+        kind,
+        paired: pairs.len(),
+        metrics,
+        fixed,
+        broke,
+        changed,
+        mcnemar: mcnemar(fixed, broke),
+        flips,
+    }
+}
+
+fn metric(key: &'static str, label: &'static str, a: f64, b: f64, delta: bool) -> Metric {
+    Metric {
+        key,
+        label,
+        a,
+        b,
+        delta,
+    }
+}
+
+/// The questions `b` is significantly worse at, for `--fail-on-regression`.
+pub fn regressions(comparison: &Comparison) -> Vec<&Shared> {
+    comparison
+        .questions
+        .iter()
+        .filter(|q| q.mcnemar.verdict == Verdict::Worse)
+        .collect()
+}
+
+/// How many flipped cases the text report lists per question before it points at the JSON.
+const FLIPS_SHOWN: usize = 10;
+
+/// The comparison as lines: a legend, a block per shared question, what could not be compared.
+pub fn compare_lines(comparison: &Comparison) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let sides = [("a", &comparison.a), ("b", &comparison.b)];
+    let label_width = sides
+        .iter()
+        .map(|(_, side)| side.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (letter, side) in sides {
+        let n = side.report.cases;
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            bold(letter),
+            Span::raw("  "),
+            Span::raw(pad_end(&side.label, label_width)),
+            Span::raw("  "),
+            dim(format!("{} · {n} case{}", side.report.model, plural(n))),
+        ]));
+    }
+
+    let width = comparison
+        .questions
+        .iter()
+        .map(|q| q.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for question in &comparison.questions {
+        out.push(Line::default());
+        out.extend(shared_lines(question, width));
+    }
+
+    let mut lists: Vec<Line<'static>> = Vec::new();
+    if !comparison.only_a.is_empty() {
+        lists.push(Line::from(vec![
+            Span::raw("  "),
+            dim("only in a: "),
+            Span::raw(comparison.only_a.join(", ")),
+        ]));
+    }
+    if !comparison.only_b.is_empty() {
+        lists.push(Line::from(vec![
+            Span::raw("  "),
+            dim("only in b: "),
+            Span::raw(comparison.only_b.join(", ")),
+        ]));
+    }
+    for odd in &comparison.mismatched {
+        lists.push(Line::from(vec![
+            Span::raw("  "),
+            dim("mismatched: "),
+            Span::raw(format!(
+                "{} is a {} in a and a {} in b",
+                odd.name, odd.a, odd.b
+            )),
+        ]));
+    }
+    for name in &comparison.unpaired {
+        lists.push(Line::from(vec![
+            Span::raw("  "),
+            dim("unpaired: "),
+            Span::raw(format!("{name} — no case was scored for it on both pages")),
+        ]));
+    }
+    if !lists.is_empty() {
+        out.push(Line::default());
+        out.extend(lists);
+    }
+
+    let mut failures: Vec<Line<'static>> = Vec::new();
+    for (letter, side) in sides {
+        for failed in &side.report.errors {
+            failures.extend(error_case_lines(failed, &format!("{letter} ")));
+        }
+    }
+    if !failures.is_empty() {
+        out.push(Line::default());
+        out.extend(failures);
+    }
+
+    out.push(Line::default());
+    let tally = |report: &Report| {
+        let errors = report.errors.len();
+        format!(
+            "{} answered, {errors} error{}",
+            report.answered,
+            plural(errors)
+        )
+    };
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        bold(format!(
+            "{} case{}",
+            comparison.cases,
+            plural(comparison.cases)
+        )),
+        dim(format!(
+            " · a {} · b {}",
+            tally(&comparison.a.report),
+            tally(&comparison.b.report)
+        )),
+    ]));
+    out.push(usage_line(&comparison.usage));
+    out
+}
+
+fn shared_lines(question: &Shared, width: usize) -> Vec<Line<'static>> {
+    let n = question.paired;
+    let mut out = vec![
+        Line::from(vec![
+            Span::raw("  "),
+            bold(pad_end(&question.name, width)),
+            Span::raw("  "),
+            Span::styled(
+                pad_end(question.kind, 8),
+                Style::new().fg(color_for(question.kind)),
+            ),
+            dim(format!("{n} paired case{}", plural(n))),
+        ]),
+        Line::from(vec![
+            Span::raw(format!("    {}", " ".repeat(14))),
+            dim(format!("{}{}Δ", pad_end("a", 8), pad_end("b", 8))),
+        ]),
+    ];
+    for metric in &question.metrics {
+        let mut cells = vec![two(metric.a), two(metric.b)];
+        if metric.delta {
+            cells.push(signed(metric.b - metric.a));
+        }
+        let cells: String = cells.iter().map(|cell| pad_end(cell, 8)).collect();
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            Span::raw(pad_end(metric.label, 14)),
+            Span::raw(cells.trim_end().to_owned()),
+        ]));
+    }
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        Span::raw(format!(
+            "{} fixed · {} broke · {} changed",
+            question.fixed, question.broke, question.changed
+        )),
+    ]));
+    let verdict = question.mcnemar.verdict;
+    let text = mcnemar_text(&question.mcnemar);
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        match verdict {
+            Verdict::Better => Span::styled(text, Style::new().fg(SCORE)),
+            Verdict::Worse => Span::styled(text, Style::new().fg(BAD)),
+            _ => dim(text),
+        },
+    ]));
+
+    let shown = &question.flips[..question.flips.len().min(FLIPS_SHOWN)];
+    let names: Vec<String> = shown
+        .iter()
+        .map(|flip| case_name(flip.case, flip.id.as_deref(), flip.turn))
+        .collect();
+    let moves: Vec<String> = shown
+        .iter()
+        .map(|flip| {
+            format!(
+                "{} → {}",
+                reading(question.kind, &flip.a),
+                reading(question.kind, &flip.b)
+            )
+        })
+        .collect();
+    let name_width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+    let move_width = moves.iter().map(|m| m.chars().count()).max().unwrap_or(0);
+    for ((flip, name), change) in shown.iter().zip(&names).zip(&moves) {
+        let color = match flip.status {
+            "fixed" => SCORE,
+            "broke" => BAD,
+            _ => DIM,
+        };
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            Span::raw(pad_end(name, name_width)),
+            Span::raw("   "),
+            Span::raw(pad_end(change, move_width)),
+            Span::raw("   "),
+            Span::styled(flip.status, Style::new().fg(color)),
+        ]));
+    }
+    let more = question.flips.len() - shown.len();
+    if more > 0 {
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            dim(format!("… {more} more flipped; --json lists them all")),
+        ]));
+    }
+    out
+}
+
+/// The significance line, which says in words what the p-value allows and what it does not.
+fn mcnemar_text(test: &McNemar) -> String {
+    if test.discordant == 0 {
+        return "McNemar: no discordant pairs, nothing to test".to_owned();
+    }
+    if test.verdict == Verdict::TooFew {
+        return format!(
+            "McNemar: too few discordant pairs to call ({}; {MIN_DISCORDANT} are needed for p < {ALPHA})",
+            test.discordant
+        );
+    }
+    let head = format!(
+        "McNemar p {} over {} discordant pairs: ",
+        three(test.p),
+        test.discordant
+    );
+    match test.verdict {
+        Verdict::Better => format!("{head}b is significantly better"),
+        Verdict::Worse => format!("{head}b is significantly worse"),
+        _ => format!("{head}no significant difference"),
+    }
+}
+
+/// A prediction as the report says it: yes or no, a label, a level.
+fn reading(kind: &str, value: &Value) -> String {
+    match (kind, value) {
+        ("noul", Value::Bool(true)) => "yes".to_owned(),
+        ("noul", _) => "no".to_owned(),
+        ("score", other) => format!("level {other}"),
+        (_, Value::String(label)) => label.clone(),
+        (_, other) => other.to_string(),
+    }
+}
+
+/// `case 7 turn 2 (t-007)`: the line in the cases file, the prefix of a case labelled per turn, and
+/// the id when the case has one.
+fn case_name(line: usize, id: Option<&str>, turn: Option<usize>) -> String {
+    let turn = turn.map(|t| format!(" turn {t}")).unwrap_or_default();
+    let id = id.map(|id| format!(" ({id})")).unwrap_or_default();
+    format!("case {line}{turn}{id}")
+}
+
+/// A change, signed either way, so a regression reads as one; `-0.00` is no change, so `+0.00`.
+pub fn signed(n: f64) -> String {
+    let text = two(n);
+    if text == "-0.00" {
+        return "+0.00".to_owned();
+    }
+    if text.starts_with('-') {
+        text
+    } else {
+        format!("+{text}")
+    }
+}
+
+/// The comparison as JSON, ready for `to_string_pretty`: both reports whole, and what moved
+/// between them.
+pub fn compare_json(comparison: &Comparison) -> Value {
+    let side = |one: &Labelled| {
+        let mut out = serde_json::Map::new();
+        out.insert("page".to_owned(), json!(one.label));
+        if let Value::Object(report) = report_json(&one.report) {
+            out.extend(report);
+        }
+        Value::Object(out)
+    };
+    let mut questions = serde_json::Map::new();
+    for question in &comparison.questions {
+        let pick = |f: &dyn Fn(&Metric) -> Option<f64>| {
+            let mut out = serde_json::Map::new();
+            for metric in &question.metrics {
+                if let Some(value) = f(metric) {
+                    out.insert(metric.key.to_owned(), number(value));
+                }
+            }
+            Value::Object(out)
+        };
+        let flips: Vec<Value> = question
+            .flips
+            .iter()
+            .map(|flip| {
+                let mut out = serde_json::Map::new();
+                out.insert("case".to_owned(), json!(flip.case));
+                if let Some(turn) = flip.turn {
+                    out.insert("turn".to_owned(), json!(turn));
+                }
+                if let Some(id) = &flip.id {
+                    out.insert("id".to_owned(), json!(id));
+                }
+                out.insert("expected".to_owned(), flip.expected.clone());
+                out.insert("a".to_owned(), flip.a.clone());
+                out.insert("b".to_owned(), flip.b.clone());
+                out.insert("status".to_owned(), json!(flip.status));
+                Value::Object(out)
+            })
+            .collect();
+        questions.insert(
+            question.name.clone(),
+            json!({
+                "kind": question.kind,
+                "paired": question.paired,
+                "a": pick(&|m| Some(m.a)),
+                "b": pick(&|m| Some(m.b)),
+                "delta": pick(&|m| m.delta.then_some(m.b - m.a)),
+                "fixed": question.fixed,
+                "broke": question.broke,
+                "changed": question.changed,
+                "mcnemar": {
+                    "discordant": question.mcnemar.discordant,
+                    "p": number(question.mcnemar.p),
+                    "verdict": question.mcnemar.verdict.as_str(),
+                },
+                "flips": flips,
+            }),
+        );
+    }
+    let mut usage = serde_json::Map::new();
+    usage.insert(
+        "inputTokens".to_owned(),
+        json!(comparison.usage.input_tokens),
+    );
+    usage.insert(
+        "outputTokens".to_owned(),
+        json!(comparison.usage.output_tokens),
+    );
+    usage.insert("estimated".to_owned(), json!(comparison.usage.estimated));
+    if let Some(cost) = comparison.usage.cost {
+        usage.insert("cost".to_owned(), number(cost.total));
+    }
+    json!({
+        "a": side(&comparison.a),
+        "b": side(&comparison.b),
+        "questions": Value::Object(questions),
+        "onlyA": comparison.only_a,
+        "onlyB": comparison.only_b,
+        "mismatched": comparison.mismatched.iter().map(|odd| json!({
+            "name": odd.name,
+            "a": odd.a,
+            "b": odd.b,
+        })).collect::<Vec<_>>(),
+        "unpaired": comparison.unpaired,
+        "regressions": regressions(comparison).iter().map(|q| q.name.clone()).collect::<Vec<_>>(),
+        "usage": Value::Object(usage),
+    })
+}
+
+/// The comparison as the plain text a pipe wants.
+pub fn compare_text(comparison: &Comparison) -> String {
+    lines_text(compare_lines(comparison))
+}
+
+// ---- writing the bars back --------------------------------------------------------------------
+
+/// The accuracy a choice's or score's bar has to reach when `--target-accuracy` is not given.
+pub const DEFAULT_TARGET: f64 = 0.9;
+
+/// The confidence bars calibration tries, `k / 20` for `k` from 0 to 19: finer than the report's
+/// gate, and computed by division so each prints as the short decimal it is.
+pub fn calibration_cuts() -> Vec<f64> {
+    (0..20).map(|k| f64::from(k) / 20.0).collect()
+}
+
+/// What calibration made of one question: the bar it found, or why it left the question alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalibratedQuestion {
+    pub name: String,
+    pub kind: &'static str,
+    /// The new bar; `None` when the question is left alone.
+    pub bar: Option<f64>,
+    /// The bar the page had before.
+    pub was: Option<f64>,
+    /// For a noul: the F1 at the new threshold.
+    pub f1: Option<f64>,
+    /// For a choice or a score: the accuracy over the cases that clear the new bar, and how many
+    /// do.
+    pub accuracy: Option<f64>,
+    pub coverage: Option<f64>,
+    /// Why the question was left alone.
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Calibration {
+    pub target: f64,
+    pub questions: Vec<CalibratedQuestion>,
+    /// Only the bars that changed: what `sketch::set_bars` has to write.
+    pub changed: Vec<(String, f64)>,
+}
+
+/// The bars a run supports, one per scored question.
+///
+/// A noul gets the threshold with the best F1, which the report has already found. A choice or a
+/// score gets the lowest confidence bar at which the answers it lets through are right at least
+/// `target` of the time: the lowest, because every step up sends more of the work to a person.
+pub fn calibrate(
+    session: &Session,
+    cases: &[Case],
+    outcomes: &[Outcome],
+    scored_report: &Report,
+    target: f64,
+) -> Calibration {
+    let (_, scored) = scored_of(cases, outcomes);
+    let mut questions = Vec::new();
+    let mut changed = Vec::new();
+    for question in &scored_report.questions {
+        let name = question.name();
+        let mut found = CalibratedQuestion {
+            name: name.to_owned(),
+            kind: question.kind(),
+            bar: None,
+            was: session.bar(name),
+            f1: None,
+            accuracy: None,
+            coverage: None,
+            reason: None,
+        };
+        if let QuestionReport::Noul { best, .. } = question {
+            if best.f1 > 0.0 {
+                found.bar = Some(best.threshold);
+                found.f1 = Some(best.f1);
+            } else {
+                found.reason = Some("no threshold gives an F1 above 0".to_owned());
+            }
+        } else {
+            let points = scored.iter().filter_map(|one| {
+                let expectation = one.expects(name)?;
+                match (one.answer(name)?, expectation) {
+                    (Answer::Choice(answer), Expectation::Choice { label }) => {
+                        Some((answer.confidence, answer.choice == *label))
+                    }
+                    (Answer::Score(answer), Expectation::Score { level }) => {
+                        Some((answer.confidence, answer.rounded_level() as usize == *level))
+                    }
+                    _ => None,
+                }
+            });
+            let rows = gate_at(points, &calibration_cuts());
+            let reached = rows
+                .iter()
+                .find(|row| row.accuracy.is_some_and(|accuracy| accuracy >= target));
+            match reached {
+                Some(row) => {
+                    found.bar = Some(row.confidence);
+                    found.accuracy = row.accuracy;
+                    found.coverage = Some(row.coverage);
+                }
+                None => {
+                    let mut best: Option<&GateRow> = None;
+                    for row in &rows {
+                        if let Some(accuracy) = row.accuracy
+                            && best.is_none_or(|b| accuracy > b.accuracy.unwrap_or(0.0))
+                        {
+                            best = Some(row);
+                        }
+                    }
+                    found.reason = Some(match best {
+                        None => format!("no confidence bar reaches accuracy {}", two(target)),
+                        Some(row) => format!(
+                            "no confidence bar reaches accuracy {} (best {} at {})",
+                            two(target),
+                            two(row.accuracy.unwrap_or(0.0)),
+                            two(row.confidence)
+                        ),
+                    });
+                }
+            }
+        }
+        if let Some(bar) = found.bar
+            && found.was != Some(bar)
+        {
+            changed.push((found.name.clone(), bar));
+        }
+        questions.push(found);
+    }
+    Calibration {
+        target,
+        questions,
+        changed,
+    }
+}
+
+/// Why a run with errors writes nothing back: the bars would be fitted to the cases that worked.
+pub fn not_calibrating(errors: usize) -> String {
+    format!(
+        "not calibrating: {errors} case{} back with errors, so the numbers are incomplete.",
+        if errors == 1 { " came" } else { "s came" }
+    )
+}
+
+/// The directive a question's bar is written with.
+fn directive_of(kind: &str) -> &'static str {
+    if kind == "noul" {
+        "@threshold"
+    } else {
+        "@confidence"
+    }
+}
+
+/// What calibration changed, as lines for under the report: one per question, the new directive as
+/// it now reads on the page, what it replaced, and the evidence for it.
+pub fn calibration_lines(calibration: &Calibration, page: &str) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(vec![
+        Span::raw("  "),
+        bold("calibration"),
+        dim(format!("  target accuracy {}", two(calibration.target))),
+    ])];
+    let width = calibration
+        .questions
+        .iter()
+        .map(|q| q.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for question in &calibration.questions {
+        let mut spans = vec![
+            Span::raw("    "),
+            bold(pad_end(&question.name, width)),
+            Span::raw("  "),
+        ];
+        match question.bar {
+            None => {
+                spans.push(dim(pad_end("left alone", 19)));
+                spans.push(dim(question.reason.clone().unwrap_or_default()));
+            }
+            Some(bar) => {
+                let was = match question.was {
+                    Some(was) if was == bar => "unchanged".to_owned(),
+                    Some(was) => format!("was {was}"),
+                    None => "was none".to_owned(),
+                };
+                let evidence = if question.kind == "noul" {
+                    format!("f1 {}", two(question.f1.unwrap_or(0.0)))
+                } else {
+                    format!(
+                        "accuracy {} over {} of cases",
+                        two(question.accuracy.unwrap_or(0.0)),
+                        two(question.coverage.unwrap_or(0.0))
+                    )
+                };
+                spans.push(Span::styled(
+                    pad_end(&format!("{} {bar}", directive_of(question.kind)), 19),
+                    Style::new().fg(color_for(question.kind)),
+                ));
+                spans.push(dim(pad_end(&was, 11)));
+                spans.push(Span::raw(evidence));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+    let n = calibration.changed.len();
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        if n == 0 {
+            dim(format!("nothing to write: {page} already holds these bars"))
+        } else {
+            Span::raw(format!("wrote {n} bar{} to {page}", plural(n)))
+        },
+    ]));
+    out
+}
+
+/// The calibration as plain text, for under the report.
+pub fn calibration_text(calibration: &Calibration, page: &str) -> String {
+    lines_text(calibration_lines(calibration, page))
+}
+
+/// The calibration as JSON, for the report's `calibration` key.
+pub fn calibration_json(calibration: &Calibration, page: &str) -> serde_json::Map<String, Value> {
+    let mut questions = serde_json::Map::new();
+    for question in &calibration.questions {
+        let mut out = serde_json::Map::new();
+        out.insert("kind".to_owned(), json!(question.kind));
+        out.insert("bar".to_owned(), maybe(question.bar));
+        out.insert("was".to_owned(), maybe(question.was));
+        if let Some(f1) = question.f1 {
+            out.insert("f1".to_owned(), number(f1));
+        }
+        if let Some(accuracy) = question.accuracy {
+            out.insert("accuracy".to_owned(), number(accuracy));
+        }
+        if let Some(coverage) = question.coverage {
+            out.insert("coverage".to_owned(), number(coverage));
+        }
+        if let Some(reason) = &question.reason {
+            out.insert("reason".to_owned(), json!(reason));
+        }
+        questions.insert(question.name.clone(), Value::Object(out));
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("page".to_owned(), json!(page));
+    out.insert("target".to_owned(), number(calibration.target));
+    out.insert("written".to_owned(), json!(!calibration.changed.is_empty()));
+    out.insert("questions".to_owned(), Value::Object(questions));
     out
 }

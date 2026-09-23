@@ -1,15 +1,16 @@
 name: release
-# Two crates, two tag prefixes: `v0.1.0` publishes the library, `jev-v0.1.0` publishes the REPL.
-# The REPL depends on a published library version, so tag the library first when both change.
+# Three crates, three tag prefixes: `v0.1.0` publishes the library, `jev-v0.1.0` the REPL and
+# `derive-v0.1.0` the library's proc macros. Each depends on a published version of the one before
+# it — derive, then library, then REPL — so tag in that order when more than one changes.
 on:
   push:
-    tags: ["v*", "jev-v*"]
+    tags: ["v*", "jev-v*", "derive-v*"]
   workflow_dispatch:
     inputs:
       crate:
         description: Which crate to publish
         type: choice
-        options: [typesafe-ai-sdk, jev-repl]
+        options: [typesafe-ai-sdk, jev-repl, typesafe-derive]
         default: typesafe-ai-sdk
 permissions:
   contents: read
@@ -27,6 +28,7 @@ jobs:
         run: |
           case "$GITHUB_REF_NAME" in
             jev-v*) crate=jev-repl; tag="${GITHUB_REF_NAME#jev-v}" ;;
+            derive-v*) crate=typesafe-derive; tag="${GITHUB_REF_NAME#derive-v}" ;;
             v*)     crate=typesafe-ai-sdk; tag="${GITHUB_REF_NAME#v}" ;;
             *)      crate="${{ inputs.crate }}"; tag="" ;;
           esac

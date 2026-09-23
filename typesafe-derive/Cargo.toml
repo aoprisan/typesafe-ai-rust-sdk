@@ -1,0 +1,19 @@
+[package]
+name = "typesafe-derive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "#[derive(Rubric)] and #[derive(RubricChoice)] for typesafe-ai-sdk; use it through the `derive` feature"
+license = "MIT"
+repository = "https://github.com/aoprisan/typesafe-ai-rust-sdk"
+documentation = "https://docs.rs/typesafe-ai-sdk"
+keywords = ["typesafe", "ai", "derive"]
+categories = ["api-bindings"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = "2.0.119"

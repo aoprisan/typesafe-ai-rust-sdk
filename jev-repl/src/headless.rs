@@ -88,7 +88,18 @@ fn describe(session: &Session) -> String {
     let kinds = session
         .questions
         .iter()
-        .map(|(name, q)| format!("{name} ({})", kind_of(q)))
+        .map(|(name, q)| {
+            let kind = kind_of(q);
+            let directive = match q {
+                Question::Noul(_) => Some("@threshold"),
+                Question::Choice(_) | Question::Score(_) => Some("@confidence"),
+                _ => None,
+            };
+            match (session.bar(name), directive) {
+                (Some(bar), Some(directive)) => format!("{name} ({kind}, {directive} {bar})"),
+                _ => format!("{name} ({kind})"),
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let plural = if n == 1 { "" } else { "s" };
@@ -203,10 +214,20 @@ pub fn cached_answers(session: &Session, body: &Value) -> Option<(Vec<Answered>,
 
 /// The answer page: the same bars and labels the REPL draws, minus the colour.
 pub fn answers_text(answers: &[Answered], threshold: f64) -> String {
+    page_text(answers, |_| threshold)
+}
+
+/// The answer page for a session, where a noul that carries its own `@threshold` is read at that
+/// instead of `threshold` — what `jev run` and `jev_ask` print.
+pub fn session_answers_text(answers: &[Answered], threshold: f64, session: &Session) -> String {
+    page_text(answers, |name| session.threshold_of(name, threshold))
+}
+
+fn page_text(answers: &[Answered], threshold_of: impl Fn(&str) -> f64) -> String {
     let mut out = String::new();
     for (name, answer) in answers {
         match answer {
-            Some(a) => out.push_str(&plain(answer_lines(name, a, threshold))),
+            Some(a) => out.push_str(&plain(answer_lines(name, a, threshold_of(name)))),
             None => out.push_str(&format!(
                 "  {name}: no answer came back for this question.\n"
             )),

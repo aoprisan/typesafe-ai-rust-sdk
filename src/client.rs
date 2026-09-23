@@ -1,6 +1,7 @@
 //! The asynchronous client.
 
 use std::future::{Future, IntoFuture};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +13,7 @@ use http::{Method, StatusCode};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::cassette;
 use crate::constants::*;
 use crate::error::{ApiError, Error, ResponseValidationError, Result, lenient_body};
 use crate::question::Questions;
@@ -21,7 +23,7 @@ use crate::response::{
 };
 use crate::retry::RetryPolicy;
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Builder for [`Client`]. Explicit settings win over environment variables; empty or
 /// whitespace-only environment values are ignored.
@@ -34,6 +36,8 @@ pub struct ClientBuilder {
     retry: Option<RetryPolicy>,
     headers: HeaderMap,
     http: Option<reqwest::Client>,
+    record: Option<PathBuf>,
+    replay: Option<PathBuf>,
 }
 
 impl ClientBuilder {
@@ -74,6 +78,21 @@ impl ClientBuilder {
         self
     }
 
+    /// Write each successful System One response to `<dir>/<key>.json` (else `TYPESAFE_RECORD`).
+    /// The directory is created if needed. See [`cassette`](crate::cassette).
+    pub fn record(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.record = Some(dir.into());
+        self
+    }
+
+    /// Answer System One calls from `<dir>/<key>.json` instead of the network (else
+    /// `TYPESAFE_REPLAY`); no API key is needed. A request that was never recorded fails with
+    /// [`Error::ReplayMiss`]. See [`cassette`](crate::cassette).
+    pub fn replay(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.replay = Some(dir.into());
+        self
+    }
+
     /// Use your own `reqwest::Client` (proxies, TLS, connection pools…). Requires the
     /// `reqwest-client` feature.
     #[cfg(feature = "reqwest-client")]
@@ -84,11 +103,33 @@ impl ClientBuilder {
 
     /// Build the client.
     pub fn build(self) -> Result<Client> {
-        let api_key = resolve(self.api_key, API_KEY_ENV, None).ok_or_else(|| {
-            Error::Config(format!(
+        let cassette = match (
+            resolve_path(self.record, RECORD_ENV),
+            resolve_path(self.replay, REPLAY_ENV),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Config(format!(
+                    "Both record and replay are set; a client does one or the other. Unset \
+                     {RECORD_ENV} or {REPLAY_ENV}, or drop one of the builder calls."
+                )));
+            }
+            (Some(dir), None) => {
+                std::fs::create_dir_all(&dir).map_err(|e| {
+                    Error::Config(format!("Cannot record into {}: {e}.", dir.display()))
+                })?;
+                Some(Cassette::Record(dir))
+            }
+            (None, Some(dir)) => Some(Cassette::Replay(dir)),
+            (None, None) => None,
+        };
+        let replaying = matches!(cassette, Some(Cassette::Replay(_)));
+        // A replaying client never sends anything, so it has no use for a key.
+        let api_key = resolve(self.api_key, API_KEY_ENV, None);
+        if api_key.is_none() && !replaying {
+            return Err(Error::Config(format!(
                 "No API key was provided. Pass api_key or set the {API_KEY_ENV} environment variable."
-            ))
-        })?;
+            )));
+        }
         let base_url = resolve(self.base_url, BASE_URL_ENV, Some(DEFAULT_BASE_URL))
             .unwrap_or_default()
             .trim_end_matches('/')
@@ -99,13 +140,14 @@ impl ClientBuilder {
         let retry = self.retry.unwrap_or_default();
         retry.validate()?;
 
-        let mut auth = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
-            Error::Config("The API key contains characters not allowed in a header.".into())
-        })?;
-        auth.set_sensitive(true);
-
         let mut protected = HeaderMap::new();
-        protected.insert(AUTHORIZATION, auth);
+        if let Some(api_key) = api_key {
+            let mut auth = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
+                Error::Config("The API key contains characters not allowed in a header.".into())
+            })?;
+            auth.set_sensitive(true);
+            protected.insert(AUTHORIZATION, auth);
+        }
         protected.insert(ACCEPT, HeaderValue::from_static("application/json"));
         let ident = HeaderValue::from_str(&format!("{SDK_NAME}/{VERSION}")).expect("ascii");
         protected.insert(USER_AGENT, ident.clone());
@@ -129,6 +171,7 @@ impl ClientBuilder {
                 retry,
                 default_headers: self.headers,
                 protected,
+                cassette,
             }),
         })
     }
@@ -143,6 +186,10 @@ fn resolve(explicit: Option<String>, env: &str, default: Option<&str>) -> Option
                 .filter(|v| !v.is_empty())
         })
         .or_else(|| default.map(str::to_owned))
+}
+
+fn resolve_path(explicit: Option<PathBuf>, env: &str) -> Option<PathBuf> {
+    explicit.or_else(|| resolve(None, env, None).map(PathBuf::from))
 }
 
 fn check_base_url(url: &str) -> Result<()> {
@@ -174,6 +221,14 @@ struct Inner {
     retry: RetryPolicy,
     default_headers: HeaderMap,
     protected: HeaderMap,
+    cassette: Option<Cassette>,
+}
+
+/// Where System One responses are recorded to or replayed from.
+#[derive(Debug)]
+enum Cassette {
+    Record(PathBuf),
+    Replay(PathBuf),
 }
 
 /// TypeSafe API client. Cheap to clone; clones share the connection pool.
@@ -489,11 +544,22 @@ impl SystemOneRequest {
             ))
         })?;
 
-        let (bytes, meta, endpoint) = self
-            .client
-            .execute(Method::POST, SYSTEM_ONE_PATH, Some(bytes), self.opts)
-            .await?;
-        match decode_system_one(&bytes) {
+        let key = cassette::body_key(&bytes);
+        let (bytes, meta, endpoint) = match &self.client.inner.cassette {
+            Some(Cassette::Replay(dir)) => replay(dir, &key)?,
+            _ => {
+                self.client
+                    .execute(Method::POST, SYSTEM_ONE_PATH, Some(bytes), self.opts)
+                    .await?
+            }
+        };
+        let decoded = decode_system_one(&bytes);
+        if let (Ok(_), Some(Cassette::Record(dir))) = (&decoded, &self.client.inner.cassette)
+            && let Err(e) = cassette::write(dir, &key, &bytes)
+        {
+            tracing::warn!(dir = %dir.display(), %key, error = %e, "could not record the response");
+        }
+        match decoded {
             Ok(DecodedSystemOne {
                 model,
                 usage,
@@ -515,6 +581,22 @@ impl SystemOneRequest {
             )),
         }
     }
+}
+
+/// The recorded response for `key`, in the shape a live call returns: no headers, no attempts.
+fn replay(dir: &std::path::Path, key: &str) -> Result<(Vec<u8>, ResponseMeta, String)> {
+    let path = cassette::path(dir, key);
+    let bytes = std::fs::read(&path).map_err(|_| Error::ReplayMiss {
+        key: key.to_owned(),
+        path: path.clone(),
+    })?;
+    tracing::debug!(path = %path.display(), "<- replayed");
+    let meta = ResponseMeta {
+        status: 200,
+        headers: HeaderMap::new(),
+        attempts: 0,
+    };
+    Ok((bytes, meta, format!("replay {}", path.display())))
 }
 
 #[derive(Serialize)]
@@ -567,6 +649,12 @@ impl ListModelsRequest {
 
     /// Send the request.
     pub async fn send(self) -> Result<ListModelsResponse> {
+        if let Some(Cassette::Replay(dir)) = &self.client.inner.cassette {
+            return Err(Error::Config(format!(
+                "Listing models is not recorded, so a client replaying from {} cannot answer it.",
+                dir.display()
+            )));
+        }
         let (bytes, meta, endpoint) = self
             .client
             .execute(Method::GET, MODELS_PATH, None, self.opts)

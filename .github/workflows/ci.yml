@@ -19,8 +19,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo clippy -p typesafe-ai-sdk -p typesafe-derive --all-features --all-targets -- -D warnings
       - run: cargo test --all-features
+      - run: cargo test -p typesafe-derive
       - run: cargo test --no-default-features
   repl:
     # The learning REPL is a workspace member, not part of the published crate.
