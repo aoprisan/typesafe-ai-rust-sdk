@@ -584,6 +584,16 @@ fn finish_question(b: Block, out: &mut Parsed) {
             );
             return;
         }
+        if levels.len() > MAX_SCORE_LEVELS {
+            problem(
+                b.line,
+                format!(
+                    "a score takes at most {MAX_SCORE_LEVELS} levels, this one has {}",
+                    levels.len()
+                ),
+            );
+            return;
+        }
         out.questions
             .push((b.name, Score::new(instructions, levels).into()));
         return;
@@ -623,8 +633,19 @@ fn finish_question(b: Block, out: &mut Parsed) {
         );
         return;
     }
+    if count > MAX_CHOICE_OPTIONS {
+        problem(
+            b.line,
+            format!("a choice takes at most {MAX_CHOICE_OPTIONS} options, this one has {count}"),
+        );
+        return;
+    }
     out.questions.push((b.name, q.into()));
 }
+
+/// The API's limits, from the primitives docs: a score has 2–10 levels, a choice up to 255 options.
+pub const MAX_SCORE_LEVELS: usize = 10;
+pub const MAX_CHOICE_OPTIONS: usize = 255;
 
 /// Split on `sep`, except inside a double-quoted JSON string — so a quoted value can carry the
 /// notation's own punctuation. Splits at most once for `=`, since a description may contain it.

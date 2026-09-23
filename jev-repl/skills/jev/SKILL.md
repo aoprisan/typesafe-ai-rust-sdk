@@ -13,7 +13,10 @@ description: >-
 
 TypeSafe System One answers **named questions about one piece of text** in a single
 call. You send a `state` (the text or JSON to judge) and a set of questions; you get
-back one answer per question, each with a confidence and a short rationale.
+back one answer per question as a distribution, never as text: a noul is the probability
+of yes (that probability is its own confidence), a choice is the winning label with a
+probability per label and a confidence, and a score is the probability-weighted level
+with a probability per level and a confidence. There is no rationale to read.
 
 There are three kinds of question:
 
@@ -101,6 +104,8 @@ also stops a run being reproducible from its page.
 - Choice labels need descriptions whenever the label alone is ambiguous, and should
   cover the input — add `other` rather than forcing a wrong bucket.
 - Score levels go lowest to highest and should be distinguishable by a stranger.
+- A choice takes at most 255 options and a score between 2 and 10 levels; the API
+  refuses anything outside that, and `jev check` says so first.
 - A noul's answer is a probability; compare it against a threshold you pick
   (`--threshold`, default `0.5`) rather than treating it as a bare boolean.
 

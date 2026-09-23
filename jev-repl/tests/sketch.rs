@@ -190,6 +190,33 @@ fn problems_point_at_the_line_and_say_what_to_do() {
         assert_eq!(p.line, *line, "{page:?}: {p:?}");
         assert!(p.message.contains(expected), "{page:?}: {p:?}");
     }
+    // Past the API's limits is a problem; the limits themselves are fine.
+    let levels = |n: usize| {
+        (0..n)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join(" < ")
+    };
+    let options = |n: usize| (0..n).map(|i| format!("  o{i}\n")).collect::<String>();
+    let over = format!("text\n---\nsev: How bad\n  {}\n", levels(11));
+    let p = &sketch::parse(&over).problems[0];
+    assert!(
+        p.message.contains("at most 10 levels, this one has 11"),
+        "{p:?}"
+    );
+    let over = format!("text\n---\ntag: Which\n{}", options(256));
+    let p = &sketch::parse(&over).problems[0];
+    assert!(
+        p.message.contains("at most 255 options, this one has 256"),
+        "{p:?}"
+    );
+    let at = format!(
+        "text\n---\nsev: How bad\n  {}\ntag: Which\n{}",
+        levels(10),
+        options(255)
+    );
+    assert!(sketch::parse(&at).problems.is_empty());
+
     // A broken question drops out; the good ones stay.
     let parsed = sketch::parse("text\n---\na? fine\nb: broken\nc? also fine\n");
     let names: Vec<&str> = parsed.questions.iter().map(|(n, _)| n.as_str()).collect();
