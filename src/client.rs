@@ -41,7 +41,8 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    /// API key (else `TYPESAFE_API_KEY`).
+    /// API key (else `TYPESAFE_API_KEY`). Surrounding whitespace is trimmed; an empty key, or one
+    /// with whitespace, control or non-ASCII characters inside it, is rejected by `build`.
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
@@ -124,11 +125,21 @@ impl ClientBuilder {
         };
         let replaying = matches!(cassette, Some(Cassette::Replay(_)));
         // A replaying client never sends anything, so it has no use for a key.
-        let api_key = resolve(self.api_key, API_KEY_ENV, None);
+        let api_key = resolve(self.api_key, API_KEY_ENV, None)
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty());
         if api_key.is_none() && !replaying {
             return Err(Error::Config(format!(
                 "No API key was provided. Pass api_key or set the {API_KEY_ENV} environment variable."
             )));
+        }
+        if api_key
+            .as_deref()
+            .is_some_and(|k| !k.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err(Error::Config(
+                "API key must contain only printable ASCII characters without whitespace.".into(),
+            ));
         }
         let base_url = resolve(self.base_url, BASE_URL_ENV, Some(DEFAULT_BASE_URL))
             .unwrap_or_default()
@@ -142,9 +153,8 @@ impl ClientBuilder {
 
         let mut protected = HeaderMap::new();
         if let Some(api_key) = api_key {
-            let mut auth = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
-                Error::Config("The API key contains characters not allowed in a header.".into())
-            })?;
+            let mut auth = HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .expect("a printable ASCII key is a valid header value");
             auth.set_sensitive(true);
             protected.insert(AUTHORIZATION, auth);
         }

@@ -457,6 +457,21 @@ fn config_validation() {
     assert_eq!(c.default_model(), "jev-latest");
 }
 
+#[test]
+fn api_key_is_trimmed_and_checked() {
+    assert!(Client::builder().api_key("  sk-test\n").build().is_ok());
+    for bad in ["", "   ", "sk test", "sk\ttest", "sk-\u{7f}", "sk-é"] {
+        let err = Client::builder().api_key(bad).build().unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{bad:?}");
+        let expected = if bad.trim().is_empty() {
+            "No API key"
+        } else {
+            "printable ASCII"
+        };
+        assert!(err.to_string().contains(expected), "{bad:?}: {err}");
+    }
+}
+
 #[cfg(feature = "reqwest-client")]
 #[tokio::test]
 async fn custom_reqwest_client() {
