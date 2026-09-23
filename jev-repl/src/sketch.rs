@@ -746,7 +746,7 @@ pub fn set_bars(text: &str, bars: &[(String, f64)]) -> String {
             .map_or_else(|| "  ".to_owned(), |i| leading(&lines[i]));
         inserts.push((block.last, format!("{indent}{directive} {value}{cr}")));
     }
-    inserts.sort_by(|x, y| y.0.cmp(&x.0));
+    inserts.sort_by_key(|x| std::cmp::Reverse(x.0));
     for (after, line) in inserts {
         lines.insert(after + 1, line);
     }
