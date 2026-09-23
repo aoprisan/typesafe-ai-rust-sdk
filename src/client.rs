@@ -461,11 +461,21 @@ fn redact_url(url: &str) -> String {
     }
 }
 
+/// A credential-bearing header: the known names, plus anything that says it carries one, as an AI
+/// gateway's own key does (`cf-aig-authorization`, `x-portkey-api-key`, `x-gateway-token`).
+fn is_secret(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SECRET_HEADERS.contains(&name.as_str())
+        || ["authorization", "api-key", "token", "secret"]
+            .iter()
+            .any(|part| name.contains(part))
+}
+
 fn redacted(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|(k, v)| {
-            let value = if SECRET_HEADERS.contains(&k.as_str()) {
+            let value = if is_secret(k.as_str()) {
                 "[REDACTED]".to_owned()
             } else {
                 v.to_str().unwrap_or("<binary>").to_owned()
@@ -688,5 +698,27 @@ impl IntoFuture for ListModelsRequest {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.send())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_secret;
+
+    #[test]
+    fn masks_a_gateways_key_as_well_as_the_apis() {
+        for name in [
+            "Authorization",
+            "cookie",
+            "cf-aig-authorization",
+            "x-portkey-api-key",
+            "x-gateway-token",
+            "x-client-secret",
+        ] {
+            assert!(is_secret(name), "{name}");
+        }
+        for name in ["content-type", "x-typesafe-request-id", "retry-after"] {
+            assert!(!is_secret(name), "{name}");
+        }
     }
 }

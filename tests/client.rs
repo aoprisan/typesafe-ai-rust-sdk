@@ -504,6 +504,30 @@ async fn custom_reqwest_client() {
     assert!(c.models().list().await.unwrap().models.is_empty());
 }
 
+/// An AI gateway sits in front of the API under a path of its own and wants a key of its own.
+#[tokio::test]
+async fn goes_through_an_ai_gateway() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/acct/gw/typesafe/v1/systemone"))
+        .and(header("cf-aig-authorization", "Bearer gw-key"))
+        .and(header("authorization", "Bearer sk-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = Client::builder()
+        .api_key("sk-test")
+        .base_url(format!("{}/v1/acct/gw/typesafe/", server.uri()))
+        .header(
+            HeaderName::from_static("cf-aig-authorization"),
+            HeaderValue::from_static("Bearer gw-key"),
+        )
+        .build()
+        .unwrap();
+    c.system_one("x", questions()).await.unwrap();
+}
+
 #[cfg(feature = "blocking")]
 #[test]
 fn blocking_client() {
