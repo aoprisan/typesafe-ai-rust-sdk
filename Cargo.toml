@@ -3,7 +3,7 @@ members = ["jev-repl", "typesafe-derive"]
 
 [package]
 name = "typesafe-ai-sdk"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Rust client for the TypeSafe AI System One API (Noul, Choice and Score questions)"
@@ -40,7 +40,7 @@ sha2 = "0.10.9"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["time"] }
 tracing = "0.1.44"
-typesafe-derive = { path = "typesafe-derive", version = "0.1.0", optional = true }
+typesafe-derive = { path = "typesafe-derive", version = "0.2.0", optional = true }
 
 [dev-dependencies]
 reqwest = { version = "0.13.5", default-features = false }

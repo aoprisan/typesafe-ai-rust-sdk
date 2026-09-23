@@ -457,6 +457,21 @@ fn config_validation() {
     assert_eq!(c.default_model(), "jev-latest");
 }
 
+#[test]
+fn api_key_is_trimmed_and_checked() {
+    assert!(Client::builder().api_key("  sk-test\n").build().is_ok());
+    for bad in ["", "   ", "sk test", "sk\ttest", "sk-\u{7f}", "sk-é"] {
+        let err = Client::builder().api_key(bad).build().unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{bad:?}");
+        let expected = if bad.trim().is_empty() {
+            "No API key"
+        } else {
+            "printable ASCII"
+        };
+        assert!(err.to_string().contains(expected), "{bad:?}: {err}");
+    }
+}
+
 #[cfg(feature = "reqwest-client")]
 #[tokio::test]
 async fn custom_reqwest_client() {
@@ -487,6 +502,30 @@ async fn custom_reqwest_client() {
         .build()
         .unwrap();
     assert!(c.models().list().await.unwrap().models.is_empty());
+}
+
+/// An AI gateway sits in front of the API under a path of its own and wants a key of its own.
+#[tokio::test]
+async fn goes_through_an_ai_gateway() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/acct/gw/typesafe/v1/systemone"))
+        .and(header("cf-aig-authorization", "Bearer gw-key"))
+        .and(header("authorization", "Bearer sk-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = Client::builder()
+        .api_key("sk-test")
+        .base_url(format!("{}/v1/acct/gw/typesafe/", server.uri()))
+        .header(
+            HeaderName::from_static("cf-aig-authorization"),
+            HeaderValue::from_static("Bearer gw-key"),
+        )
+        .build()
+        .unwrap();
+    c.system_one("x", questions()).await.unwrap();
 }
 
 #[cfg(feature = "blocking")]

@@ -441,6 +441,21 @@ impl<R: Rubric + 'static> IntoFuture for AskRequest<R> {
 ///     anger: typesafe::ScoreAnswer,
 /// }
 /// ```
+/// A score with one level, or with more than the API's ten:
+/// ```compile_fail
+/// #[derive(typesafe::Rubric)]
+/// struct R {
+///     #[score("How angry", levels = ["Furious"])]
+///     anger: typesafe::ScoreAnswer,
+/// }
+/// ```
+/// ```compile_fail
+/// #[derive(typesafe::Rubric)]
+/// struct R {
+///     #[score("How angry", levels = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])]
+///     anger: typesafe::ScoreAnswer,
+/// }
+/// ```
 /// A field that is not a question:
 /// ```compile_fail
 /// #[derive(typesafe::Rubric)]
@@ -487,6 +502,8 @@ impl<R: Rubric + 'static> IntoFuture for AskRequest<R> {
 ///     team: Team,
 ///     #[score("How angry", levels = ["Calm", "Angry"])]
 ///     anger: typesafe::ScoreAnswer,
+///     #[score("How bad", levels = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])]
+///     severity: typesafe::ScoreAnswer,
 /// }
 /// #[derive(typesafe::RubricChoice)]
 /// enum Team {
