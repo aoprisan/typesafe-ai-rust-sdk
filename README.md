@@ -18,10 +18,10 @@ defaults, retry semantics, error classification and forward-compatible response 
 
 ```toml
 [dependencies]
-typesafe-ai-sdk = "0.2"                                                 # async (bring your own Tokio runtime)
-# typesafe-ai-sdk = { version = "0.2", features = ["blocking"] }        # sync client
-# typesafe-ai-sdk = { version = "0.2", features = ["reqwest-client"] }  # bring your own reqwest::Client
-# typesafe-ai-sdk = { version = "0.2", features = ["derive"] }          # #[derive(Rubric)]
+typesafe-ai-sdk = "0.4"                                                 # async (bring your own Tokio runtime)
+# typesafe-ai-sdk = { version = "0.4", features = ["blocking"] }        # sync client
+# typesafe-ai-sdk = { version = "0.4", features = ["reqwest-client"] }  # bring your own reqwest::Client
+# typesafe-ai-sdk = { version = "0.4", features = ["derive"] }          # #[derive(Rubric)]
 ```
 
 The library is imported as `typesafe`. MSRV: Rust 1.88. TLS is rustls; `HTTPS_PROXY`-style

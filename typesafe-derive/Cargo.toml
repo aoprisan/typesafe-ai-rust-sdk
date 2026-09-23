@@ -1,6 +1,6 @@
 [package]
 name = "typesafe-derive"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "#[derive(Rubric)] and #[derive(RubricChoice)] for typesafe-ai-sdk; use it through the `derive` feature"
