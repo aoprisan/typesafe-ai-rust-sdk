@@ -186,30 +186,41 @@ them over shelling out, and pass the page as text rather than writing a temp fil
 writing a client by hand. Build named questions, send one request, read the answers
 back by name.
 
+When the questions are fixed, describe them as a struct with `#[derive(Rubric)]`
+(feature `derive`) and `ask` for it: the field name is the question name, the field type
+is its answer, and a choice's labels can be an enum, so a misspelled name or an unknown
+label is a compile error instead of a `None`.
+
 ```rust
-use typesafe::{Choice, Client, Noul, Questions, Score};
+use typesafe::{ChoiceOf, Client, NoulAnswer, Rubric, RubricChoice, ScoreAnswer};
+
+#[derive(Rubric)]
+struct Triage {
+    #[noul("The message conveys urgency")]
+    is_urgent: NoulAnswer,
+    #[choice("Which team should handle this")]
+    department: ChoiceOf<Department>,
+    #[score("How frustrated the customer is", levels = ["Calm", "Annoyed", "Furious"])]
+    frustration: ScoreAnswer,
+}
+
+#[derive(Debug, PartialEq, RubricChoice)]
+enum Department {
+    #[option("Payment or subscription issues")]
+    Billing,
+    #[option("Bugs or integration problems")]
+    Technical,
+}
 
 let client = Client::from_env()?; // TYPESAFE_API_KEY
-let res = client
-    .system_one(
-        "The payout failed again.",
-        Questions::new()
-            .with("is_urgent", Noul::new("The message conveys urgency"))
-            .with(
-                "department",
-                Choice::new("Which team should handle this")
-                    .option("billing", "Payment or subscription issues")
-                    .option("technical", "Bugs or integration problems"),
-            )
-            .with(
-                "frustration",
-                Score::new("How frustrated the customer is", ["Calm", "Annoyed", "Furious"]),
-            ),
-    )
-    .await?;
-res.noul("is_urgent").map(|a| a.noul); // a probability
-res.choice("department").map(|a| a.choice.as_str()); // a label
+let triage: Triage = client.ask("The payout failed again.").await?;
+triage.is_urgent.noul; // a probability
+triage.department.value; // Department::Billing or Department::Technical
 ```
+
+An answer that comes back missing, of the wrong type, or with a label the enum does not
+have is an `Error::ResponseValidation` naming the field. Use `client.system_one` with
+`Questions::new().with(...)` only when the questions are built at run time.
 
 Keep the API key in the environment; never write it into a page, a config file or a
 committed example.

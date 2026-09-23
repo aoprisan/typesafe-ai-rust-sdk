@@ -63,6 +63,11 @@ impl Kind {
     }
 }
 
+/// The API's limits, from the primitives docs: a score has 2 to 10 levels, a choice up to 255
+/// options. Past them the request is refused, so the derive refuses to compile instead.
+const MAX_SCORE_LEVELS: usize = 10;
+const MAX_CHOICE_OPTIONS: usize = 255;
+
 /// One `#[noul(...)]`, `#[choice(...)]` or `#[score(...)]`, parsed.
 struct Question {
     kind: Kind,
@@ -156,6 +161,15 @@ fn rubric(input: &DeriveInput) -> Result<Tokens> {
                 }
             }
             Kind::Choice => {
+                if q.labels.len() > MAX_CHOICE_OPTIONS {
+                    return Err(Error::new_spanned(
+                        attr,
+                        format!(
+                            "a choice takes at most {MAX_CHOICE_OPTIONS} options, this one has {}",
+                            q.labels.len()
+                        ),
+                    ));
+                }
                 let labels = &q.labels;
                 quote! {
                     <#ty as ::typesafe::rubric::ChoiceField>::question(#instructions.into())
@@ -167,6 +181,15 @@ fn rubric(input: &DeriveInput) -> Result<Tokens> {
                     return Err(Error::new_spanned(
                         attr,
                         "a score needs its levels, lowest first: #[score(\"...\", levels = [\"Low\", \"High\"])]",
+                    ));
+                }
+                if !(2..=MAX_SCORE_LEVELS).contains(&q.levels.len()) {
+                    return Err(Error::new_spanned(
+                        attr,
+                        format!(
+                            "a score takes 2 to {MAX_SCORE_LEVELS} levels, this one has {}",
+                            q.levels.len()
+                        ),
                     ));
                 }
                 let levels = &q.levels;
@@ -325,6 +348,15 @@ fn rubric_choice(input: &DeriveInput) -> Result<Tokens> {
             "a choice needs at least one option",
         ));
     }
+    if data.variants.len() > MAX_CHOICE_OPTIONS {
+        return Err(Error::new_spanned(
+            &input.ident,
+            format!(
+                "a choice takes at most {MAX_CHOICE_OPTIONS} options, this enum has {}",
+                data.variants.len()
+            ),
+        ));
+    }
     if !input.generics.params.is_empty() {
         return Err(Error::new_spanned(
             &input.generics,
@@ -442,7 +474,7 @@ fn snake_case(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::snake_case;
+    use super::{DeriveInput, rubric, rubric_choice, snake_case};
 
     #[test]
     fn labels_are_snake_case() {
@@ -451,5 +483,45 @@ mod tests {
         assert_eq!(snake_case("HTTPError"), "http_error");
         assert_eq!(snake_case("Tier2Support"), "tier2_support");
         assert_eq!(snake_case("already_snake"), "already_snake");
+    }
+
+    fn options(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("V{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn quoted(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("\"o{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[test]
+    fn holds_a_choice_to_the_apis_255_options() {
+        let at: DeriveInput = syn::parse_str(&format!("enum E {{ {} }}", options(255))).unwrap();
+        assert!(rubric_choice(&at).is_ok());
+        let over: DeriveInput = syn::parse_str(&format!("enum E {{ {} }}", options(256))).unwrap();
+        let err = rubric_choice(&over).unwrap_err().to_string();
+        assert!(
+            err.contains("at most 255 options, this enum has 256"),
+            "{err}"
+        );
+
+        let labels = |n| {
+            syn::parse_str::<DeriveInput>(&format!(
+                "struct R {{ #[choice(\"Which\", labels = [{}])] pick: typesafe::ChoiceAnswer }}",
+                quoted(n)
+            ))
+            .unwrap()
+        };
+        assert!(rubric(&labels(255)).is_ok());
+        let err = rubric(&labels(256)).unwrap_err().to_string();
+        assert!(
+            err.contains("at most 255 options, this one has 256"),
+            "{err}"
+        );
     }
 }
