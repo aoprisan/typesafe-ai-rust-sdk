@@ -44,12 +44,14 @@ impl Noul {
     }
 
     /// Describe what a yes means.
+    #[must_use]
     pub fn when_true(mut self, description: impl Into<Value>) -> Self {
         self.criteria.get_or_insert_with(Default::default).yes = Some(description.into());
         self
     }
 
     /// Describe what a no means.
+    #[must_use]
     pub fn when_false(mut self, description: impl Into<Value>) -> Self {
         self.criteria.get_or_insert_with(Default::default).no = Some(description.into());
         self
@@ -90,12 +92,14 @@ impl Choice {
     }
 
     /// Add an option with a description.
+    #[must_use]
     pub fn option(mut self, label: impl Into<String>, description: impl Into<Value>) -> Self {
         self.criteria.insert(label.into(), Some(description.into()));
         self
     }
 
     /// Add an option without a description.
+    #[must_use]
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.criteria.insert(label.into(), None);
         self
@@ -128,6 +132,7 @@ impl Score {
     }
 
     /// Append a level.
+    #[must_use]
     pub fn level(mut self, description: impl Into<Value>) -> Self {
         self.criteria.push(description.into());
         self
@@ -193,6 +198,7 @@ impl Questions {
     }
 
     /// Add (or replace) a question, builder-style.
+    #[must_use]
     pub fn with(mut self, name: impl Into<String>, question: impl Into<Question>) -> Self {
         self.insert(name, question);
         self
@@ -202,6 +208,11 @@ impl Questions {
     pub fn insert(&mut self, name: impl Into<String>, question: impl Into<Question>) -> &mut Self {
         self.0.insert(name.into(), question.into());
         self
+    }
+
+    /// The question named `name`.
+    pub fn get(&self, name: &str) -> Option<&Question> {
+        self.0.get(name)
     }
 
     /// Number of questions.
@@ -294,6 +305,37 @@ impl<K: Into<String>, Q: Into<Question>> FromIterator<(K, Q)> for Questions {
     }
 }
 
+impl<K: Into<String>, Q: Into<Question>> Extend<(K, Q)> for Questions {
+    /// Add (or replace) each question, as [`Questions::insert`] does.
+    fn extend<T: IntoIterator<Item = (K, Q)>>(&mut self, iter: T) {
+        self.0
+            .extend(iter.into_iter().map(|(k, q)| (k.into(), q.into())));
+    }
+}
+
+/// Name and question, in insertion order.
+impl IntoIterator for Questions {
+    type Item = (String, Question);
+    type IntoIter = indexmap::map::IntoIter<String, Question>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// The same items as [`Questions::iter`].
+impl<'a> IntoIterator for &'a Questions {
+    type Item = (&'a str, &'a Question);
+    type IntoIter = std::iter::Map<
+        indexmap::map::Iter<'a, String, Question>,
+        fn((&'a String, &'a Question)) -> (&'a str, &'a Question),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().map(|(k, v)| (k.as_str(), v))
+    }
+}
+
 impl<K: Into<String>, Q: Into<Question>, const N: usize> From<[(K, Q); N]> for Questions {
     fn from(arr: [(K, Q); N]) -> Self {
         arr.into_iter().collect()
@@ -336,6 +378,29 @@ mod tests {
         // insertion order is preserved on the wire
         let keys: Vec<_> = q.iter().map(|(k, _)| k).collect();
         assert_eq!(keys, ["department", "frustration", "is_urgent", "bare"]);
+    }
+
+    #[test]
+    fn lookup_iteration_and_extend() {
+        let mut q: Questions = [("a", Noul::new("a"))].into_iter().collect();
+        q.extend([("b", Question::from(Noul::new("b")))]);
+        q.extend(vec![(String::from("a"), Score::new("a", ["lo", "hi"]))]);
+        assert_eq!(q.len(), 2);
+        assert!(matches!(q.get("a"), Some(Question::Score(_))));
+        assert_eq!(q.get("b"), Some(&Question::Noul(Noul::new("b"))));
+        assert_eq!(q.get("c"), None);
+
+        let borrowed: Vec<&str> = (&q).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(borrowed, ["a", "b"]);
+        let mut names = Vec::new();
+        for (name, _) in &q {
+            names.push(name);
+        }
+        assert_eq!(names, borrowed);
+        let owned: Vec<String> = q.clone().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(owned, ["a", "b"]);
+        // Round-trips through the owned iterator without losing order or content.
+        assert_eq!(q.clone().into_iter().collect::<Questions>(), q);
     }
 
     #[test]

@@ -32,11 +32,11 @@ A `.jev` page is the request written as text. Everything above the first `---` r
 is the state; everything below it is questions.
 
 ```text
+The payout failed again, third time this month. I'm done waiting.
+---
 # a comment
 @model jev-latest
 
-The payout failed again, third time this month. I'm done waiting.
----
 is_urgent? The message conveys urgency or time-sensitivity
   yes: A deadline, a threat to leave, or "ASAP"
   no: Routine, no time pressure
@@ -51,7 +51,7 @@ department: Which team should handle this
 frustration: How frustrated the customer appears
   Calm < Frustrated but civil < Very angry
 
-shape! {"kind": "noul", "instructions": "A hand-built question object"}
+shape! {"type": "noul", "instructions": "A hand-built question object"}
 ```
 
 Rules worth remembering:

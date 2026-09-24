@@ -1,19 +1,24 @@
 //! Answers and response metadata.
+//!
+//! The answer types serialize to the JSON the API sends, so a response can be stored and read
+//! back: an [`Answer`] carries its wire `type` tag, and a [`SystemOneResponse`] serializes to its
+//! `{"model", "answers", "usage"}` body.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use http::header::HeaderMap;
 use indexmap::IndexMap;
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{self, DeserializeOwned, Deserializer};
+use serde::ser::{SerializeMap, SerializeStruct, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 
 use crate::constants::REQUEST_ID_HEADER;
 
 /// A yes/no answer.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct NoulAnswer {
     /// Probability of "yes", from 0 to 1.
@@ -28,7 +33,7 @@ impl NoulAnswer {
 }
 
 /// A selected option with its distribution.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ChoiceAnswer {
     /// The highest-probability option.
@@ -41,6 +46,10 @@ pub struct ChoiceAnswer {
 
 impl ChoiceAnswer {
     /// Parse the selected label into your own type (e.g. an enum implementing `FromStr`).
+    ///
+    /// # Errors
+    ///
+    /// Whatever `T::from_str` returns for the label.
     pub fn parse<T: FromStr>(&self) -> Result<T, T::Err> {
         self.choice.parse()
     }
@@ -63,7 +72,7 @@ impl ChoiceAnswer {
 }
 
 /// An expected score with its rubric and distribution.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ScoreAnswer {
     /// Probability-weighted level; may fall between levels.
@@ -123,15 +132,90 @@ impl Answer {
     }
 }
 
+/// Serialized with its wire `type` tag: `{"type": "noul", "noul": 0.97}`.
+impl Serialize for Answer {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("type", self.kind())?;
+        match self {
+            Answer::Noul(a) => m.serialize_entry("noul", &a.noul)?,
+            Answer::Choice(a) => {
+                m.serialize_entry("choice", &a.choice)?;
+                m.serialize_entry("probabilities", &a.probabilities)?;
+                m.serialize_entry("confidence", &a.confidence)?;
+            }
+            Answer::Score(a) => {
+                m.serialize_entry("score", &a.score)?;
+                m.serialize_entry("legend", &a.legend)?;
+                m.serialize_entry("probabilities", &a.probabilities)?;
+                m.serialize_entry("confidence", &a.confidence)?;
+            }
+        }
+        m.end()
+    }
+}
+
+/// Reads the wire shape, dispatching on `type`; an unknown type is an error.
+impl<'de> Deserialize<'de> for Answer {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Every field any answer type has, so the body is read once, in order, by any
+        // deserializer. Choice and score probabilities differ in key type, so they are read as
+        // strings and the score's parsed afterwards.
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "type")]
+            kind: String,
+            noul: Option<f64>,
+            choice: Option<String>,
+            score: Option<f64>,
+            confidence: Option<f64>,
+            legend: Option<BTreeMap<u32, Value>>,
+            probabilities: Option<IndexMap<String, f64>>,
+        }
+
+        fn need<T, E: de::Error>(v: Option<T>, field: &'static str) -> Result<T, E> {
+            v.ok_or_else(|| E::missing_field(field))
+        }
+
+        let w = Wire::deserialize(d)?;
+        match w.kind.as_str() {
+            "noul" => Ok(Answer::Noul(NoulAnswer {
+                noul: need(w.noul, "noul")?,
+            })),
+            "choice" => Ok(Answer::Choice(ChoiceAnswer {
+                choice: need(w.choice, "choice")?,
+                probabilities: need(w.probabilities, "probabilities")?,
+                confidence: need(w.confidence, "confidence")?,
+            })),
+            "score" => Ok(Answer::Score(ScoreAnswer {
+                score: need(w.score, "score")?,
+                confidence: need(w.confidence, "confidence")?,
+                legend: need(w.legend, "legend")?,
+                probabilities: need(w.probabilities, "probabilities")?
+                    .into_iter()
+                    .map(|(k, p)| match k.parse() {
+                        Ok(level) => Ok((level, p)),
+                        Err(_) => Err(de::Error::custom(format!("invalid level {k:?}"))),
+                    })
+                    .collect::<Result<_, D::Error>>()?,
+            })),
+            other => Err(de::Error::unknown_variant(
+                other,
+                &["noul", "choice", "score"],
+            )),
+        }
+    }
+}
+
 /// Token usage. The API reports these when available; absent counts are `None`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Usage {
     /// Input tokens, when reported.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     /// Output tokens, when reported.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
 }
 
@@ -229,8 +313,21 @@ impl SystemOneResponse {
     }
 }
 
+/// Serialized as the body it was decoded from: `{"model", "answers", "usage"}`, answers in server
+/// order. HTTP metadata is left out, as are answers of types this SDK version does not know (see
+/// `raw` for those).
+impl Serialize for SystemOneResponse {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("SystemOneResponse", 3)?;
+        st.serialize_field("model", &self.model)?;
+        st.serialize_field("answers", &self.answers)?;
+        st.serialize_field("usage", &self.usage)?;
+        st.end()
+    }
+}
+
 /// One available model.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ModelMetadata {
     /// Model name, e.g. `jev-latest`.
@@ -239,6 +336,15 @@ pub struct ModelMetadata {
     pub description: String,
     /// Release date as reported by the API.
     pub release_date: String,
+}
+
+/// Serialized as the body it was decoded from: `{"models": [...]}`, without HTTP metadata.
+impl Serialize for ListModelsResponse {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("ListModelsResponse", 1)?;
+        st.serialize_field("models", &self.models)?;
+        st.end()
+    }
 }
 
 /// The models available to the account.
@@ -404,6 +510,59 @@ mod tests {
             panic!()
         };
         assert_eq!(c.ranked()[0], ("technical", 0.84));
+    }
+
+    #[test]
+    fn serializes_back_to_the_wire_shape() {
+        let mut wire = sample();
+        wire["answers"].as_object_mut().unwrap().remove("future");
+        wire["usage"].as_object_mut().unwrap().remove("extra");
+        let d = decode(wire.clone()).ok().unwrap();
+        let res = SystemOneResponse {
+            model: d.model,
+            usage: d.usage,
+            answers: d.answers,
+            raw: d.raw,
+            meta: ResponseMeta {
+                status: 200,
+                headers: HeaderMap::new(),
+                attempts: 1,
+            },
+        };
+        // The JSON the API sent, and it decodes to the same answers.
+        let body = serde_json::to_vec(&res).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), wire);
+        let again = decode_system_one(&body).ok().unwrap();
+        assert_eq!(again.model, res.model);
+        assert_eq!(again.usage, res.usage);
+        assert_eq!(again.answers, res.answers);
+
+        for (name, answer) in &res.answers {
+            let text = serde_json::to_string(answer).unwrap();
+            assert_eq!(serde_json::from_str::<Answer>(&text).unwrap(), *answer);
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).unwrap(),
+                wire["answers"][name]
+            );
+        }
+        // Server order survives the round trip, byte for byte.
+        let text = r#"{"type":"choice","choice":"z","probabilities":{"z":0.5,"a":0.3,"m":0.2},"confidence":0.1}"#;
+        let answer: Answer = serde_json::from_str(text).unwrap();
+        assert_eq!(serde_json::to_string(&answer).unwrap(), text);
+
+        assert_eq!(serde_json::to_value(Usage::default()).unwrap(), json!({}));
+        assert!(serde_json::from_value::<Answer>(json!({"type": "span"})).is_err());
+        assert!(serde_json::from_value::<Answer>(json!({"type": "noul"})).is_err());
+
+        let body =
+            br#"{"models":[{"name":"jev-latest","description":"d","release_date":"2025-01-01"}]}"#;
+        let (models, raw) = decode_models(body).ok().unwrap();
+        let list = ListModelsResponse {
+            models,
+            raw: raw.clone(),
+            meta: res.meta.clone(),
+        };
+        assert_eq!(serde_json::to_value(&list).unwrap(), raw);
     }
 
     #[test]

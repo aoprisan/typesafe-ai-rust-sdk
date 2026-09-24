@@ -601,7 +601,7 @@ fn finish_question(b: Block, out: &mut Parsed) {
 
     out.tags[b.line] = Tag::Choice;
     let mut q = Choice::new(instructions);
-    let mut count = 0;
+    let mut seen: Vec<&str> = Vec::new();
     let mut bad = false;
     for (i, part) in &parts {
         out.tags[*i] = Tag::Option;
@@ -615,13 +615,20 @@ fn finish_question(b: Block, out: &mut Parsed) {
             problem(*i, "an option needs a label before the `=`".into());
             continue;
         }
+        if seen.contains(&label) {
+            bad = true;
+            out.tags[*i] = Tag::Stray;
+            problem(*i, format!("option `{label}` is listed twice"));
+            continue;
+        }
+        seen.push(label);
         q = if desc.is_empty() {
             q.label(label)
         } else {
             q.option(label, value(desc))
         };
-        count += 1;
     }
+    let count = seen.len();
     if bad {
         return;
     }

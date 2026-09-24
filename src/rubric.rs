@@ -89,6 +89,11 @@ pub trait Rubric: Sized {
     fn questions() -> Questions;
 
     /// Read the answers back out of a response to [`Rubric::questions`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ResponseValidation`], with `field_path` naming the question, if an answer is
+    /// missing, of another type, or a label the field's type does not have.
     fn from_response(response: &SystemOneResponse) -> Result<Self>;
 }
 
@@ -119,6 +124,10 @@ pub trait RubricChoice: Sized {
     }
 
     /// [`RubricChoice::from_label`], with an error that lists the labels there are.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownLabel`] if no option has this label.
     fn parse_label(label: &str) -> std::result::Result<Self, UnknownLabel> {
         Self::from_label(label).ok_or_else(|| UnknownLabel {
             label: label.to_owned(),
@@ -236,6 +245,10 @@ pub trait ChoiceField: Sized {
     fn question(instructions: Value) -> Choice;
 
     /// Convert the answer.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownLabel`] if the chosen label is not one the type has.
     fn from_choice(answer: &ChoiceAnswer) -> std::result::Result<Self, UnknownLabel>;
 }
 
@@ -401,6 +414,10 @@ impl<R: Rubric> AskRequest<R> {
     }
 
     /// Send the request and decode the answers.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`SystemOneRequest::send`], plus those of [`Rubric::from_response`].
     pub async fn send(self) -> Result<R> {
         R::from_response(&self.req.send().await?)
     }

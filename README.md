@@ -29,12 +29,58 @@ environment variables are honoured.
 
 ## Quick start
 
+With the `derive` feature, a struct is the rubric: each field is a question, and the answers come
+back into it, typed.
+
 ```rust,no_run
-use typesafe::{Choice, Client, Noul, Questions, Score};
+use typesafe::{ChoiceOf, Client, NoulAnswer, Rubric, RubricChoice, ScoreAnswer};
+
+#[derive(Rubric)]
+struct Triage {
+    #[choice("Which team should handle this")]
+    department: ChoiceOf<Department>,
+    #[score("How frustrated the customer appears",
+            levels = ["Calm", "Frustrated but civil", "Very angry"])]
+    frustration: ScoreAnswer,
+    #[noul("The message conveys urgency")]
+    is_urgent: NoulAnswer,
+}
+
+#[derive(Debug, RubricChoice)]
+enum Department {
+    /// Payment or subscription issues
+    Billing,
+    /// Bugs or integration problems
+    Technical,
+    /// Pricing or account questions
+    Sales,
+}
 
 #[tokio::main]
 async fn main() -> typesafe::Result<()> {
     let client = Client::from_env()?; // TYPESAFE_API_KEY
+
+    let t: Triage = client
+        .ask("I've been trying to connect my Stripe account for 3 days. Please help ASAP.")
+        .await?;
+
+    if t.department.confidence() > 0.5 {
+        println!("route to {:?}", *t.department);
+    }
+    println!("{:.2}", t.frustration.score);
+    println!("{}", t.is_urgent.is_yes(0.8));
+    Ok(())
+}
+```
+
+Without the derive, build the questions at runtime and look the answers up by name:
+
+```rust,no_run
+use typesafe::{Choice, Client, Noul, Questions, Score};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::from_env()?;
 
     let res = client
         .system_one(
@@ -50,12 +96,13 @@ async fn main() -> typesafe::Result<()> {
         )
         .await?;
 
-    let dept = res.choice("department").unwrap();
+    let dept = res.choice("department").ok_or("no department answer")?;
     if dept.confidence > 0.5 {
         println!("route to {}", dept.choice);
     }
-    println!("{:.2}", res.score("frustration").unwrap().score);
-    println!("{}", res.noul("is_urgent").unwrap().is_yes(0.8));
+    if let Some(frustration) = res.score("frustration") {
+        println!("{:.2}", frustration.score);
+    }
     Ok(())
 }
 ```
@@ -92,10 +139,10 @@ Instructions, option descriptions and score levels accept any JSON value:
 
 ```rust
 use typesafe::{Choice, Noul, Score, json};
-Score::new(json!({"task": "rate tone", "ignore": ["signatures"]}),
-           [json!({"level": "neutral"}), json!("hostile")]);
-Noul::new("Is this a refund request?").when_true("Explicit ask for money back");
-Choice::from_labels("Sentiment", ["positive", "neutral", "negative"]);
+let tone = Score::new(json!({"task": "rate tone", "ignore": ["signatures"]}),
+                      [json!({"level": "neutral"}), json!("hostile")]);
+let refund = Noul::new("Is this a refund request?").when_true("Explicit ask for money back");
+let sentiment = Choice::from_labels("Sentiment", ["positive", "neutral", "negative"]);
 ```
 
 ### Typed choices
@@ -186,11 +233,13 @@ for m in client.models().list().await?.models {
 ### Blocking
 
 ```rust,ignore
-let client = typesafe::blocking::Client::from_env()?;
+let client = typesafe::blocking::Client::from_env()?;   // or Client::builder()….build_blocking()?
 let res = client.system_one("text", questions).send()?;
+let models = client.models().list().send()?;
 ```
 
-The blocking client owns a private current-thread runtime; don't call it from inside async code.
+The blocking client owns a private current-thread runtime, shared by its clones; don't call it
+from inside async code.
 
 ## Learn it interactively
 
@@ -341,7 +390,7 @@ let client = typesafe::Client::builder().replay("tests/cassettes").build()?;
 ```rust
 use std::time::Duration;
 use typesafe::RetryPolicy;
-RetryPolicy::default()
+let policy = RetryPolicy::default()
     .max_retries(5)
     .backoff(Duration::from_millis(200), Duration::from_secs(2))
     .budget(Some(Duration::from_secs(10)))
