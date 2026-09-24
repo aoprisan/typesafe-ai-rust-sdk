@@ -26,6 +26,10 @@ use crate::question::Questions;
 /// The key of a request with no `extra_body`: the hash of `{"state", "model", "questions"}` as
 /// compact JSON.
 ///
+/// # Panics
+///
+/// Never: a `Value` and a `Questions` always encode as JSON.
+///
 /// ```
 /// use typesafe::{Noul, Questions, cassette, json};
 ///

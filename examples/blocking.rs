@@ -10,7 +10,7 @@ fn main() -> typesafe::Result<()> {
     // never call it from inside async code.
     let client = Client::from_env()?;
 
-    for model in client.list_models().send()?.models {
+    for model in client.models().list().send()?.models {
         println!("model {}", model.name);
     }
 

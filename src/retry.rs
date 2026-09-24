@@ -87,12 +87,14 @@ impl RetryPolicy {
     }
 
     /// Set `max_retries`.
+    #[must_use]
     pub fn max_retries(mut self, n: u32) -> Self {
         self.max_retries = n;
         self
     }
 
     /// Set the backoff bounds.
+    #[must_use]
     pub fn backoff(mut self, initial: Duration, max: Duration) -> Self {
         self.backoff_initial = initial;
         self.backoff_max = max;
@@ -100,42 +102,49 @@ impl RetryPolicy {
     }
 
     /// Set the jitter fraction.
+    #[must_use]
     pub fn jitter(mut self, fraction: f64) -> Self {
         self.backoff_jitter = fraction;
         self
     }
 
     /// Replace the retryable status set.
+    #[must_use]
     pub fn statuses(mut self, statuses: impl IntoIterator<Item = u16>) -> Self {
         self.http_statuses = statuses.into_iter().collect();
         self
     }
 
     /// Set the total time budget.
+    #[must_use]
     pub fn budget(mut self, budget: Option<Duration>) -> Self {
         self.budget = budget;
         self
     }
 
     /// Whether to honor `retry-after-ms` / `Retry-After`.
+    #[must_use]
     pub fn respect_retry_after(mut self, yes: bool) -> Self {
         self.respect_retry_after = yes;
         self
     }
 
     /// Whether to retry [`Error::Connection`].
+    #[must_use]
     pub fn retry_connection_errors(mut self, yes: bool) -> Self {
         self.retry_connection_errors = yes;
         self
     }
 
     /// Whether to retry [`Error::Timeout`].
+    #[must_use]
     pub fn retry_timeouts(mut self, yes: bool) -> Self {
         self.retry_timeouts = yes;
         self
     }
 
     /// Add a custom predicate.
+    #[must_use]
     pub fn retry_if(mut self, f: impl Fn(&Error) -> bool + Send + Sync + 'static) -> Self {
         self.predicate = Some(Arc::new(f));
         self

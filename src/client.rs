@@ -1,11 +1,13 @@
 //! The asynchronous client.
 
+use std::fmt;
 use std::future::{Future, IntoFuture};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
@@ -27,7 +29,10 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Builder for [`Client`]. Explicit settings win over environment variables; empty or
 /// whitespace-only environment values are ignored.
-#[derive(Debug, Default)]
+///
+/// Its `Debug` output hides the API key and any credential-bearing header.
+#[must_use = "a builder does nothing until .build() is called"]
+#[derive(Default)]
 pub struct ClientBuilder {
     api_key: Option<String>,
     base_url: Option<String>,
@@ -38,6 +43,22 @@ pub struct ClientBuilder {
     http: Option<reqwest::Client>,
     record: Option<PathBuf>,
     replay: Option<PathBuf>,
+}
+
+impl fmt::Debug for ClientBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientBuilder")
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("timeout", &self.timeout)
+            .field("retry", &self.retry)
+            .field("headers", &redacted(&self.headers))
+            .field("http", &self.http)
+            .field("record", &self.record)
+            .field("replay", &self.replay)
+            .finish()
+    }
 }
 
 impl ClientBuilder {
@@ -97,12 +118,34 @@ impl ClientBuilder {
     /// Use your own `reqwest::Client` (proxies, TLS, connection pools…). Requires the
     /// `reqwest-client` feature.
     #[cfg(feature = "reqwest-client")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "reqwest-client")))]
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http = Some(client);
         self
     }
 
+    /// Build a [`blocking::Client`](crate::blocking::Client) (feature `blocking`).
+    ///
+    /// # Errors
+    ///
+    /// As for [`build`](Self::build), plus [`Error::Config`] if the runtime cannot be started.
+    #[cfg(feature = "blocking")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "blocking")))]
+    pub fn build_blocking(self) -> Result<crate::blocking::Client> {
+        crate::blocking::Client::new(self.build()?)
+    }
+
     /// Build the client.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if no API key is set (unless replaying) or it is malformed, the base URL
+    /// is not an http(s) URL, the timeout is zero, the retry policy is invalid, both record and
+    /// replay are set, or the record directory cannot be created.
+    ///
+    /// # Panics
+    ///
+    /// Never: the key is checked to be printable ASCII before it becomes a header value.
     pub fn build(self) -> Result<Client> {
         let cassette = match (
             resolve_path(self.record, RECORD_ENV),
@@ -222,7 +265,6 @@ fn check_timeout(t: Duration) -> Result<Duration> {
     }
 }
 
-#[derive(Debug)]
 struct Inner {
     http: reqwest::Client,
     base_url: String,
@@ -232,6 +274,22 @@ struct Inner {
     default_headers: HeaderMap,
     protected: HeaderMap,
     cassette: Option<Cassette>,
+}
+
+/// Headers go through [`redacted`], so the API key and any gateway credential stay hidden.
+impl fmt::Debug for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Inner")
+            .field("http", &self.http)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("timeout", &self.timeout)
+            .field("retry", &self.retry)
+            .field("default_headers", &redacted(&self.default_headers))
+            .field("protected", &redacted(&self.protected))
+            .field("cassette", &self.cassette)
+            .finish()
+    }
 }
 
 /// Where System One responses are recorded to or replayed from.
@@ -274,6 +332,10 @@ impl Client {
     }
 
     /// A client configured entirely from the environment.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`], as for [`ClientBuilder::build`].
     pub fn from_env() -> Result<Self> {
         Self::builder().build()
     }
@@ -312,9 +374,9 @@ impl Client {
         &self,
         method: Method,
         path: &str,
-        body: Option<Vec<u8>>,
+        body: Option<Bytes>,
         opts: CallOptions,
-    ) -> Result<(Vec<u8>, ResponseMeta, String)> {
+    ) -> Result<(Bytes, ResponseMeta, String)> {
         let inner = &self.inner;
         let retry = opts.retry.as_ref().unwrap_or(&inner.retry);
         retry.validate()?;
@@ -342,6 +404,7 @@ impl Client {
                 tracing::info!(%endpoint, retry = attempts, "retrying");
             }
             attempts += 1;
+            // `Bytes` clones share one buffer, so a retry does not copy the body.
             let result = self
                 .attempt(&method, &url, &endpoint, h, body.clone(), timeout)
                 .await;
@@ -376,9 +439,9 @@ impl Client {
         url: &str,
         endpoint: &str,
         headers: HeaderMap,
-        body: Option<Vec<u8>>,
+        body: Option<Bytes>,
         timeout: Duration,
-    ) -> Result<(Vec<u8>, u16, HeaderMap)> {
+    ) -> Result<(Bytes, u16, HeaderMap)> {
         let t0 = Instant::now();
         tracing::debug!(%endpoint, "->");
         if tracing::enabled!(tracing::Level::TRACE) {
@@ -427,7 +490,7 @@ impl Client {
                 Some(endpoint.to_owned()),
             ))));
         }
-        Ok((bytes.to_vec(), status.as_u16(), resp_headers))
+        Ok((bytes, status.as_u16(), resp_headers))
     }
 }
 
@@ -543,6 +606,15 @@ impl SystemOneRequest {
     }
 
     /// Send the request.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRequest`] if the state cannot be encoded or the questions are rejected
+    ///   locally (none, or a choice or score without criteria); nothing is sent.
+    /// - [`Error::Config`] if a per-call timeout or retry policy is invalid.
+    /// - [`Error::Api`], [`Error::Connection`] or [`Error::Timeout`] once retries are exhausted.
+    /// - [`Error::ResponseValidation`] if a 2xx body does not decode.
+    /// - [`Error::ReplayMiss`] if replaying and the request was never recorded.
     pub async fn send(self) -> Result<SystemOneResponse> {
         let state = self.state.map_err(Error::InvalidRequest)?;
         self.questions.validate()?;
@@ -564,18 +636,24 @@ impl SystemOneRequest {
             ))
         })?;
 
-        let key = cassette::body_key(&bytes);
-        let (bytes, meta, endpoint) = match &self.client.inner.cassette {
-            Some(Cassette::Replay(dir)) => replay(dir, &key)?,
+        // Only a recording or replaying client needs the body's hash.
+        let cassette = self
+            .client
+            .inner
+            .cassette
+            .as_ref()
+            .map(|c| (c, cassette::body_key(&bytes)));
+        let (bytes, meta, endpoint) = match &cassette {
+            Some((Cassette::Replay(dir), key)) => replay(dir, key)?,
             _ => {
                 self.client
-                    .execute(Method::POST, SYSTEM_ONE_PATH, Some(bytes), self.opts)
+                    .execute(Method::POST, SYSTEM_ONE_PATH, Some(bytes.into()), self.opts)
                     .await?
             }
         };
         let decoded = decode_system_one(&bytes);
-        if let (Ok(_), Some(Cassette::Record(dir))) = (&decoded, &self.client.inner.cassette)
-            && let Err(e) = cassette::write(dir, &key, &bytes)
+        if let (Ok(_), Some((Cassette::Record(dir), key))) = (&decoded, &cassette)
+            && let Err(e) = cassette::write(dir, key, &bytes)
         {
             tracing::warn!(dir = %dir.display(), %key, error = %e, "could not record the response");
         }
@@ -604,7 +682,7 @@ impl SystemOneRequest {
 }
 
 /// The recorded response for `key`, in the shape a live call returns: no headers, no attempts.
-fn replay(dir: &std::path::Path, key: &str) -> Result<(Vec<u8>, ResponseMeta, String)> {
+fn replay(dir: &std::path::Path, key: &str) -> Result<(Bytes, ResponseMeta, String)> {
     let path = cassette::path(dir, key);
     let bytes = std::fs::read(&path).map_err(|_| Error::ReplayMiss {
         key: key.to_owned(),
@@ -616,7 +694,7 @@ fn replay(dir: &std::path::Path, key: &str) -> Result<(Vec<u8>, ResponseMeta, St
         headers: HeaderMap::new(),
         attempts: 0,
     };
-    Ok((bytes, meta, format!("replay {}", path.display())))
+    Ok((bytes.into(), meta, format!("replay {}", path.display())))
 }
 
 #[derive(Serialize)]
@@ -668,6 +746,13 @@ impl ListModelsRequest {
     call_option_methods!();
 
     /// Send the request.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Config`] if a per-call timeout or retry policy is invalid, or the client is
+    ///   replaying (model listings are not recorded).
+    /// - [`Error::Api`], [`Error::Connection`] or [`Error::Timeout`] once retries are exhausted.
+    /// - [`Error::ResponseValidation`] if a 2xx body does not decode.
     pub async fn send(self) -> Result<ListModelsResponse> {
         if let Some(Cassette::Replay(dir)) = &self.client.inner.cassette {
             return Err(Error::Config(format!(
@@ -703,7 +788,29 @@ impl IntoFuture for ListModelsRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::is_secret;
+    use super::*;
+
+    #[test]
+    fn debug_output_hides_the_key() {
+        let builder = Client::builder()
+            .api_key("sk-very-secret")
+            .header(
+                HeaderName::from_static("x-portkey-api-key"),
+                HeaderValue::from_static("gw-very-secret"),
+            )
+            .base_url("https://example.test");
+        let shown = format!("{builder:?}");
+        assert!(!shown.contains("very-secret"), "{shown}");
+        assert!(
+            shown.contains("***") && shown.contains("example.test"),
+            "{shown}"
+        );
+
+        let client = builder.build().unwrap();
+        let shown = format!("{client:?}");
+        assert!(!shown.contains("very-secret"), "{shown}");
+        assert!(shown.contains("example.test"), "{shown}");
+    }
 
     #[test]
     fn masks_a_gateways_key_as_well_as_the_apis() {

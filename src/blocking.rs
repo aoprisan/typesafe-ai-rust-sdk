@@ -1,6 +1,7 @@
 //! Synchronous client (feature `blocking`). Each client owns a private current-thread Tokio
-//! runtime; do not call it from inside an async context.
+//! runtime, shared with its clones; do not call it from inside an async context.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::header::{HeaderName, HeaderValue};
@@ -13,26 +14,48 @@ use crate::response::{ListModelsResponse, SystemOneResponse};
 use crate::retry::RetryPolicy;
 use crate::rubric::Rubric;
 
-/// Blocking TypeSafe client.
-#[derive(Debug)]
+/// Blocking TypeSafe client. Cheap to clone; clones share the runtime and the connection pool.
+#[derive(Debug, Clone)]
 pub struct Client {
     inner: crate::Client,
-    rt: tokio::runtime::Runtime,
+    rt: Arc<tokio::runtime::Runtime>,
 }
 
 impl Client {
-    /// Wrap an async client configured via [`crate::Client::builder`].
+    /// Wrap an async client configured via [`crate::Client::builder`] (or build one with
+    /// [`ClientBuilder::build_blocking`](crate::ClientBuilder::build_blocking)).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the runtime cannot be started.
     pub fn new(inner: crate::Client) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| Error::Config(format!("could not start runtime: {e}")))?;
-        Ok(Self { inner, rt })
+        Ok(Self {
+            inner,
+            rt: Arc::new(rt),
+        })
     }
 
     /// A client configured entirely from the environment.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] as for [`crate::Client::from_env`], or if the runtime cannot be started.
     pub fn from_env() -> Result<Self> {
         Self::new(crate::Client::from_env()?)
+    }
+
+    /// The default model.
+    pub fn default_model(&self) -> &str {
+        self.inner.default_model()
+    }
+
+    /// The Models resource; see [`crate::Client::models`].
+    pub fn models(&self) -> Models<'_> {
+        Models { client: self }
     }
 
     /// See [`crate::Client::system_one`].
@@ -56,10 +79,24 @@ impl Client {
     }
 
     /// `GET /v1/models`.
+    #[deprecated(note = "use `client.models().list()`, as on the async client")]
     pub fn list_models(&self) -> ListModelsRequest<'_> {
+        self.models().list()
+    }
+}
+
+/// The blocking Models resource.
+#[derive(Debug, Clone, Copy)]
+pub struct Models<'a> {
+    client: &'a Client,
+}
+
+impl<'a> Models<'a> {
+    /// `GET /v1/models`.
+    pub fn list(&self) -> ListModelsRequest<'a> {
         ListModelsRequest {
-            rt: &self.rt,
-            req: self.inner.models().list(),
+            rt: &self.client.rt,
+            req: self.client.inner.models().list(),
         }
     }
 }
@@ -102,6 +139,14 @@ impl SystemOneRequest<'_> {
     }
 
     /// Send and wait.
+    ///
+    /// # Errors
+    ///
+    /// As for the async request's `send`.
+    ///
+    /// # Panics
+    ///
+    /// When called from inside an async runtime.
     pub fn send(self) -> Result<SystemOneResponse> {
         self.rt.block_on(self.req.send())
     }
@@ -135,6 +180,14 @@ impl<R: Rubric> AskRequest<'_, R> {
     }
 
     /// Send, wait, and decode the answers.
+    ///
+    /// # Errors
+    ///
+    /// As for the async request's `send`.
+    ///
+    /// # Panics
+    ///
+    /// When called from inside an async runtime.
     pub fn send(self) -> Result<R> {
         self.rt.block_on(self.req.send())
     }
@@ -156,6 +209,14 @@ impl ListModelsRequest<'_> {
     );
 
     /// Send and wait.
+    ///
+    /// # Errors
+    ///
+    /// As for the async request's `send`.
+    ///
+    /// # Panics
+    ///
+    /// When called from inside an async runtime.
     pub fn send(self) -> Result<ListModelsResponse> {
         self.rt.block_on(self.req.send())
     }
