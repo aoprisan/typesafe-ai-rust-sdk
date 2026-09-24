@@ -328,8 +328,9 @@ pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
             raw.parse::<f64>()
         } && ms.is_finite()
             && ms >= 0.0
+            && let Ok(delay) = Duration::try_from_secs_f64(ms / 1000.0)
         {
-            return Some(Duration::from_secs_f64(ms / 1000.0));
+            return Some(delay);
         }
     }
     let raw = header_str(headers, RETRY_AFTER_HEADER)?;
@@ -439,5 +440,12 @@ mod tests {
             HeaderValue::from_static("  Wed, 21 Oct 2015 07:28:00 GMT "),
         );
         assert_eq!(parse_retry_after(&h), Some(Duration::ZERO));
+
+        // Too long for a `Duration`: ignored (falling back to `Retry-After`), never a panic.
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER_MS_HEADER, HeaderValue::from_static("1e300"));
+        assert_eq!(parse_retry_after(&h), None);
+        h.insert(RETRY_AFTER_HEADER, HeaderValue::from_static("3"));
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(3)));
     }
 }

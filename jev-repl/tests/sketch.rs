@@ -173,6 +173,11 @@ fn problems_point_at_the_line_and_say_what_to_do() {
             2,
             "are mixed",
         ),
+        (
+            "text\n---\npick: Which\n  a = x\n  a = y\n",
+            4,
+            "option `a` is listed twice",
+        ),
         ("text\n---\nx? one\nx? two\n", 3, "already named"),
         ("text\n---\nraw! not json\n", 2, "not valid JSON"),
         ("text\n---\nraw! {\"no\": \"type\"}\n", 2, "with a `type`"),
