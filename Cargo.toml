@@ -3,7 +3,7 @@ members = ["jev-repl", "typesafe-derive"]
 
 [package]
 name = "typesafe-ai-sdk"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Rust client for the TypeSafe AI System One API (Noul, Choice and Score questions)"

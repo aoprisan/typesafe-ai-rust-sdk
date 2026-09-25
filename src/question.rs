@@ -204,10 +204,14 @@ impl Questions {
         self
     }
 
-    /// Add (or replace) a question.
-    pub fn insert(&mut self, name: impl Into<String>, question: impl Into<Question>) -> &mut Self {
-        self.0.insert(name.into(), question.into());
-        self
+    /// Add a question, or replace the one of the same name (keeping its position). Returns the
+    /// question it replaced, as `HashMap::insert` does.
+    pub fn insert(
+        &mut self,
+        name: impl Into<String>,
+        question: impl Into<Question>,
+    ) -> Option<Question> {
+        self.0.insert(name.into(), question.into())
     }
 
     /// The question named `name`.
@@ -233,9 +237,7 @@ impl Questions {
     /// Reject what the Python SDK rejects locally; everything else is left to server validation.
     pub(crate) fn validate(&self) -> Result<()> {
         if self.0.is_empty() {
-            return Err(Error::InvalidRequest(
-                "At least one question is required.".into(),
-            ));
+            return Err(Error::invalid_request("at least one question is required"));
         }
         for (name, q) in &self.0 {
             match q {
@@ -250,14 +252,14 @@ impl Questions {
 }
 
 fn empty_score(name: &str) -> Error {
-    Error::InvalidRequest(format!(
-        "Score question \"{name}\" has no criteria; at least one score is required."
+    Error::invalid_request(format!(
+        "score question \"{name}\" has no criteria; at least one score is required"
     ))
 }
 
 fn empty_choice(name: &str) -> Error {
-    Error::InvalidRequest(format!(
-        "Choice question \"{name}\" has no criteria; at least one option is required."
+    Error::invalid_request(format!(
+        "choice question \"{name}\" has no criteria; at least one option is required"
     ))
 }
 
@@ -268,13 +270,13 @@ fn validate_raw(name: &str, v: &Value) -> Result<()> {
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty())
         .ok_or_else(|| {
-            Error::InvalidRequest(format!(
-                "Question \"{name}\" must be a question object or a JSON object with a nonempty string \"type\"."
+            Error::invalid_request(format!(
+                "question \"{name}\" must be a question object or a JSON object with a nonempty string \"type\""
             ))
         })?;
     if matches!(ty, "choice" | "score") {
         let criteria = v.get("criteria").ok_or_else(|| {
-            Error::InvalidRequest(format!("Question \"{name}\" requires \"criteria\"."))
+            Error::invalid_request(format!("question \"{name}\" requires \"criteria\""))
         })?;
         let empty = match criteria {
             Value::Null => true,
@@ -401,6 +403,12 @@ mod tests {
         assert_eq!(owned, ["a", "b"]);
         // Round-trips through the owned iterator without losing order or content.
         assert_eq!(q.clone().into_iter().collect::<Questions>(), q);
+
+        // `insert` hands back what it replaced.
+        let mut r = Questions::new();
+        assert_eq!(r.insert("c", Noul::new("c")), None);
+        assert_eq!(r.insert("c", Noul::new("d")), Some(Noul::new("c").into()));
+        assert_eq!(r.get("c"), Some(&Question::Noul(Noul::new("d"))));
     }
 
     #[test]

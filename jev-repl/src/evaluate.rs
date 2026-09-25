@@ -800,7 +800,7 @@ fn unscorable(expect: &[(String, Expectation)], answers: &[(String, Answer)]) ->
     for (name, expectation) in expect {
         match answers.iter().find(|(n, _)| n == name).map(|(_, a)| a) {
             None => return Some(format!("no answer came back for {name}")),
-            Some(answer) if answer.kind() != expectation.kind() => {
+            Some(answer) if answer.kind().as_str() != expectation.kind() => {
                 return Some(format!(
                     "{name} came back as a {}, not a {}",
                     answer.kind(),

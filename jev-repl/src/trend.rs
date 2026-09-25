@@ -85,7 +85,7 @@ pub fn series(session: &Session, per_turn: &[Vec<Answered>], threshold: f64) -> 
                         .iter()
                         .find(|(n, _)| n == name)
                         .and_then(|(_, a)| a.as_ref())
-                        .filter(|a| a.kind() == kind)
+                        .filter(|a| a.kind().as_str() == kind)
                 })
                 .collect();
             let Some(all) = answers.filter(|all| !all.is_empty()) else {

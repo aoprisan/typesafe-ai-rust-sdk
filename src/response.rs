@@ -5,8 +5,10 @@
 //! `{"model", "answers", "usage"}` body.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::str::FromStr;
 
+use http::StatusCode;
 use http::header::HeaderMap;
 use indexmap::IndexMap;
 use serde::de::{self, DeserializeOwned, Deserializer};
@@ -112,13 +114,42 @@ pub enum Answer {
     Score(ScoreAnswer),
 }
 
-impl Answer {
-    /// The wire `type` tag.
-    pub fn kind(&self) -> &'static str {
+/// The type of an [`Answer`]; `Display` gives its wire `type` tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AnswerKind {
+    /// A [`NoulAnswer`], `"noul"`.
+    Noul,
+    /// A [`ChoiceAnswer`], `"choice"`.
+    Choice,
+    /// A [`ScoreAnswer`], `"score"`.
+    Score,
+}
+
+impl AnswerKind {
+    /// The wire `type` tag: `"noul"`, `"choice"` or `"score"`.
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Answer::Noul(_) => "noul",
-            Answer::Choice(_) => "choice",
-            Answer::Score(_) => "score",
+            AnswerKind::Noul => "noul",
+            AnswerKind::Choice => "choice",
+            AnswerKind::Score => "score",
+        }
+    }
+}
+
+impl fmt::Display for AnswerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Answer {
+    /// The answer's type.
+    pub fn kind(&self) -> AnswerKind {
+        match self {
+            Answer::Noul(_) => AnswerKind::Noul,
+            Answer::Choice(_) => AnswerKind::Choice,
+            Answer::Score(_) => AnswerKind::Score,
         }
     }
 
@@ -136,7 +167,7 @@ impl Answer {
 impl Serialize for Answer {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut m = s.serialize_map(None)?;
-        m.serialize_entry("type", self.kind())?;
+        m.serialize_entry("type", self.kind().as_str())?;
         match self {
             Answer::Noul(a) => m.serialize_entry("noul", &a.noul)?,
             Answer::Choice(a) => {
@@ -224,7 +255,7 @@ pub struct Usage {
 #[non_exhaustive]
 pub struct ResponseMeta {
     /// HTTP status.
-    pub status: u16,
+    pub status: StatusCode,
     /// Response headers.
     pub headers: HeaderMap,
     /// Number of attempts made, including the successful one; `0` for a replayed response.
@@ -524,7 +555,7 @@ mod tests {
             answers: d.answers,
             raw: d.raw,
             meta: ResponseMeta {
-                status: 200,
+                status: StatusCode::OK,
                 headers: HeaderMap::new(),
                 attempts: 1,
             },
@@ -538,6 +569,7 @@ mod tests {
         assert_eq!(again.answers, res.answers);
 
         for (name, answer) in &res.answers {
+            assert_eq!(answer.kind().to_string(), wire["answers"][name]["type"]);
             let text = serde_json::to_string(answer).unwrap();
             assert_eq!(serde_json::from_str::<Answer>(&text).unwrap(), *answer);
             assert_eq!(

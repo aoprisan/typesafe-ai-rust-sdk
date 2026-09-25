@@ -3,7 +3,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use typesafe::{Answer, Error, Question};
+use typesafe::{Answer, Error, Question, StatusCode};
 
 use crate::cost::{Estimate, Rates, Thread, format_rates, price, price_estimate, usd};
 use crate::session::Turn;
@@ -49,7 +49,7 @@ pub fn color_for(kind: &str) -> Color {
 
 /// Render one answer: the number, the distribution it came from, and what it means.
 pub fn answer_lines(name: &str, answer: &Answer, threshold: f64) -> Vec<Line<'static>> {
-    let kind = answer.kind();
+    let kind = answer.kind().as_str();
     let mut out = vec![Line::from(vec![
         Span::raw("  "),
         bold(name.to_owned()),
@@ -388,19 +388,23 @@ pub fn question_lines(index: usize, name: &str, question: &Question) -> Vec<Line
 /// Errors are part of the lesson: show the variant, what it means, and what to do.
 pub fn error_lines(err: &Error) -> Vec<Line<'static>> {
     let (variant, advice) = match err {
-        Error::Config(_) => ("Config", "Fix the client settings — :key sets an API key."),
-        Error::InvalidRequest(_) => (
+        Error::Config { .. } => ("Config", "Fix the client settings — :key sets an API key."),
+        Error::InvalidRequest { .. } => (
             "InvalidRequest",
             "Rejected before anything was sent; nothing reached the API.",
         ),
         Error::Api(e) => (
             "Api",
             match e.status {
-                401 => "The API key is missing or wrong.",
-                403 => "The key is valid but not allowed to do this.",
-                422 => "The server rejected the body — check the question criteria.",
-                429 => "Rate limited; the SDK already retried with backoff.",
-                s if s >= 500 => "Server-side; the SDK already retried with backoff.",
+                StatusCode::UNAUTHORIZED => "The API key is missing or wrong.",
+                StatusCode::FORBIDDEN => "The key is valid but not allowed to do this.",
+                StatusCode::UNPROCESSABLE_ENTITY => {
+                    "The server rejected the body — check the question criteria."
+                }
+                StatusCode::TOO_MANY_REQUESTS => {
+                    "Rate limited; the SDK already retried with backoff."
+                }
+                s if s.is_server_error() => "Server-side; the SDK already retried with backoff.",
                 _ => "Non-2xx after retries.",
             },
         ),
@@ -430,6 +434,15 @@ pub fn error_lines(err: &Error) -> Vec<Line<'static>> {
         ),
         Span::raw(err.to_string()),
     ])];
+    // The SDK's message says what failed; the chain under it says why.
+    let mut cause = std::error::Error::source(err);
+    while let Some(e) = cause {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            dim(format!("caused by: {e}")),
+        ]));
+        cause = e.source();
+    }
     if let Error::ResponseValidation(e) = err {
         lines.push(Line::from(vec![
             Span::raw("    "),

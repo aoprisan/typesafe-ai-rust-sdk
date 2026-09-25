@@ -3,7 +3,9 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::json;
 use typesafe::http::header::{AUTHORIZATION, HeaderName, HeaderValue};
-use typesafe::{ApiErrorKind, Choice, Client, Error, Noul, Questions, RetryPolicy, Score};
+use typesafe::{
+    ApiErrorKind, Choice, Client, Error, Noul, Questions, RetryPolicy, Score, StatusCode,
+};
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -245,7 +247,7 @@ async fn overloaded_529_exhausts_retries() {
         .await
         .unwrap_err();
     let api = err.as_api().unwrap();
-    assert_eq!(api.status, 529);
+    assert_eq!(api.status.as_u16(), 529);
     assert_eq!(api.kind, ApiErrorKind::InternalServer);
     assert_eq!(api.message, "Overloaded");
     assert!(err.to_string().starts_with("POST http://127.0.0.1"));
@@ -315,7 +317,7 @@ async fn custom_predicate_retries_otherwise_final_status() {
     let policy = RetryPolicy::default()
         .max_retries(1)
         .backoff(Duration::ZERO, Duration::ZERO)
-        .retry_if(|e| e.status() == Some(409));
+        .retry_if(|e| e.status() == Some(StatusCode::CONFLICT));
     let err = client(&server)
         .system_one("x", questions())
         .retry(policy)
@@ -384,7 +386,7 @@ async fn invalid_success_body_reports_field_path() {
     {
         Error::ResponseValidation(e) => {
             assert_eq!(e.field_path, "answers.department.confidence");
-            assert_eq!(e.status, 200);
+            assert_eq!(e.status, StatusCode::OK);
         }
         other => panic!("{other:?}"),
     }
@@ -401,17 +403,17 @@ async fn local_validation_happens_before_sending() {
     let c = client(&server);
     assert!(matches!(
         c.system_one("x", Questions::new()).await,
-        Err(Error::InvalidRequest(_))
+        Err(Error::InvalidRequest { .. })
     ));
     assert!(matches!(
         c.system_one("x", Questions::new().with("c", Choice::new("no options")))
             .await,
-        Err(Error::InvalidRequest(_))
+        Err(Error::InvalidRequest { .. })
     ));
     let q = Questions::new().with("raw", json!({"type": "score", "criteria": []}));
     assert!(matches!(
         c.system_one("x", q).await,
-        Err(Error::InvalidRequest(_))
+        Err(Error::InvalidRequest { .. })
     ));
 }
 
@@ -435,20 +437,23 @@ async fn lists_models() {
 #[test]
 fn config_validation() {
     if std::env::var(typesafe::constants::API_KEY_ENV).is_err() {
-        assert!(matches!(Client::builder().build(), Err(Error::Config(_))));
+        assert!(matches!(
+            Client::builder().build(),
+            Err(Error::Config { .. })
+        ));
     }
     assert!(matches!(
         Client::builder()
             .api_key("k")
             .timeout(Duration::ZERO)
             .build(),
-        Err(Error::Config(_))
+        Err(Error::Config { .. })
     ));
     for bad in ["", "not a url", "ftp://x", "http://"] {
         assert!(
             matches!(
                 Client::builder().api_key("k").base_url(bad).build(),
-                Err(Error::Config(_))
+                Err(Error::Config { .. })
             ),
             "{bad:?}"
         );
@@ -462,14 +467,44 @@ fn api_key_is_trimmed_and_checked() {
     assert!(Client::builder().api_key("  sk-test\n").build().is_ok());
     for bad in ["", "   ", "sk test", "sk\ttest", "sk-\u{7f}", "sk-é"] {
         let err = Client::builder().api_key(bad).build().unwrap_err();
-        assert!(matches!(err, Error::Config(_)), "{bad:?}");
+        assert!(matches!(err, Error::Config { .. }), "{bad:?}");
         let expected = if bad.trim().is_empty() {
-            "No API key"
+            "no API key"
         } else {
             "printable ASCII"
         };
         assert!(err.to_string().contains(expected), "{bad:?}: {err}");
     }
+}
+
+#[tokio::test]
+async fn errors_follow_the_conventions_and_keep_their_cause() {
+    use std::error::Error as _;
+
+    // The URL parser's error is the cause, not part of the message.
+    let err = Client::builder()
+        .api_key("k")
+        .base_url("not a url")
+        .build()
+        .unwrap_err();
+    assert_eq!(err.to_string(), "base_url \"not a url\" is not a valid URL");
+    assert!(err.source().is_some(), "{err:?}");
+
+    // State that cannot be JSON keeps serde_json's error.
+    let state: std::collections::HashMap<(u8, u8), u8> = [((1, 2), 3)].into();
+    let c = Client::builder().api_key("k").build().unwrap();
+    let err = c.system_one(state, questions()).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest { .. }), "{err:?}");
+    assert_eq!(err.to_string(), "the state could not be encoded as JSON");
+    assert!(err.source().unwrap().is::<typesafe::serde_json::Error>());
+
+    // Lowercase, no trailing period.
+    let err = c.system_one("x", Questions::new()).await.unwrap_err();
+    assert_eq!(err.to_string(), "at least one question is required");
+    assert_eq!(
+        Error::Timeout(Duration::from_secs(10)).to_string(),
+        "request timed out (timeout=10s)"
+    );
 }
 
 #[cfg(feature = "reqwest-client")]

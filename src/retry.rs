@@ -7,6 +7,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use http::StatusCode;
+
 use crate::error::{Error, Result};
 
 /// Custom retry predicate, consulted in addition to the built-in rules.
@@ -28,7 +30,7 @@ pub struct RetryPolicy {
     /// Fraction of each delay randomly subtracted, in `[0, 1]`. Default `0.25`.
     pub backoff_jitter: f64,
     /// Statuses that are retried. Default 408, 429 and 500–599 (which includes TypeSafe's 529).
-    pub http_statuses: BTreeSet<u16>,
+    pub http_statuses: BTreeSet<StatusCode>,
     /// Honor `retry-after-ms` / `Retry-After`. Default `true`.
     pub respect_retry_after: bool,
     /// Retry [`Error::Connection`]. Default `true`.
@@ -43,8 +45,10 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        let mut statuses: BTreeSet<u16> = (500..600).collect();
-        statuses.extend([408, 429]);
+        let mut statuses: BTreeSet<StatusCode> = (500..600)
+            .filter_map(|s| StatusCode::from_u16(s).ok())
+            .collect();
+        statuses.extend([StatusCode::REQUEST_TIMEOUT, StatusCode::TOO_MANY_REQUESTS]);
         Self {
             max_retries: 2,
             backoff_initial: Duration::from_millis(500),
@@ -109,8 +113,18 @@ impl RetryPolicy {
     }
 
     /// Replace the retryable status set.
+    ///
+    /// ```
+    /// use typesafe::{RetryPolicy, StatusCode};
+    ///
+    /// let policy = RetryPolicy::default().statuses([
+    ///     StatusCode::TOO_MANY_REQUESTS,
+    ///     StatusCode::SERVICE_UNAVAILABLE,
+    /// ]);
+    /// assert!(policy.http_statuses.contains(&StatusCode::SERVICE_UNAVAILABLE));
+    /// ```
     #[must_use]
-    pub fn statuses(mut self, statuses: impl IntoIterator<Item = u16>) -> Self {
+    pub fn statuses(mut self, statuses: impl IntoIterator<Item = StatusCode>) -> Self {
         self.http_statuses = statuses.into_iter().collect();
         self
     }
@@ -152,14 +166,10 @@ impl RetryPolicy {
 
     pub(crate) fn validate(&self) -> Result<()> {
         if !(0.0..=1.0).contains(&self.backoff_jitter) {
-            return Err(Error::Config(
-                "backoff_jitter must be between zero and one.".into(),
-            ));
+            return Err(Error::config("backoff_jitter must be between zero and one"));
         }
         if self.budget == Some(Duration::ZERO) {
-            return Err(Error::Config(
-                "retry budget must be a positive duration.".into(),
-            ));
+            return Err(Error::config("retry budget must be a positive duration"));
         }
         Ok(())
     }
@@ -251,9 +261,9 @@ mod tests {
     fn default_statuses_cover_529() {
         let p = RetryPolicy::default();
         for s in [408, 429, 500, 503, 529, 599] {
-            assert!(p.http_statuses.contains(&s));
+            assert!(p.http_statuses.contains(&StatusCode::from_u16(s).unwrap()));
         }
-        assert!(!p.http_statuses.contains(&422));
+        assert!(!p.http_statuses.contains(&StatusCode::UNPROCESSABLE_ENTITY));
         assert!(RetryPolicy::default().jitter(1.5).validate().is_err());
     }
 }

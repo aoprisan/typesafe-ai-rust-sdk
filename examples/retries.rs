@@ -3,7 +3,7 @@
 //! answer eventually, a request behind a user wants an answer now or not at all.
 use std::time::Duration;
 
-use typesafe::{ApiErrorKind, Client, Error, Noul, Questions, RetryPolicy};
+use typesafe::{ApiErrorKind, Client, Error, Noul, Questions, RetryPolicy, StatusCode};
 
 const TEXT: &str = "Does the export honour custom fields? The changelog does not say.";
 
@@ -16,7 +16,7 @@ async fn main() -> typesafe::Result<()> {
         .backoff(Duration::from_millis(200), Duration::from_secs(4))
         .jitter(0.5)
         .budget(Some(Duration::from_secs(20)))
-        .retry_if(|err| err.status() == Some(409));
+        .retry_if(|err| err.status() == Some(StatusCode::CONFLICT));
 
     let client = Client::builder()
         .retry(patient)

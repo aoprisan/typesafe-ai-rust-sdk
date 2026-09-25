@@ -290,7 +290,7 @@ impl ChoiceField for String {
 #[doc(hidden)]
 pub mod __private {
     use super::*;
-    use crate::response::Answer;
+    use crate::response::{Answer, AnswerKind};
 
     fn mismatch(response: &SystemOneResponse, field_path: String, detail: String) -> Error {
         Error::ResponseValidation(Box::new(ResponseValidationError {
@@ -303,7 +303,11 @@ pub mod __private {
         }))
     }
 
-    fn answer<'r>(response: &'r SystemOneResponse, name: &str, kind: &str) -> Result<&'r Answer> {
+    fn answer<'r>(
+        response: &'r SystemOneResponse,
+        name: &str,
+        kind: AnswerKind,
+    ) -> Result<&'r Answer> {
         let answer = response.answers.get(name).ok_or_else(|| {
             let detail = if response.raw["answers"].get(name).is_some() {
                 format!("the answer is of a type this SDK does not know; expected a {kind}")
@@ -323,21 +327,21 @@ pub mod __private {
     }
 
     pub fn noul<'r>(response: &'r SystemOneResponse, name: &str) -> Result<&'r NoulAnswer> {
-        match answer(response, name, "noul")? {
+        match answer(response, name, AnswerKind::Noul)? {
             Answer::Noul(a) => Ok(a),
             _ => unreachable!("kind checked"),
         }
     }
 
     pub fn score<'r>(response: &'r SystemOneResponse, name: &str) -> Result<&'r ScoreAnswer> {
-        match answer(response, name, "score")? {
+        match answer(response, name, AnswerKind::Score)? {
             Answer::Score(a) => Ok(a),
             _ => unreachable!("kind checked"),
         }
     }
 
     pub fn choice<T: ChoiceField>(response: &SystemOneResponse, name: &str) -> Result<T> {
-        let Answer::Choice(a) = answer(response, name, "choice")? else {
+        let Answer::Choice(a) = answer(response, name, AnswerKind::Choice)? else {
             unreachable!("kind checked")
         };
         T::from_choice(a)
