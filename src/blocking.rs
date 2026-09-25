@@ -27,12 +27,13 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Config`] if the runtime cannot be started.
+    /// [`Error::Config`], with the [`std::io::Error`] as its `source()`, if the runtime cannot be
+    /// started.
     pub fn new(inner: crate::Client) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| Error::Config(format!("could not start runtime: {e}")))?;
+            .map_err(|e| Error::config_caused("could not start the async runtime", e))?;
         Ok(Self {
             inner,
             rt: Arc::new(rt),
@@ -76,12 +77,6 @@ impl Client {
             rt: &self.rt,
             req: self.inner.ask(state),
         }
-    }
-
-    /// `GET /v1/models`.
-    #[deprecated(note = "use `client.models().list()`, as on the async client")]
-    pub fn list_models(&self) -> ListModelsRequest<'_> {
-        self.models().list()
     }
 }
 

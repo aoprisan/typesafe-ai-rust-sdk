@@ -54,14 +54,21 @@ async fn main() {
 fn report(label: &str, err: Error) {
     print!("{label}: ");
     match err {
-        // Programmer error: fix the configuration and restart.
-        Error::Config(message) => println!("configuration — {message}"),
+        // Programmer error: fix the configuration and restart. `source` is the cause, if there
+        // is one: the I/O error of an unusable record directory, the URL parser's error, …
+        Error::Config { message, source } => {
+            println!("configuration — {message}");
+            if let Some(cause) = source {
+                println!("  caused by: {cause}");
+            }
+        }
 
         // Programmer error too: the request was never sent, so retrying it changes nothing.
-        Error::InvalidRequest(message) => println!("invalid request — {message}"),
+        Error::InvalidRequest { message, .. } => println!("invalid request — {message}"),
 
         // The server answered, unhappily. `kind` classifies the status.
         Error::Api(api) => {
+            // `status` is an `http::StatusCode`: this prints e.g. `429 Too Many Requests`.
             print!("HTTP {} ({:?}) — {}", api.status, api.kind, api.message);
             if let Some(id) = api.request_id() {
                 print!(" [request {id}]");

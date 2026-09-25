@@ -69,10 +69,13 @@ pub mod blocking;
 
 pub use client::{Client, ClientBuilder, ListModelsRequest, Models, SystemOneRequest};
 pub use error::{ApiError, ApiErrorKind, Error, ResponseValidationError, Result};
+/// The HTTP status type of [`Error::status`], [`ApiError::status`], [`ResponseMeta::status`] and
+/// [`RetryPolicy::statuses`], with constants such as `StatusCode::TOO_MANY_REQUESTS`.
+pub use http::StatusCode;
 pub use question::{Choice, Noul, NoulCriteria, Question, Questions, Score};
 pub use response::{
-    Answer, ChoiceAnswer, ListModelsResponse, ModelMetadata, NoulAnswer, ResponseMeta, ScoreAnswer,
-    SystemOneResponse, Usage,
+    Answer, AnswerKind, ChoiceAnswer, ListModelsResponse, ModelMetadata, NoulAnswer, ResponseMeta,
+    ScoreAnswer, SystemOneResponse, Usage,
 };
 pub use retry::RetryPolicy;
 pub use rubric::{AskRequest, ChoiceOf, Rubric, RubricChoice};

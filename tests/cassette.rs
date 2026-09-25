@@ -106,7 +106,7 @@ async fn a_request_never_recorded_is_a_replay_miss() {
         .system_one(STATE, Questions::new())
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+    assert!(matches!(err, Error::InvalidRequest { .. }), "{err:?}");
 }
 
 #[tokio::test]
@@ -139,7 +139,10 @@ async fn only_successful_responses_are_recorded() {
         .system_one(STATE, questions())
         .await
         .unwrap_err();
-    assert_eq!(err.status(), Some(500));
+    assert_eq!(
+        err.status(),
+        Some(typesafe::StatusCode::INTERNAL_SERVER_ERROR)
+    );
     let bad_body = server(200, r#"{"answers": {}}"#).await;
     let err = recording(&bad_body, &dir)
         .system_one(STATE, questions())
@@ -173,7 +176,26 @@ async fn a_replaying_client_does_not_list_models() {
         .list()
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::Config(_)), "{err:?}");
+    assert!(matches!(err, Error::Config { .. }), "{err:?}");
+}
+
+#[test]
+fn a_record_directory_that_cannot_be_made_keeps_the_io_error() {
+    use std::error::Error as _;
+
+    // A directory cannot be made under a file.
+    let file = scratch("not-a-dir");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "").unwrap();
+    let err = Client::builder()
+        .api_key("sk-test")
+        .record(file.join("inside"))
+        .build()
+        .unwrap_err();
+    assert!(matches!(err, Error::Config { .. }), "{err:?}");
+    assert!(err.to_string().starts_with("cannot record into "), "{err}");
+    assert!(err.source().unwrap().is::<std::io::Error>(), "{err:?}");
+    let _ = std::fs::remove_file(&file);
 }
 
 #[test]
@@ -184,14 +206,14 @@ fn record_and_replay_together_is_a_config_error() {
         .replay(scratch("both"))
         .build()
         .unwrap_err();
-    assert!(matches!(err, Error::Config(_)), "{err:?}");
+    assert!(matches!(err, Error::Config { .. }), "{err:?}");
     // Recording still sends, so it still needs a key.
     if std::env::var(typesafe::constants::API_KEY_ENV).is_err() {
         let err = Client::builder()
             .record(scratch("keyless"))
             .build()
             .unwrap_err();
-        assert!(matches!(err, Error::Config(_)), "{err:?}");
+        assert!(matches!(err, Error::Config { .. }), "{err:?}");
     }
 }
 

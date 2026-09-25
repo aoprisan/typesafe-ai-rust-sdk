@@ -389,12 +389,12 @@ let client = typesafe::Client::builder().replay("tests/cassettes").build()?;
 
 ```rust
 use std::time::Duration;
-use typesafe::RetryPolicy;
+use typesafe::{RetryPolicy, StatusCode};
 let policy = RetryPolicy::default()
     .max_retries(5)
     .backoff(Duration::from_millis(200), Duration::from_secs(2))
     .budget(Some(Duration::from_secs(10)))
-    .retry_if(|e| e.status() == Some(409));
+    .retry_if(|e| e.status() == Some(StatusCode::CONFLICT));
 ```
 
 ## Errors
@@ -412,13 +412,18 @@ match client.system_one(state, questions).await {
 
 | Variant              | When                                                                   |
 | -------------------- | ---------------------------------------------------------------------- |
-| `Config`             | missing API key, invalid base URL, zero timeout, invalid retry policy, record and replay both set |
-| `InvalidRequest`     | no questions, empty choice/score criteria, malformed raw question, unencodable state |
-| `Api`                | non-2xx after retries; `kind`, `message`, `body`, `request_id()`, `retry_after()` |
+| `Config`             | missing API key, invalid base URL, zero timeout, invalid retry policy, record and replay both set, unusable record directory; `message`, `source` |
+| `InvalidRequest`     | no questions, empty choice/score criteria, malformed raw question, unencodable state; `message`, `source` |
+| `Api`                | non-2xx after retries; `status`, `kind`, `message`, `body`, `request_id()`, `retry_after()` |
 | `Connection`         | no response (DNS, connect, reset, body read); HTTP client error in `source()` |
 | `Timeout`            | an attempt exceeded its timeout                                         |
 | `ResponseValidation` | 2xx body missing required data; `field_path` like `answers.tone.confidence` |
 | `ReplayMiss`         | replaying, and this request was never recorded; `key`, `path`           |
+
+An error's message says what failed, lowercase and without a trailing period; the cause (an I/O
+error, the URL parser's error, the transport error) is not repeated in it but kept as its
+`source()`, so print the chain to see why. Statuses are `http::StatusCode`, re-exported as
+`typesafe::StatusCode`: `e.status() == Some(StatusCode::TOO_MANY_REQUESTS)`.
 
 Error messages from FastAPI-style validation bodies are flattened, e.g.
 `questions.frustration.criteria: List should have at least 2 items`.

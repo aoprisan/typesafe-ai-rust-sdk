@@ -141,25 +141,22 @@ impl ClientBuilder {
     ///
     /// [`Error::Config`] if no API key is set (unless replaying) or it is malformed, the base URL
     /// is not an http(s) URL, the timeout is zero, the retry policy is invalid, both record and
-    /// replay are set, or the record directory cannot be created.
-    ///
-    /// # Panics
-    ///
-    /// Never: the key is checked to be printable ASCII before it becomes a header value.
+    /// replay are set, or the record directory cannot be created. The cause, such as the
+    /// [`std::io::Error`] or the URL parse error, is the error's `source()`.
     pub fn build(self) -> Result<Client> {
         let cassette = match (
             resolve_path(self.record, RECORD_ENV),
             resolve_path(self.replay, REPLAY_ENV),
         ) {
             (Some(_), Some(_)) => {
-                return Err(Error::Config(format!(
-                    "Both record and replay are set; a client does one or the other. Unset \
-                     {RECORD_ENV} or {REPLAY_ENV}, or drop one of the builder calls."
+                return Err(Error::config(format!(
+                    "both record and replay are set, and a client does one or the other; unset \
+                     {RECORD_ENV} or {REPLAY_ENV}, or drop one of the builder calls"
                 )));
             }
             (Some(dir), None) => {
                 std::fs::create_dir_all(&dir).map_err(|e| {
-                    Error::Config(format!("Cannot record into {}: {e}.", dir.display()))
+                    Error::config_caused(format!("cannot record into {}", dir.display()), e)
                 })?;
                 Some(Cassette::Record(dir))
             }
@@ -172,16 +169,16 @@ impl ClientBuilder {
             .map(|k| k.trim().to_owned())
             .filter(|k| !k.is_empty());
         if api_key.is_none() && !replaying {
-            return Err(Error::Config(format!(
-                "No API key was provided. Pass api_key or set the {API_KEY_ENV} environment variable."
+            return Err(Error::config(format!(
+                "no API key was provided; pass api_key or set the {API_KEY_ENV} environment variable"
             )));
         }
         if api_key
             .as_deref()
             .is_some_and(|k| !k.bytes().all(|b| b.is_ascii_graphic()))
         {
-            return Err(Error::Config(
-                "API key must contain only printable ASCII characters without whitespace.".into(),
+            return Err(Error::config(
+                "the API key must contain only printable ASCII characters without whitespace",
             ));
         }
         let base_url = resolve(self.base_url, BASE_URL_ENV, Some(DEFAULT_BASE_URL))
@@ -197,7 +194,7 @@ impl ClientBuilder {
         let mut protected = HeaderMap::new();
         if let Some(api_key) = api_key {
             let mut auth = HeaderValue::from_str(&format!("Bearer {api_key}"))
-                .expect("a printable ASCII key is a valid header value");
+                .map_err(|e| Error::config_caused("the API key is not a valid header value", e))?;
             auth.set_sensitive(true);
             protected.insert(AUTHORIZATION, auth);
         }
@@ -248,18 +245,19 @@ fn resolve_path(explicit: Option<PathBuf>, env: &str) -> Option<PathBuf> {
 fn check_base_url(url: &str) -> Result<()> {
     match reqwest::Url::parse(url) {
         Ok(u) if matches!(u.scheme(), "http" | "https") && u.has_host() => Ok(()),
-        Ok(_) => Err(Error::Config(format!(
-            "base_url must be an http(s) URL with a host, got {url:?}."
+        Ok(_) => Err(Error::config(format!(
+            "base_url must be an http(s) URL with a host, got {url:?}"
         ))),
-        Err(e) => Err(Error::Config(format!(
-            "base_url {url:?} is not a valid URL: {e}."
-        ))),
+        Err(e) => Err(Error::config_caused(
+            format!("base_url {url:?} is not a valid URL"),
+            e,
+        )),
     }
 }
 
 fn check_timeout(t: Duration) -> Result<Duration> {
     if t.is_zero() {
-        Err(Error::Config("timeout must be a positive duration.".into()))
+        Err(Error::config("timeout must be a positive duration"))
     } else {
         Ok(t)
     }
@@ -354,8 +352,7 @@ impl Client {
     ) -> SystemOneRequest {
         SystemOneRequest {
             client: self.clone(),
-            state: serde_json::to_value(state)
-                .map_err(|e| format!("The state could not be encoded as JSON: {e}")),
+            state: serde_json::to_value(state),
             questions: questions.into(),
             model: None,
             extra_body: Map::new(),
@@ -441,7 +438,7 @@ impl Client {
         headers: HeaderMap,
         body: Option<Bytes>,
         timeout: Duration,
-    ) -> Result<(Bytes, u16, HeaderMap)> {
+    ) -> Result<(Bytes, StatusCode, HeaderMap)> {
         let t0 = Instant::now();
         tracing::debug!(%endpoint, "->");
         if tracing::enabled!(tracing::Level::TRACE) {
@@ -484,13 +481,13 @@ impl Client {
 
         if !status.is_success() {
             return Err(Error::Api(Box::new(ApiError::new(
-                status.as_u16(),
+                status,
                 lenient_body(&bytes),
                 resp_headers,
                 Some(endpoint.to_owned()),
             ))));
         }
-        Ok((bytes, status.as_u16(), resp_headers))
+        Ok((bytes, status, resp_headers))
     }
 }
 
@@ -502,7 +499,7 @@ fn validation_error(
     f: DecodeFailure,
 ) -> Error {
     Error::ResponseValidation(Box::new(ResponseValidationError {
-        status: status.as_u16(),
+        status,
         field_path: f.path,
         detail: f.detail,
         body,
@@ -582,7 +579,7 @@ macro_rules! call_option_methods {
 #[derive(Debug)]
 pub struct SystemOneRequest {
     client: Client,
-    state: std::result::Result<Value, String>,
+    state: serde_json::Result<Value>,
     questions: Questions,
     model: Option<String>,
     extra_body: Map<String, Value>,
@@ -614,9 +611,12 @@ impl SystemOneRequest {
     /// - [`Error::Config`] if a per-call timeout or retry policy is invalid.
     /// - [`Error::Api`], [`Error::Connection`] or [`Error::Timeout`] once retries are exhausted.
     /// - [`Error::ResponseValidation`] if a 2xx body does not decode.
-    /// - [`Error::ReplayMiss`] if replaying and the request was never recorded.
+    /// - [`Error::ReplayMiss`] if replaying and the request was never recorded, or
+    ///   [`Error::Config`] if its recording exists but cannot be read.
     pub async fn send(self) -> Result<SystemOneResponse> {
-        let state = self.state.map_err(Error::InvalidRequest)?;
+        let state = self.state.map_err(|e| {
+            Error::invalid_request_caused("the state could not be encoded as JSON", e)
+        })?;
         self.questions.validate()?;
         let model = self
             .model
@@ -631,9 +631,7 @@ impl SystemOneRequest {
             extra,
         };
         let bytes = serde_json::to_vec(&body).map_err(|e| {
-            Error::InvalidRequest(format!(
-                "The request body could not be encoded as JSON: {e}"
-            ))
+            Error::invalid_request_caused("the request body could not be encoded as JSON", e)
         })?;
 
         // Only a recording or replaying client needs the body's hash.
@@ -671,7 +669,7 @@ impl SystemOneRequest {
                 meta,
             }),
             Err(f) => Err(validation_error(
-                StatusCode::from_u16(meta.status).unwrap_or(StatusCode::OK),
+                meta.status,
                 lenient_body(&bytes),
                 meta.headers,
                 &endpoint,
@@ -684,13 +682,16 @@ impl SystemOneRequest {
 /// The recorded response for `key`, in the shape a live call returns: no headers, no attempts.
 fn replay(dir: &std::path::Path, key: &str) -> Result<(Bytes, ResponseMeta, String)> {
     let path = cassette::path(dir, key);
-    let bytes = std::fs::read(&path).map_err(|_| Error::ReplayMiss {
-        key: key.to_owned(),
-        path: path.clone(),
+    let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Error::ReplayMiss {
+            key: key.to_owned(),
+            path: path.clone(),
+        },
+        _ => Error::config_caused(format!("cannot read the recording {}", path.display()), e),
     })?;
     tracing::debug!(path = %path.display(), "<- replayed");
     let meta = ResponseMeta {
-        status: 200,
+        status: StatusCode::OK,
         headers: HeaderMap::new(),
         attempts: 0,
     };
@@ -755,8 +756,8 @@ impl ListModelsRequest {
     /// - [`Error::ResponseValidation`] if a 2xx body does not decode.
     pub async fn send(self) -> Result<ListModelsResponse> {
         if let Some(Cassette::Replay(dir)) = &self.client.inner.cassette {
-            return Err(Error::Config(format!(
-                "Listing models is not recorded, so a client replaying from {} cannot answer it.",
+            return Err(Error::config(format!(
+                "listing models is not recorded, so a client replaying from {} cannot answer it",
                 dir.display()
             )));
         }
@@ -767,7 +768,7 @@ impl ListModelsRequest {
         match decode_models(&bytes) {
             Ok((models, raw)) => Ok(ListModelsResponse { models, raw, meta }),
             Err(f) => Err(validation_error(
-                StatusCode::from_u16(meta.status).unwrap_or(StatusCode::OK),
+                meta.status,
                 lenient_body(&bytes),
                 meta.headers,
                 &endpoint,

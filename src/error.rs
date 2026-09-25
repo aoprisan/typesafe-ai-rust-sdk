@@ -8,6 +8,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
+use http::StatusCode;
 use http::header::HeaderMap;
 use serde_json::Value;
 
@@ -18,19 +19,39 @@ use crate::constants::{
 /// Convenience alias for results returned by this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The underlying cause carried by [`Error::Config`], [`Error::InvalidRequest`] and
+/// [`Error::Connection`], available through [`std::error::Error::source`].
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// Any failure produced by the SDK.
+///
+/// `Display` describes this error only; the cause, when there is one, is its
+/// [`source`](std::error::Error::source), so walk the chain to show all of it.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The client could not be configured (missing API key, invalid base URL, invalid timeout,
-    /// invalid retry policy).
-    #[error("{0}")]
-    Config(String),
+    /// invalid retry policy, a record or replay directory that cannot be used, or an async
+    /// runtime that cannot be started).
+    #[error("{message}")]
+    Config {
+        /// What is wrong.
+        message: String,
+        /// The error that caused it, if any: the I/O error, the URL parse error, …
+        #[source]
+        source: Option<BoxError>,
+    },
 
     /// The request was rejected locally before being sent (no questions, empty choice or score
     /// criteria, malformed raw question, or a body that cannot be encoded as JSON).
-    #[error("{0}")]
-    InvalidRequest(String),
+    #[error("{message}")]
+    InvalidRequest {
+        /// What is wrong.
+        message: String,
+        /// The error that caused it, if any: the JSON encoding error, …
+        #[source]
+        source: Option<BoxError>,
+    },
 
     /// The server returned an unsuccessful HTTP status after any retries.
     #[error(transparent)]
@@ -38,11 +59,11 @@ pub enum Error {
 
     /// The request could not reach the server or the response could not be read (DNS, connect,
     /// TLS, reset, body read). The underlying HTTP client's error is available via `source()`.
-    #[error("Connection error: {0}")]
-    Connection(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("connection error")]
+    Connection(#[source] BoxError),
 
     /// The request exceeded its configured timeout.
-    #[error("Request timed out (timeout={}s).", .0.as_secs_f64())]
+    #[error("request timed out (timeout={}s)", .0.as_secs_f64())]
     Timeout(Duration),
 
     /// The server returned a successful status but the body is missing required data.
@@ -52,7 +73,7 @@ pub enum Error {
     /// The client is replaying and this request was never recorded. Nothing was sent: a replaying
     /// client does not fall back to the network. Record it first (`TYPESAFE_RECORD=<dir>`); see
     /// [`crate::cassette`].
-    #[error("No recording for this request: {} does not exist (replaying, so nothing was sent).", path.display())]
+    #[error("no recording for this request: {} does not exist (replaying, so nothing was sent)", path.display())]
     ReplayMiss {
         /// The request's cassette key.
         key: String,
@@ -62,6 +83,41 @@ pub enum Error {
 }
 
 impl Error {
+    /// A [`Error::Config`] without a cause.
+    pub(crate) fn config(message: impl Into<String>) -> Self {
+        Error::Config {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// A [`Error::Config`] caused by `source`.
+    pub(crate) fn config_caused(message: impl Into<String>, source: impl Into<BoxError>) -> Self {
+        Error::Config {
+            message: message.into(),
+            source: Some(source.into()),
+        }
+    }
+
+    /// A [`Error::InvalidRequest`] without a cause.
+    pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
+        Error::InvalidRequest {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// A [`Error::InvalidRequest`] caused by `source`.
+    pub(crate) fn invalid_request_caused(
+        message: impl Into<String>,
+        source: impl Into<BoxError>,
+    ) -> Self {
+        Error::InvalidRequest {
+            message: message.into(),
+            source: Some(source.into()),
+        }
+    }
+
     /// The API error, if this is one.
     pub fn as_api(&self) -> Option<&ApiError> {
         match self {
@@ -71,7 +127,15 @@ impl Error {
     }
 
     /// The HTTP status associated with this error, if any.
-    pub fn status(&self) -> Option<u16> {
+    ///
+    /// ```
+    /// use typesafe::{Error, StatusCode};
+    ///
+    /// fn is_conflict(err: &Error) -> bool {
+    ///     err.status() == Some(StatusCode::CONFLICT)
+    /// }
+    /// ```
+    pub fn status(&self) -> Option<StatusCode> {
         match self {
             Error::Api(e) => Some(e.status),
             Error::ResponseValidation(e) => Some(e.status),
@@ -113,15 +177,15 @@ pub enum ApiErrorKind {
 
 impl ApiErrorKind {
     /// Map a status code to its kind.
-    pub fn from_status(status: u16) -> Self {
+    pub fn from_status(status: StatusCode) -> Self {
         match status {
-            400 => Self::BadRequest,
-            401 => Self::Authentication,
-            403 => Self::PermissionDenied,
-            404 => Self::NotFound,
-            422 => Self::UnprocessableEntity,
-            429 => Self::RateLimit,
-            s if s >= 500 => Self::InternalServer,
+            StatusCode::BAD_REQUEST => Self::BadRequest,
+            StatusCode::UNAUTHORIZED => Self::Authentication,
+            StatusCode::FORBIDDEN => Self::PermissionDenied,
+            StatusCode::NOT_FOUND => Self::NotFound,
+            StatusCode::UNPROCESSABLE_ENTITY => Self::UnprocessableEntity,
+            StatusCode::TOO_MANY_REQUESTS => Self::RateLimit,
+            s if s.is_server_error() => Self::InternalServer,
             _ => Self::Other,
         }
     }
@@ -132,7 +196,7 @@ impl ApiErrorKind {
 #[non_exhaustive]
 pub struct ApiError {
     /// HTTP status code.
-    pub status: u16,
+    pub status: StatusCode,
     /// Classification of `status`.
     pub kind: ApiErrorKind,
     /// Human-readable message extracted from the body.
@@ -147,7 +211,7 @@ pub struct ApiError {
 
 impl ApiError {
     pub(crate) fn new(
-        status: u16,
+        status: StatusCode,
         body: Option<Value>,
         headers: HeaderMap,
         endpoint: Option<String>,
@@ -186,7 +250,7 @@ impl fmt::Display for ApiError {
         if let Some(endpoint) = &self.endpoint {
             write!(f, "{endpoint}: ")?;
         }
-        write!(f, "{} {}", self.status, self.message)?;
+        write!(f, "{} {}", self.status.as_u16(), self.message)?;
         if let Some(id) = self.request_id() {
             write!(f, " (request_id={id})")?;
         }
@@ -201,7 +265,7 @@ impl std::error::Error for ApiError {}
 #[non_exhaustive]
 pub struct ResponseValidationError {
     /// HTTP status code (2xx).
-    pub status: u16,
+    pub status: StatusCode,
     /// Dotted path to the offending field, e.g. `answers.tone.confidence`.
     pub field_path: String,
     /// Underlying decoder message.
@@ -221,8 +285,10 @@ impl fmt::Display for ResponseValidationError {
         }
         write!(
             f,
-            "{} Invalid response data at '{}': {}",
-            self.status, self.field_path, self.detail
+            "{} invalid response data at '{}': {}",
+            self.status.as_u16(),
+            self.field_path,
+            self.detail
         )?;
         if let Some(id) = header_str(&self.headers, REQUEST_ID_HEADER) {
             write!(f, " (request_id={id})")?;
@@ -395,7 +461,7 @@ mod tests {
     #[test]
     fn long_bodies_are_truncated() {
         let err = ApiError::new(
-            500,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Some(json!({"x": "y".repeat(500)})),
             HeaderMap::new(),
             None,
@@ -407,7 +473,7 @@ mod tests {
     #[test]
     fn empty_body_message() {
         let err = ApiError::new(
-            503,
+            StatusCode::SERVICE_UNAVAILABLE,
             None,
             HeaderMap::new(),
             Some("GET http://x/v1/models".into()),
