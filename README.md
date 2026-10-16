@@ -259,7 +259,8 @@ just repl                         # from this checkout (or: cargo run -p jev-rep
 <Enter>                                          # send; answers come back with their distributions
 ```
 
-- `:lesson` walks an eleven-step track from "what is a noul" to what a call costs.
+- `:lesson` walks an eleven-step track from "what is a noul", past what a call costs, to taking
+  the session out as code.
 - `:sketch` opens the whole request as one page of text (below).
 - `:build` opens a form for composing a question, with the JSON it will send rendered as you type.
 - `:turn <who>: <text>` grows the state into a conversation instead of replacing it, so the same

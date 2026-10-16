@@ -25,7 +25,8 @@ jev            # with TYPESAFE_API_KEY for live answers; without it, answers are
 <Enter>                                          # send; answers come back with their distributions
 ```
 
-- `:lesson` walks an eleven-step track from "what is a noul" to what a call costs.
+- `:lesson` walks an eleven-step track from "what is a noul", past what a call costs, to taking
+  the session out as code.
 - `:sketch` (Ctrl-K) opens the whole request as one page of text, with the question types read
   off the punctuation, a gutter that says what each line became, and a live preview of the JSON,
   simulated answers, the same request as Rust, or what a call would cost:
