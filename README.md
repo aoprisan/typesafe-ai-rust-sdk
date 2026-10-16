@@ -259,7 +259,8 @@ just repl                         # from this checkout (or: cargo run -p jev-rep
 <Enter>                                          # send; answers come back with their distributions
 ```
 
-- `:lesson` walks an eleven-step track from "what is a noul" to what a call costs.
+- `:lesson` walks an eleven-step track from "what is a noul", past what a call costs, to taking
+  the session out as code.
 - `:sketch` opens the whole request as one page of text (below).
 - `:build` opens a form for composing a question, with the JSON it will send rendered as you type.
 - `:turn <who>: <text>` grows the state into a conversation instead of replacing it, so the same
@@ -397,6 +398,22 @@ let policy = RetryPolicy::default()
     .retry_if(|e| e.status() == Some(StatusCode::CONFLICT));
 ```
 
+`on_retry` is where a metrics counter or a logger of your own hears about retries. It is called
+just before each wait, only when another attempt really is coming, with a `RetryEvent`: the
+`endpoint`, the 1-based `attempt` that failed, the `delay` before the next one and the `error`. A
+panic in it is caught, so a broken counter cannot fail a call. A request's own `on_retry` replaces
+the client's.
+
+```rust
+let client = typesafe::Client::builder()
+    .api_key("sk-test")
+    .on_retry(|e| {
+        eprintln!("{} attempt {} failed ({}); retrying in {:?}", e.endpoint, e.attempt, e.error, e.delay)
+    })
+    .build()?;
+# Ok::<(), typesafe::Error>(())
+```
+
 ## Errors
 
 ```rust,ignore
@@ -439,6 +456,7 @@ Error messages from FastAPI-style validation bodies are flattened, e.g.
 
 Uses `tracing`: INFO when a request is retried, DEBUG for each request/response line, TRACE for
 headers and bodies. Secret headers are redacted; bodies (including your `state`) are not.
+To count or log retries without a `tracing` subscriber, use [`on_retry`](#retries).
 
 ## Differences from the Python SDK
 

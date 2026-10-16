@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -252,6 +253,87 @@ async fn overloaded_529_exhausts_retries() {
     assert_eq!(api.message, "Overloaded");
     assert!(err.to_string().starts_with("POST http://127.0.0.1"));
     assert!(err.to_string().ends_with("/v1/systemone: 529 Overloaded"));
+}
+
+#[tokio::test]
+async fn on_retry_hears_each_retry_but_not_the_failure_that_ends_the_call() {
+    let server = MockServer::start().await;
+    Mock::given(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("boom"))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let c = Client::builder()
+        .api_key("sk-test")
+        .base_url(server.uri())
+        .retry(RetryPolicy::default().backoff(Duration::ZERO, Duration::ZERO))
+        .on_retry(move |e| {
+            sink.lock().unwrap().push((
+                e.endpoint.to_owned(),
+                e.attempt,
+                e.delay,
+                e.error.status(),
+            ));
+        })
+        .build()
+        .unwrap();
+    let err = c.system_one("x", questions()).await.unwrap_err();
+    assert_eq!(err.status(), Some(StatusCode::SERVICE_UNAVAILABLE));
+
+    let seen = seen.lock().unwrap();
+    let attempts: Vec<_> = seen.iter().map(|(_, a, d, _)| (*a, *d)).collect();
+    assert_eq!(attempts, [(1, Duration::ZERO), (2, Duration::ZERO)]);
+    assert!(seen[0].0.starts_with("POST http://127.0.0.1"));
+    assert!(seen[0].0.ends_with("/v1/systemone"));
+    assert_eq!(seen[0].3, Some(StatusCode::SERVICE_UNAVAILABLE));
+}
+
+#[tokio::test]
+async fn a_call_replaces_on_retry_and_a_panicking_observer_is_caught() {
+    struct Flaky(std::sync::atomic::AtomicU32);
+    impl Respond for Flaky {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            if self
+                .0
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .is_multiple_of(2)
+            {
+                ResponseTemplate::new(500).set_body_string("boom")
+            } else {
+                ResponseTemplate::new(200).set_body_json(ok_body())
+            }
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(path("/v1/systemone"))
+        .respond_with(Flaky(Default::default()))
+        .mount(&server)
+        .await;
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (client_sink, call_sink) = (Arc::clone(&seen), Arc::clone(&seen));
+    let c = Client::builder()
+        .api_key("sk-test")
+        .base_url(server.uri())
+        .retry(RetryPolicy::default().backoff(Duration::ZERO, Duration::ZERO))
+        .on_retry(move |_| client_sink.lock().unwrap().push("client"))
+        .build()
+        .unwrap();
+    c.system_one("x", questions())
+        .on_retry(move |_| call_sink.lock().unwrap().push("call"))
+        .await
+        .unwrap();
+    assert_eq!(*seen.lock().unwrap(), ["call"]);
+
+    let res = c
+        .system_one("x", questions())
+        .on_retry(|_| panic!("broken counter"))
+        .await
+        .unwrap();
+    assert_eq!(res.meta.attempts, 2);
 }
 
 #[tokio::test]

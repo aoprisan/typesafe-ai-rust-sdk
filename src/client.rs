@@ -23,7 +23,7 @@ use crate::response::{
     DecodeFailure, DecodedSystemOne, ListModelsResponse, ResponseMeta, SystemOneResponse,
     decode_models, decode_system_one,
 };
-use crate::retry::RetryPolicy;
+use crate::retry::{RetryEvent, RetryObserver, RetryPolicy};
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -39,6 +39,7 @@ pub struct ClientBuilder {
     model: Option<String>,
     timeout: Option<Duration>,
     retry: Option<RetryPolicy>,
+    on_retry: Option<RetryObserver>,
     headers: HeaderMap,
     http: Option<reqwest::Client>,
     record: Option<PathBuf>,
@@ -53,6 +54,7 @@ impl fmt::Debug for ClientBuilder {
             .field("model", &self.model)
             .field("timeout", &self.timeout)
             .field("retry", &self.retry)
+            .field("on_retry", &self.on_retry)
             .field("headers", &redacted(&self.headers))
             .field("http", &self.http)
             .field("record", &self.record)
@@ -90,6 +92,24 @@ impl ClientBuilder {
     /// Default retry policy.
     pub fn retry(mut self, policy: RetryPolicy) -> Self {
         self.retry = Some(policy);
+        self
+    }
+
+    /// Be told about each retry just before its wait starts; see [`RetryEvent`]. The SDK's own
+    /// logging is `tracing`; this is the seam for a metrics counter or a logger of your own. A
+    /// request's own `on_retry` replaces this one.
+    ///
+    /// ```
+    /// let client = typesafe::Client::builder()
+    ///     .api_key("sk-test")
+    ///     .on_retry(|e| {
+    ///         eprintln!("{} attempt {} failed ({}); retrying in {:?}", e.endpoint, e.attempt, e.error, e.delay)
+    ///     })
+    ///     .build()?;
+    /// # Ok::<(), typesafe::Error>(())
+    /// ```
+    pub fn on_retry(mut self, f: impl Fn(&RetryEvent<'_>) + Send + Sync + 'static) -> Self {
+        self.on_retry = Some(RetryObserver(Arc::new(f)));
         self
     }
 
@@ -219,6 +239,7 @@ impl ClientBuilder {
                 model,
                 timeout,
                 retry,
+                on_retry: self.on_retry,
                 default_headers: self.headers,
                 protected,
                 cassette,
@@ -269,6 +290,7 @@ struct Inner {
     model: String,
     timeout: Duration,
     retry: RetryPolicy,
+    on_retry: Option<RetryObserver>,
     default_headers: HeaderMap,
     protected: HeaderMap,
     cassette: Option<Cassette>,
@@ -283,6 +305,7 @@ impl fmt::Debug for Inner {
             .field("model", &self.model)
             .field("timeout", &self.timeout)
             .field("retry", &self.retry)
+            .field("on_retry", &self.on_retry)
             .field("default_headers", &redacted(&self.default_headers))
             .field("protected", &redacted(&self.protected))
             .field("cassette", &self.cassette)
@@ -422,6 +445,14 @@ impl Client {
                     if retry.should_stop(attempts, started.elapsed(), delay) {
                         return Err(err);
                     }
+                    if let Some(observer) = opts.on_retry.as_ref().or(inner.on_retry.as_ref()) {
+                        observer.notify(&RetryEvent {
+                            endpoint: &endpoint,
+                            attempt: attempts,
+                            delay,
+                            error: &err,
+                        });
+                    }
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
@@ -548,6 +579,7 @@ fn redacted(headers: &HeaderMap) -> Vec<(String, String)> {
 #[derive(Debug, Default, Clone)]
 struct CallOptions {
     retry: Option<RetryPolicy>,
+    on_retry: Option<RetryObserver>,
     timeout: Option<Duration>,
     headers: HeaderMap,
 }
@@ -557,6 +589,15 @@ macro_rules! call_option_methods {
         /// Override the retry policy for this call.
         pub fn retry(mut self, policy: RetryPolicy) -> Self {
             self.opts.retry = Some(policy);
+            self
+        }
+
+        /// Replace the client's [`on_retry`](crate::ClientBuilder::on_retry) for this call.
+        pub fn on_retry(
+            mut self,
+            f: impl Fn(&crate::RetryEvent<'_>) + Send + Sync + 'static,
+        ) -> Self {
+            self.opts.on_retry = Some(RetryObserver(Arc::new(f)));
             self
         }
 

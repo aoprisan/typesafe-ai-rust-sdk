@@ -20,6 +20,14 @@ async fn main() -> typesafe::Result<()> {
 
     let client = Client::builder()
         .retry(patient)
+        // Called just before each wait, never for the failure that ends the call: the seam for a
+        // metrics counter or a logger of your own.
+        .on_retry(|e| {
+            eprintln!(
+                "{} attempt {} failed ({}); retrying in {:?}",
+                e.endpoint, e.attempt, e.error, e.delay
+            )
+        })
         .timeout(Duration::from_secs(8))
         .build()?;
 
