@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::question::Questions;
 use crate::response::{ListModelsResponse, SystemOneResponse};
-use crate::retry::RetryPolicy;
+use crate::retry::{RetryEvent, RetryPolicy};
 use crate::rubric::Rubric;
 
 /// Blocking TypeSafe client. Cheap to clone; clones share the runtime and the connection pool.
@@ -117,6 +117,7 @@ pub struct SystemOneRequest<'a> {
 impl SystemOneRequest<'_> {
     forward!(
         retry(policy: RetryPolicy),
+        on_retry(f: impl Fn(&RetryEvent<'_>) + Send + Sync + 'static),
         timeout(timeout: Duration),
         header(name: HeaderName, value: HeaderValue),
     );
@@ -158,6 +159,7 @@ pub struct AskRequest<'a, R> {
 impl<R: Rubric> AskRequest<'_, R> {
     forward!(
         retry(policy: RetryPolicy),
+        on_retry(f: impl Fn(&RetryEvent<'_>) + Send + Sync + 'static),
         timeout(timeout: Duration),
         header(name: HeaderName, value: HeaderValue),
     );
@@ -199,6 +201,7 @@ pub struct ListModelsRequest<'a> {
 impl ListModelsRequest<'_> {
     forward!(
         retry(policy: RetryPolicy),
+        on_retry(f: impl Fn(&RetryEvent<'_>) + Send + Sync + 'static),
         timeout(timeout: Duration),
         header(name: HeaderName, value: HeaderValue),
     );

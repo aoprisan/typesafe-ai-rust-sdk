@@ -393,6 +393,12 @@ impl<R: Rubric> AskRequest<R> {
         self
     }
 
+    /// Replace the client's [`on_retry`](crate::ClientBuilder::on_retry) for this call.
+    pub fn on_retry(mut self, f: impl Fn(&crate::RetryEvent<'_>) + Send + Sync + 'static) -> Self {
+        self.req = self.req.on_retry(f);
+        self
+    }
+
     /// Override the per-attempt timeout for this call.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.req = self.req.timeout(timeout);

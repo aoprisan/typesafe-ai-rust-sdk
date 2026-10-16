@@ -225,6 +225,44 @@ fn backoff(attempt: u32, initial: Duration, max: Duration, jitter: f64, r: f64) 
     Duration::from_secs_f64(exponential.min(rounded))
 }
 
+/// A failed attempt that will be retried, as [`ClientBuilder::on_retry`](crate::ClientBuilder::on_retry)
+/// hears about it. An event is only reported when a further attempt really is coming: the failure
+/// that exhausts the policy is returned, not announced.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct RetryEvent<'a> {
+    /// The call that failed, method and URL, e.g. `POST https://api.typesafe.ai/v1/systemone`.
+    pub endpoint: &'a str,
+    /// The 1-based number of the attempt that just failed.
+    pub attempt: u32,
+    /// The wait the policy chose before the next attempt.
+    pub delay: Duration,
+    /// What went wrong.
+    pub error: &'a Error,
+}
+
+/// Somewhere to send a [`RetryEvent`]: a logger, a metrics counter. It is for watching, not
+/// deciding: a panic in it is caught rather than failing the call.
+pub type OnRetry = Arc<dyn Fn(&RetryEvent<'_>) + Send + Sync>;
+
+/// An [`OnRetry`] that can sit in a `Debug` struct, and that keeps a panic away from the request.
+#[derive(Clone)]
+pub(crate) struct RetryObserver(pub(crate) OnRetry);
+
+impl fmt::Debug for RetryObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<on_retry>")
+    }
+}
+
+impl RetryObserver {
+    /// Calls the observer, so that nothing it does reaches the request.
+    pub(crate) fn notify(&self, event: &RetryEvent<'_>) {
+        // An observer that fails must not fail a request that was about to be retried.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)(event)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

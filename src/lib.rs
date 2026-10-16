@@ -77,7 +77,7 @@ pub use response::{
     Answer, AnswerKind, ChoiceAnswer, ListModelsResponse, ModelMetadata, NoulAnswer, ResponseMeta,
     ScoreAnswer, SystemOneResponse, Usage,
 };
-pub use retry::RetryPolicy;
+pub use retry::{OnRetry, RetryEvent, RetryPolicy};
 pub use rubric::{AskRequest, ChoiceOf, Rubric, RubricChoice};
 /// `#[derive(Rubric)]` and `#[derive(RubricChoice)]` (feature `derive`); see [`rubric`].
 #[cfg(feature = "derive")]
