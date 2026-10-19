@@ -12,9 +12,11 @@ use http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 use http::{Method, StatusCode};
+use indexmap::IndexMap;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
+use crate::asset::Image;
 use crate::cassette;
 use crate::constants::*;
 use crate::error::{ApiError, Error, ResponseValidationError, Result, lenient_body};
@@ -44,6 +46,7 @@ pub struct ClientBuilder {
     http: Option<reqwest::Client>,
     record: Option<PathBuf>,
     replay: Option<PathBuf>,
+    long_context: bool,
 }
 
 impl fmt::Debug for ClientBuilder {
@@ -59,6 +62,7 @@ impl fmt::Debug for ClientBuilder {
             .field("http", &self.http)
             .field("record", &self.record)
             .field("replay", &self.replay)
+            .field("long_context", &self.long_context)
             .finish()
     }
 }
@@ -117,6 +121,14 @@ impl ClientBuilder {
     /// cannot be overridden.
     pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.insert(name, value);
+        self
+    }
+
+    /// Opt every System One call into long context (262k tokens) with
+    /// `TypeSafe-Danger-Zone-Long-Context: true`. Experimental: slower and less accurate. A
+    /// request's own [`long_context`](SystemOneRequest::long_context) wins.
+    pub fn long_context(mut self, on: bool) -> Self {
+        self.long_context = on;
         self
     }
 
@@ -243,6 +255,7 @@ impl ClientBuilder {
                 default_headers: self.headers,
                 protected,
                 cassette,
+                long_context: self.long_context,
             }),
         })
     }
@@ -294,6 +307,7 @@ struct Inner {
     default_headers: HeaderMap,
     protected: HeaderMap,
     cassette: Option<Cassette>,
+    long_context: bool,
 }
 
 /// Headers go through [`redacted`], so the API key and any gateway credential stay hidden.
@@ -309,6 +323,7 @@ impl fmt::Debug for Inner {
             .field("default_headers", &redacted(&self.default_headers))
             .field("protected", &redacted(&self.protected))
             .field("cassette", &self.cassette)
+            .field("long_context", &self.long_context)
             .finish()
     }
 }
@@ -379,6 +394,8 @@ impl Client {
             questions: questions.into(),
             model: None,
             extra_body: Map::new(),
+            assets: IndexMap::new(),
+            long_context: None,
             opts: CallOptions::default(),
         }
     }
@@ -624,6 +641,8 @@ pub struct SystemOneRequest {
     questions: Questions,
     model: Option<String>,
     extra_body: Map<String, Value>,
+    assets: IndexMap<String, Image>,
+    long_context: Option<bool>,
     opts: CallOptions,
 }
 
@@ -643,12 +662,28 @@ impl SystemOneRequest {
         self
     }
 
+    /// Add an image under `reference`, the string that stands for it in the state, an
+    /// instruction or a criterion; see [`asset`](crate::asset). Experimental: the request is sent
+    /// with `TypeSafe-Danger-Zone-Images: true`, as it is for a [`BoxQuestion`](crate::BoxQuestion).
+    pub fn image(mut self, reference: impl Into<String>, image: Image) -> Self {
+        self.assets.insert(reference.into(), image);
+        self
+    }
+
+    /// Opt this call in or out of long context (262k tokens), whatever the client's
+    /// [`long_context`](crate::ClientBuilder::long_context) says. Experimental.
+    pub fn long_context(mut self, on: bool) -> Self {
+        self.long_context = Some(on);
+        self
+    }
+
     /// Send the request.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRequest`] if the state cannot be encoded or the questions are rejected
-    ///   locally (none, or a choice or score without criteria); nothing is sent.
+    /// - [`Error::InvalidRequest`] if the state cannot be encoded, the questions are rejected
+    ///   locally (none, or a choice or score without criteria), or an image's reference is empty
+    ///   or written nowhere in the state and questions; nothing is sent.
     /// - [`Error::Config`] if a per-call timeout or retry policy is invalid.
     /// - [`Error::Api`], [`Error::Connection`] or [`Error::Timeout`] once retries are exhausted.
     /// - [`Error::ResponseValidation`] if a 2xx body does not decode.
@@ -665,15 +700,44 @@ impl SystemOneRequest {
         // Serialized as a struct (not via `serde_json::Value`) so question order reaches the wire
         // unchanged. `extra_body` keys replace the standard field of the same name.
         let extra = &self.extra_body;
+        let send_assets = !self.assets.is_empty() && !extra.contains_key("assets");
+        if send_assets {
+            check_references(&self.assets, &state, &self.questions)?;
+        }
         let body = SystemOneBody {
             state: (!extra.contains_key("state")).then_some(&state),
             model: (!extra.contains_key("model")).then_some(&model),
             questions: (!extra.contains_key("questions")).then_some(&self.questions),
+            assets: send_assets.then_some(&self.assets),
             extra,
         };
         let bytes = serde_json::to_vec(&body).map_err(|e| {
             Error::invalid_request_caused("the request body could not be encoded as JSON", e)
         })?;
+
+        // The danger-zone opt-ins, under any header of the same name set by hand.
+        let mut opts = self.opts;
+        let defaults = &self.client.inner.default_headers;
+        let images = send_assets
+            || extra.contains_key("assets")
+            || match extra.get("questions") {
+                Some(questions) => questions
+                    .as_object()
+                    .is_some_and(|q| q.values().any(|q| q.get("type") == Some(&json!("box")))),
+                None => self.questions.asks_box(),
+            };
+        if images && !defaults.contains_key(IMAGES_HEADER) {
+            opts.headers
+                .entry(HeaderName::from_static(IMAGES_HEADER))
+                .or_insert(HeaderValue::from_static("true"));
+        }
+        if self.long_context.unwrap_or(self.client.inner.long_context)
+            && !defaults.contains_key(LONG_CONTEXT_HEADER)
+        {
+            opts.headers
+                .entry(HeaderName::from_static(LONG_CONTEXT_HEADER))
+                .or_insert(HeaderValue::from_static("true"));
+        }
 
         // Only a recording or replaying client needs the body's hash.
         let cassette = self
@@ -686,7 +750,7 @@ impl SystemOneRequest {
             Some((Cassette::Replay(dir), key)) => replay(dir, key)?,
             _ => {
                 self.client
-                    .execute(Method::POST, SYSTEM_ONE_PATH, Some(bytes.into()), self.opts)
+                    .execute(Method::POST, SYSTEM_ONE_PATH, Some(bytes.into()), opts)
                     .await?
             }
         };
@@ -720,6 +784,31 @@ impl SystemOneRequest {
     }
 }
 
+/// Reject a reference the API would: an empty one, or one the state and the questions never
+/// mention, so the model would never see its image.
+fn check_references(
+    assets: &IndexMap<String, Image>,
+    state: &Value,
+    questions: &Questions,
+) -> Result<()> {
+    let text = serde_json::to_string(&(state, questions)).unwrap_or_default();
+    for reference in assets.keys() {
+        if reference.is_empty() {
+            return Err(Error::invalid_request(
+                "an image's reference must not be empty",
+            ));
+        }
+        let escaped = serde_json::to_string(reference).unwrap_or_default();
+        if !text.contains(&escaped[1..escaped.len() - 1]) {
+            return Err(Error::invalid_request(format!(
+                "image \"{reference}\" is not referenced; write \"{reference}\" in the state, an \
+                 instruction or a criterion"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The recorded response for `key`, in the shape a live call returns: no headers, no attempts.
 fn replay(dir: &std::path::Path, key: &str) -> Result<(Bytes, ResponseMeta, String)> {
     let path = cassette::path(dir, key);
@@ -747,6 +836,8 @@ struct SystemOneBody<'a> {
     model: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     questions: Option<&'a Questions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assets: Option<&'a IndexMap<String, Image>>,
     #[serde(flatten)]
     extra: &'a Map<String, Value>,
 }

@@ -129,6 +129,7 @@ fn kind_of(question: &Question) -> String {
         Question::Noul(_) => "noul".to_owned(),
         Question::Choice(_) => "choice".to_owned(),
         Question::Score(_) => "score".to_owned(),
+        Question::Box(_) => "box".to_owned(),
         Question::Raw(value) => value
             .get("type")
             .and_then(Value::as_str)
@@ -190,6 +191,7 @@ pub fn cached_answers(session: &Session, body: &Value) -> Option<(Vec<Answered>,
             "noul" => Answer::Noul(serde_json::from_value(value.clone()).ok()?),
             "choice" => Answer::Choice(serde_json::from_value(value.clone()).ok()?),
             "score" => Answer::Score(serde_json::from_value(value.clone()).ok()?),
+            "box" => Answer::Box(serde_json::from_value(value.clone()).ok()?),
             // An answer this build does not model is skipped, the way the SDK's decoder skips it.
             _ => continue,
         };

@@ -147,6 +147,30 @@ pub fn answer_lines(name: &str, answer: &Answer, threshold: f64) -> Vec<Line<'st
                 ]));
             }
         }
+        Answer::Box(a) => {
+            let b = a.bounds;
+            out.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!(
+                        "top {:.2}  bottom {:.2}  left {:.2}  right {:.2}",
+                        b.top, b.bottom, b.left, b.right
+                    ),
+                    Style::new().fg(SCORE).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                dim("confidence "),
+                confidence_span(a.confidence),
+            ]));
+            out.push(Line::from(vec![
+                Span::raw("    "),
+                dim(format!(
+                    "{}% wide, {}% tall, from the top-left corner",
+                    (b.width() * 100.0).round(),
+                    (b.height() * 100.0).round()
+                )),
+            ]));
+        }
         _ => out.push(styled(
             format!("    (this SDK version does not model {kind} answers; see :last)"),
             WARN,

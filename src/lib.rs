@@ -54,6 +54,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
+pub mod asset;
 pub mod cassette;
 mod client;
 pub mod constants;
@@ -67,15 +68,16 @@ pub mod rubric;
 #[cfg_attr(docsrs, doc(cfg(feature = "blocking")))]
 pub mod blocking;
 
+pub use asset::{Image, ImageFormat};
 pub use client::{Client, ClientBuilder, ListModelsRequest, Models, SystemOneRequest};
 pub use error::{ApiError, ApiErrorKind, Error, ResponseValidationError, Result};
 /// The HTTP status type of [`Error::status`], [`ApiError::status`], [`ResponseMeta::status`] and
 /// [`RetryPolicy::statuses`], with constants such as `StatusCode::TOO_MANY_REQUESTS`.
 pub use http::StatusCode;
-pub use question::{Choice, Noul, NoulCriteria, Question, Questions, Score};
+pub use question::{BoxQuestion, Choice, Noul, NoulCriteria, Question, Questions, Score};
 pub use response::{
-    Answer, AnswerKind, ChoiceAnswer, ListModelsResponse, ModelMetadata, NoulAnswer, ResponseMeta,
-    ScoreAnswer, SystemOneResponse, Usage,
+    Answer, AnswerKind, BoundingBox, BoxAnswer, ChoiceAnswer, ListModelsResponse, ModelMetadata,
+    NoulAnswer, ResponseMeta, ScoreAnswer, SystemOneResponse, Usage,
 };
 pub use retry::{OnRetry, RetryEvent, RetryPolicy};
 pub use rubric::{AskRequest, ChoiceOf, Rubric, RubricChoice};

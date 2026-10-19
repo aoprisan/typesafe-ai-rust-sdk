@@ -365,6 +365,9 @@ fn expected(
                 )),
             }
         }
+        Question::Box(_) => Err(format!(
+            "{name} is a box question: boxes cannot be scored yet."
+        )),
         // A hand-built question object has no shape to score against, and neither has a kind this
         // build does not know.
         _ => Err(format!(
@@ -1915,12 +1918,14 @@ pub fn mcnemar(fixed: usize, broke: usize) -> McNemar {
     }
 }
 
-/// The wire `type` of a question, with anything that is not a noul, a choice or a score as `raw`.
+/// The wire `type` of a question, with anything that is not a noul, a choice, a score or a box as
+/// `raw`.
 fn kind_of(question: &Question) -> &'static str {
     match question {
         Question::Noul(_) => "noul",
         Question::Choice(_) => "choice",
         Question::Score(_) => "score",
+        Question::Box(_) => "box",
         _ => "raw",
     }
 }

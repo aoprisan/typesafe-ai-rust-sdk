@@ -102,6 +102,56 @@ impl ScoreAnswer {
     }
 }
 
+/// Edges of a box, as fractions of the image's height and width from its top-left corner:
+/// `left < right` and `top < bottom`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct BoundingBox {
+    /// Distance of the top edge from the top of the image, 0 to 1.
+    pub top: f64,
+    /// Distance of the bottom edge from the top of the image, 0 to 1.
+    pub bottom: f64,
+    /// Distance of the left edge from the left of the image, 0 to 1.
+    pub left: f64,
+    /// Distance of the right edge from the left of the image, 0 to 1.
+    pub right: f64,
+}
+
+impl BoundingBox {
+    /// The box's width, as a fraction of the image's.
+    pub fn width(&self) -> f64 {
+        self.right - self.left
+    }
+
+    /// The box's height, as a fraction of the image's.
+    pub fn height(&self) -> f64 {
+        self.bottom - self.top
+    }
+
+    /// The box in pixels of a `width` × `height` image, as `(left, top, right, bottom)`.
+    pub fn to_pixels(&self, width: u32, height: u32) -> (u32, u32, u32, u32) {
+        let px = |f: f64, size: u32| (f.clamp(0.0, 1.0) * f64::from(size)).round() as u32;
+        (
+            px(self.left, width),
+            px(self.top, height),
+            px(self.right, width),
+            px(self.bottom, height),
+        )
+    }
+}
+
+/// Where a [`BoxQuestion`](crate::BoxQuestion)'s thing is in the image. Experimental, Jev 1.14
+/// and later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct BoxAnswer {
+    /// The box (`box` on the wire).
+    #[serde(rename = "box")]
+    pub bounds: BoundingBox,
+    /// Certainty of the box, 0 to 1.
+    pub confidence: f64,
+}
+
 /// An answer to one question.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -112,6 +162,8 @@ pub enum Answer {
     Choice(ChoiceAnswer),
     /// See [`ScoreAnswer`].
     Score(ScoreAnswer),
+    /// See [`BoxAnswer`].
+    Box(BoxAnswer),
 }
 
 /// The type of an [`Answer`]; `Display` gives its wire `type` tag.
@@ -124,15 +176,18 @@ pub enum AnswerKind {
     Choice,
     /// A [`ScoreAnswer`], `"score"`.
     Score,
+    /// A [`BoxAnswer`], `"box"`.
+    Box,
 }
 
 impl AnswerKind {
-    /// The wire `type` tag: `"noul"`, `"choice"` or `"score"`.
+    /// The wire `type` tag: `"noul"`, `"choice"`, `"score"` or `"box"`.
     pub const fn as_str(self) -> &'static str {
         match self {
             AnswerKind::Noul => "noul",
             AnswerKind::Choice => "choice",
             AnswerKind::Score => "score",
+            AnswerKind::Box => "box",
         }
     }
 }
@@ -150,6 +205,7 @@ impl Answer {
             Answer::Noul(_) => AnswerKind::Noul,
             Answer::Choice(_) => AnswerKind::Choice,
             Answer::Score(_) => AnswerKind::Score,
+            Answer::Box(_) => AnswerKind::Box,
         }
     }
 
@@ -159,6 +215,7 @@ impl Answer {
             Answer::Noul(_) => None,
             Answer::Choice(a) => Some(a.confidence),
             Answer::Score(a) => Some(a.confidence),
+            Answer::Box(a) => Some(a.confidence),
         }
     }
 }
@@ -179,6 +236,10 @@ impl Serialize for Answer {
                 m.serialize_entry("score", &a.score)?;
                 m.serialize_entry("legend", &a.legend)?;
                 m.serialize_entry("probabilities", &a.probabilities)?;
+                m.serialize_entry("confidence", &a.confidence)?;
+            }
+            Answer::Box(a) => {
+                m.serialize_entry("box", &a.bounds)?;
                 m.serialize_entry("confidence", &a.confidence)?;
             }
         }
@@ -202,6 +263,8 @@ impl<'de> Deserialize<'de> for Answer {
             confidence: Option<f64>,
             legend: Option<BTreeMap<u32, Value>>,
             probabilities: Option<IndexMap<String, f64>>,
+            #[serde(rename = "box")]
+            bounds: Option<BoundingBox>,
         }
 
         fn need<T, E: de::Error>(v: Option<T>, field: &'static str) -> Result<T, E> {
@@ -230,9 +293,13 @@ impl<'de> Deserialize<'de> for Answer {
                     })
                     .collect::<Result<_, D::Error>>()?,
             })),
+            "box" => Ok(Answer::Box(BoxAnswer {
+                bounds: need(w.bounds, "box")?,
+                confidence: need(w.confidence, "confidence")?,
+            })),
             other => Err(de::Error::unknown_variant(
                 other,
-                &["noul", "choice", "score"],
+                &["noul", "choice", "score", "box"],
             )),
         }
     }
@@ -315,6 +382,14 @@ impl SystemOneResponse {
     pub fn score(&self, name: &str) -> Option<&ScoreAnswer> {
         match self.answers.get(name)? {
             Answer::Score(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The answer to `name`, if it is a Box.
+    pub fn box_answer(&self, name: &str) -> Option<&BoxAnswer> {
+        match self.answers.get(name)? {
+            Answer::Box(a) => Some(a),
             _ => None,
         }
     }
@@ -466,6 +541,7 @@ pub(crate) fn decode_system_one(body: &[u8]) -> Result<DecodedSystemOne, DecodeF
             "noul" => Answer::Noul(typed(&prefix, json.as_bytes())?),
             "choice" => Answer::Choice(typed(&prefix, json.as_bytes())?),
             "score" => Answer::Score(typed(&prefix, json.as_bytes())?),
+            "box" => Answer::Box(typed(&prefix, json.as_bytes())?),
             other => {
                 tracing::warn!(answer = %name, r#type = %other, "ignoring answer with unrecognized type");
                 continue;

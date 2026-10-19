@@ -222,6 +222,44 @@ client.system_one(state, questions)
 
 Authentication and SDK-identification headers cannot be overridden.
 
+### Images, box questions and long context (experimental)
+
+Jev 1.14 (released 2026-10-14) puts three features in a *danger zone*: they work, but TypeSafe does
+not call them production-ready, and each is opt-in by header. The SDK sends the header for you.
+
+- **Images** (Jev 1.13 and later): PNG or JPEG, 256 to 1568 pixels a side. Each image goes into
+  the request once, under a reference string you choose, and the model sees it wherever that
+  reference is written — in the state, an instruction or a criterion. A request with an image is
+  sent with `TypeSafe-Danger-Zone-Images: true`, and one whose image nothing refers to is refused
+  before sending.
+- **Box questions** (Jev 1.14 only: `jev-1.14.0` or `jev-preview`): `BoxQuestion` locates one thing
+  in an image and answers with a `BoxAnswer` — `bounds` (`top`, `bottom`, `left`, `right`, as
+  fractions of the image from its top-left corner) and a `confidence`. They need the images header
+  too.
+- **Long context**: 262k tokens per request and per question, up from 64k and 32k, with
+  `TypeSafe-Danger-Zone-Long-Context: true`. Slower and less accurate; turn it on for a client with
+  `ClientBuilder::long_context(true)` or for one call with `.long_context(true)`.
+
+```rust,ignore
+use typesafe::{BoxQuestion, Image, Noul, Questions};
+
+let res = client
+    .system_one(
+        json!({"photo": "photo", "caption": "Our new office"}),
+        Questions::new()
+            .with("has_people", Noul::new("photo shows at least one person"))
+            .with("door", BoxQuestion::new("the front door in photo")),
+    )
+    .model("jev-1.14.0")
+    .image("photo", Image::from_bytes(std::fs::read("office.jpg")?)?)
+    .await?;
+let door = res.box_answer("door").expect("asked");
+let (left, top, right, bottom) = door.bounds.to_pixels(1024, 768);
+```
+
+`jev-latest` moves from Jev 1.13.0 to 1.14.0 a week after the release; pin `jev-1.13.0` to stay
+where you are.
+
 ### Models
 
 ```rust,ignore
@@ -450,7 +488,8 @@ Error messages from FastAPI-style validation bodies are flattened, e.g.
 - Answer types this version does not know are skipped (logged via `tracing` at WARN) and remain in
   `response.raw`.
 - Unknown response fields are ignored.
-- `Question::Raw(json!({...}))` sends a hand-built question; `extra_body` adds top-level fields.
+- `Question::Raw(json!({...}))` sends a hand-built question; `extra_body` adds top-level fields. A
+  raw question of type `box`, or an `assets` field, still sends the images header.
 
 ## Logging
 

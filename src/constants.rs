@@ -34,6 +34,11 @@ pub(crate) const SDK_HEADER: &str = "x-typesafe-sdk";
 pub(crate) const RUNTIME_HEADER: &str = "x-typesafe-runtime";
 pub(crate) const RETRY_COUNT_HEADER: &str = "x-typesafe-retry-count";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-typesafe-request-id";
+/// Opts a request into images and box questions (Jev 1.13+, experimental).
+pub(crate) const IMAGES_HEADER: &str = "typesafe-danger-zone-images";
+/// Opts a request into 262k-token context, from 64k per request and 32k per question
+/// (experimental).
+pub(crate) const LONG_CONTEXT_HEADER: &str = "typesafe-danger-zone-long-context";
 pub(crate) const RETRY_AFTER_HEADER: &str = "retry-after";
 pub(crate) const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
 

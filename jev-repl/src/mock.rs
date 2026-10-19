@@ -61,6 +61,18 @@ pub fn answer(state: &Value, name: &str, question: &Value) -> Option<Answer> {
                 json!({"score": score, "confidence": conf, "legend": legend, "probabilities": map}),
             )
         }
+        "box" => {
+            // A box somewhere inside the image, at least a tenth of it on each side.
+            let left = round(0.6 * unit(&[&seed, "left"]));
+            let top = round(0.6 * unit(&[&seed, "top"]));
+            let right = round(left + 0.1 + (0.9 - left) * unit(&[&seed, "right"]));
+            let bottom = round(top + 0.1 + (0.9 - top) * unit(&[&seed, "bottom"]));
+            let conf = round(0.3 + 0.65 * unit(&[&seed, "box"]));
+            from_value(json!({
+                "box": {"top": top, "bottom": bottom, "left": left, "right": right},
+                "confidence": conf,
+            }))
+        }
         _ => None,
     }
 }
@@ -86,6 +98,14 @@ pub fn answer_json(answer: &Answer) -> Value {
                 .map(|(k, v)| (k.to_string(), number(*v)))
                 .collect::<serde_json::Map<String, Value>>(),
         }),
+        Answer::Box(a) => json!({
+            "type": "box",
+            "box": {
+                "top": number(a.bounds.top), "bottom": number(a.bounds.bottom),
+                "left": number(a.bounds.left), "right": number(a.bounds.right),
+            },
+            "confidence": number(a.confidence),
+        }),
         // An answer variant a later SDK adds: this one has no shape to measure or print.
         _ => Value::Null,
     }
@@ -109,6 +129,12 @@ pub fn models() -> Vec<ModelMetadata> {
             "Alias for the newest jev release",
             "2026-05-01",
         ),
+        (
+            "jev-1.14.0",
+            "Images, box questions and long context, behind opt-in headers",
+            "2026-10-14",
+        ),
+        ("jev-preview", "Alias for the newest preview", "2026-10-14"),
         ("jev-2", "Previous generation", "2025-11-12"),
     ]
     .into_iter()
@@ -129,6 +155,9 @@ fn from_value(v: Value) -> Option<Answer> {
     }
     if v.get("choice").is_some() {
         return serde_json::from_value(v).ok().map(Answer::Choice);
+    }
+    if v.get("box").is_some() {
+        return serde_json::from_value(v).ok().map(Answer::Box);
     }
     serde_json::from_value(v).ok().map(Answer::Score)
 }

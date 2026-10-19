@@ -5,7 +5,8 @@ use serde::Serialize;
 use serde_json::json;
 use typesafe::http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use typesafe::{
-    ApiErrorKind, Choice, Client, Error, Noul, Questions, RetryPolicy, Score, StatusCode,
+    ApiErrorKind, BoxQuestion, Choice, Client, Error, Image, Noul, Questions, RetryPolicy, Score,
+    StatusCode,
 };
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -672,4 +673,115 @@ fn blocking_client() {
         .unwrap();
     assert_eq!(res.choice("department").unwrap().choice, "technical");
     drop(server);
+}
+
+/// The JPEG magic bytes and nothing else: enough to be read as an image without being one.
+const JPEG: [u8; 4] = [0xff, 0xd8, 0xff, 0xe0];
+
+#[tokio::test]
+async fn images_and_box_questions_opt_in_and_decode() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(header("typesafe-danger-zone-images", "true"))
+        .and(body_json(json!({
+            "state": {"photo": "photo"},
+            "model": "jev-1.14.0",
+            "questions": {"door": {"type": "box", "instructions": "the front door in photo"}},
+            "assets": {"photo": {"type": "image", "data_base64": "/9j/4A==", "format": "jpeg"}}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "jev-1.14.0",
+            "answers": {"door": {"type": "box",
+                "box": {"top": 0.25, "bottom": 0.82, "left": 0.44, "right": 0.84},
+                "confidence": 0.92}},
+            "usage": {"input_tokens": 290, "output_tokens": 21}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let res = client(&server)
+        .system_one(
+            json!({"photo": "photo"}),
+            Questions::new().with("door", BoxQuestion::new("the front door in photo")),
+        )
+        .model("jev-1.14.0")
+        .image("photo", Image::from_bytes(JPEG).unwrap())
+        .await
+        .unwrap();
+    let door = res.box_answer("door").unwrap();
+    assert_eq!(door.bounds.top, 0.25);
+    assert_eq!(door.bounds.right, 0.84);
+    assert_eq!(door.confidence, 0.92);
+    assert_eq!(door.bounds.to_pixels(1000, 500), (440, 125, 840, 410));
+    assert_eq!(res.answers["door"].confidence(), Some(0.92));
+    // It serializes back to the body it came from.
+    assert_eq!(
+        serde_json::to_value(&res.answers["door"]).unwrap(),
+        json!({"type": "box", "box": {"top": 0.25, "bottom": 0.82, "left": 0.44, "right": 0.84},
+               "confidence": 0.92})
+    );
+}
+
+#[tokio::test]
+async fn long_context_is_opt_in_per_client_and_per_call() {
+    let server = MockServer::start().await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(move |req: &Request| {
+            let headers = &req.headers;
+            record.lock().unwrap().push((
+                headers.get("typesafe-danger-zone-long-context").is_some(),
+                headers.get("typesafe-danger-zone-images").is_some(),
+            ));
+            ResponseTemplate::new(200).set_body_json(ok_body())
+        })
+        .mount(&server)
+        .await;
+
+    let plain = client(&server);
+    plain.system_one("hi", questions()).await.unwrap();
+    plain
+        .system_one("hi", questions())
+        .long_context(true)
+        .await
+        .unwrap();
+    let long = Client::builder()
+        .api_key("sk-test")
+        .base_url(server.uri())
+        .long_context(true)
+        .build()
+        .unwrap();
+    long.system_one("hi", questions()).await.unwrap();
+    long.system_one("hi", questions())
+        .long_context(false)
+        .await
+        .unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(false, false), (true, false), (true, false), (false, false)]
+    );
+}
+
+#[tokio::test]
+async fn an_image_nothing_refers_to_is_refused_before_sending() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .system_one("no picture named here", questions())
+        .image("photo", Image::from_bytes(JPEG).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest { .. }), "{err:?}");
+    assert!(
+        err.to_string().contains("\"photo\" is not referenced"),
+        "{err}"
+    );
 }

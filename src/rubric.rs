@@ -417,6 +417,18 @@ impl<R: Rubric> AskRequest<R> {
         self
     }
 
+    /// Add an image; see [`SystemOneRequest::image`].
+    pub fn image(mut self, reference: impl Into<String>, image: crate::Image) -> Self {
+        self.req = self.req.image(reference, image);
+        self
+    }
+
+    /// Opt this call in or out of long context; see [`SystemOneRequest::long_context`].
+    pub fn long_context(mut self, on: bool) -> Self {
+        self.req = self.req.long_context(on);
+        self
+    }
+
     /// Add a top-level body field; see [`SystemOneRequest::extra_body`].
     pub fn extra_body(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.req = self.req.extra_body(key, value);
