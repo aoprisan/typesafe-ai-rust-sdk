@@ -1,4 +1,4 @@
-//! Typed questions: [`Noul`], [`Choice`] and [`Score`].
+//! Typed questions: [`Noul`], [`Choice`], [`Score`] and [`BoxQuestion`].
 //!
 //! Instructions, option descriptions and score levels accept any JSON value (`&str`, `String`,
 //! or `serde_json::json!({...})` for structured rubrics), per the API's "advanced structure" support.
@@ -139,6 +139,29 @@ impl Score {
     }
 }
 
+/// Locate one thing in an image; the answer is a [`BoxAnswer`](crate::BoxAnswer).
+///
+/// Jev 1.14 (`jev-1.14.0`, `jev-preview`) and later only, and experimental: a request that asks
+/// one is sent with `TypeSafe-Danger-Zone-Images: true`. The image goes in the request's assets
+/// (see [`Image`](crate::Image)); a box question has instructions and no criteria.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[non_exhaustive]
+#[serde(tag = "type", rename = "box")]
+pub struct BoxQuestion {
+    /// What to find, naming the image by its reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<Value>,
+}
+
+impl BoxQuestion {
+    /// Where in the image `instructions` points.
+    pub fn new(instructions: impl Into<Value>) -> Self {
+        Self {
+            instructions: Some(instructions.into()),
+        }
+    }
+}
+
 /// Any question. `Raw` passes a hand-built JSON object through (after light validation), which is
 /// useful for fields this SDK version does not model yet.
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +173,8 @@ pub enum Question {
     Choice(Choice),
     /// See [`Score`].
     Score(Score),
+    /// See [`BoxQuestion`].
+    Box(BoxQuestion),
     /// A JSON object with a non-empty string `type`.
     Raw(Value),
 }
@@ -160,6 +185,7 @@ impl Serialize for Question {
             Question::Noul(q) => q.serialize(s),
             Question::Choice(q) => q.serialize(s),
             Question::Score(q) => q.serialize(s),
+            Question::Box(q) => q.serialize(s),
             Question::Raw(v) => v.serialize(s),
         }
     }
@@ -178,6 +204,11 @@ impl From<Choice> for Question {
 impl From<Score> for Question {
     fn from(q: Score) -> Self {
         Question::Score(q)
+    }
+}
+impl From<BoxQuestion> for Question {
+    fn from(q: BoxQuestion) -> Self {
+        Question::Box(q)
     }
 }
 impl From<Value> for Question {
@@ -232,6 +263,15 @@ impl Questions {
     /// Iterate in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Question)> {
         self.0.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Whether any question is a box, which only the images opt-in may ask.
+    pub(crate) fn asks_box(&self) -> bool {
+        self.0.values().any(|q| match q {
+            Question::Box(_) => true,
+            Question::Raw(v) => v.get("type").and_then(Value::as_str) == Some("box"),
+            _ => false,
+        })
     }
 
     /// Reject what the Python SDK rejects locally; everything else is left to server validation.
@@ -409,6 +449,24 @@ mod tests {
         assert_eq!(r.insert("c", Noul::new("c")), None);
         assert_eq!(r.insert("c", Noul::new("d")), Some(Noul::new("c").into()));
         assert_eq!(r.get("c"), Some(&Question::Noul(Noul::new("d"))));
+    }
+
+    #[test]
+    fn box_questions() {
+        let q = Questions::new()
+            .with("door", BoxQuestion::new("the front door in photo"))
+            .with("n", Noul::new("x"));
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({
+                "door": {"type": "box", "instructions": "the front door in photo"},
+                "n": {"type": "noul", "instructions": "x"}
+            })
+        );
+        assert!(q.validate().is_ok());
+        assert!(q.asks_box());
+        assert!(Questions::from([("r", json!({"type": "box"}))]).asks_box());
+        assert!(!Questions::from([("n", Noul::new("x"))]).asks_box());
     }
 
     #[test]

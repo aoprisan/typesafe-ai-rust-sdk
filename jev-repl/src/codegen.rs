@@ -44,6 +44,7 @@ pub fn rust(session: &Session, model: &str, threshold: f64) -> String {
             "noul" => imports.push("Noul"),
             "choice" => imports.push("Choice"),
             "score" => imports.push("Score"),
+            "box" => imports.push("BoxQuestion"),
             _ => {}
         }
     }
@@ -102,6 +103,7 @@ fn builder(q: &Value, indent: usize) -> String {
                 " ".repeat(indent)
             )
         }
+        "box" => format!("BoxQuestion::new({instructions})"),
         _ => format!("json!({q})"),
     }
 }
@@ -170,6 +172,11 @@ fn reader(name: &str, q: &Value, bar: Option<f64>, threshold: f64) -> String {
                  \x20   println!(\"{name}: {{:.2}} of {{}} (confidence {{:.2}})\", {name}.score, {name}.legend.len() - 1, {name}.confidence);\n"
             ),
         },
+        "box" => format!(
+            "    // {name}: images are experimental — add them with .image(reference, Image)\n\
+             \x20   let {name} = res.box_answer({name:?}).expect(\"asked\");\n\
+             \x20   println!(\"{name}: {{:?}} (confidence {{:.2}})\", {name}.bounds, {name}.confidence);\n"
+        ),
         _ => format!("    // {name}: a raw question — read it from res.raw\n"),
     }
 }

@@ -120,6 +120,8 @@ impl SystemOneRequest<'_> {
         on_retry(f: impl Fn(&RetryEvent<'_>) + Send + Sync + 'static),
         timeout(timeout: Duration),
         header(name: HeaderName, value: HeaderValue),
+        image(reference: impl Into<String>, image: crate::Image),
+        long_context(on: bool),
     );
 
     /// Override the model for this call.
@@ -162,6 +164,8 @@ impl<R: Rubric> AskRequest<'_, R> {
         on_retry(f: impl Fn(&RetryEvent<'_>) + Send + Sync + 'static),
         timeout(timeout: Duration),
         header(name: HeaderName, value: HeaderValue),
+        image(reference: impl Into<String>, image: crate::Image),
+        long_context(on: bool),
     );
 
     /// Override the model for this call.

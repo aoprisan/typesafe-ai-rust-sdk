@@ -791,6 +791,10 @@ fn render_question(name: &str, question: &Question) -> String {
         (Question::Raw(raw), _) => {
             s.push_str(&format!("{name}! {raw}\n"));
         }
+        // The notation has no line of its own for a box yet, so it is written as what it sends.
+        (_, "box") => {
+            s.push_str(&format!("{name}! {v}\n"));
+        }
         (_, "noul") => {
             s.push_str(&format!("{name}? {instructions}\n"));
             if let Some(yes) = criteria.and_then(|c| c.get("true")) {

@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use typesafe::{Choice, Noul, Question, Questions, Score};
+use typesafe::{BoxQuestion, Choice, Noul, Question, Questions, Score};
 
 /// A question under construction, kept in the order it was added (answers come back in that order).
 pub type Entry = (String, Question);
@@ -469,6 +469,7 @@ pub fn question_from_json(v: &Value) -> Question {
                 .unwrap_or_default();
             Score::new(instructions.unwrap_or(Value::Null), levels).into()
         }
+        Some("box") => BoxQuestion::new(instructions.unwrap_or(Value::Null)).into(),
         _ => Question::Raw(v.clone()),
     }
 }
